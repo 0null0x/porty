@@ -88,8 +88,8 @@ console, `__porty` exposes the running emulator (`__porty.args`,
 | `mem` | 1536 (phones: 1024) | Guest RAM in MiB (512 to 3072) |
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
 | `tb` | 384 (phones: 256) | TCG translation cache in MiB |
-| `smp` | 1 | Guest CPUs, 1 to 4 (extra CPUs share one thread unless `mttcg=1`) |
-| `mttcg` | off | `1` gives each guest CPU its own thread (multi-threaded TCG; crashes QEMU-Wasm with this guest today) |
+| `smp` | 1 | Guest CPUs, 1 to 4 (`smp=2` crashes QEMU-Wasm with this guest today) |
+| `usb` | on | `0` leaves out the USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
 | `cpu` | `Nehalem` | QEMU CPU model (SSE4.2 and POPCNT, which Android's x86_64 ABI requires; no AVX) |
 | `res` | `480x800` | Guest resolution |
@@ -162,8 +162,6 @@ appearing.** The guest cannot see its disk. Try `?disk=ide`.
 black.** Try `?gfx=vesa`, then `?res=1024x768`, then both.
 
 **It works but crawls.** Try a smaller screen such as `?res=320x480&dpi=120`.
-Extra CPUs (`?smp=2`) share one host thread unless `mttcg=1`, so they add
-no speed today.
 
 **The kernel crashes or the machine powers off early in boot.** See
 "Findings" in [docs/PLAN.md](docs/PLAN.md). `?jit=2147483647` runs the

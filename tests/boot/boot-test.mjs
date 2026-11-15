@@ -9,6 +9,9 @@
 //   MINUTES        how long to let Android boot (default 40)
 //   CHROME         Chrome binary (default /usr/bin/google-chrome)
 //   PUPPETEER_DIR  directory that has node_modules/puppeteer-core
+//   DUMP_FILES     comma-separated paths in QEMU's in-memory filesystem to
+//                  print at the end, e.g. the -D log of
+//                  QUERY="qemu=-d%20cpu_reset,guest_errors%20-D%20/tmp/q.log"
 //
 // Exit status: 0 whatever happened to Android (the verdict is in the log,
 // the job summary and a warning annotation: a red run would e-mail the
@@ -69,10 +72,14 @@ const describe = (handle) => handle.evaluate((v) => {
     }
     return String(v);
 }).catch(() => '?');
+// QEMU's stderr reaches the page as console.warn (Module.printErr).
+let warnings = 0;
 page.on('console', async (m) => {
     if (m.type() === 'error') {
         const parts = await Promise.all(m.args().map(describe));
         log(`console.error: ${parts.join(' ') || m.text()}`);
+    } else if ((m.type() === 'warn' || m.type() === 'warning') && warnings++ < 300) {
+        log(`console.warn: ${m.text()}`);
     }
 });
 // Uncaught exceptions inside QEMU's threads (Web Workers), with their wasm
@@ -124,6 +131,35 @@ async function shot(label, wholePage = false) {
         }
     } catch (e) {
         log(`screenshot ${label} failed: ${e.message}`);
+    }
+}
+
+/** Print files from QEMU's in-memory filesystem (DUMP_FILES). */
+let dumped = false;
+async function dumpFiles() {
+    if (dumped) {
+        return;
+    }
+    dumped = true;
+    for (const file of (process.env.DUMP_FILES || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+        const text = await page.evaluate((f) => {
+            try {
+                const fs = globalThis.__porty && globalThis.__porty.module && globalThis.__porty.module.FS;
+                if (!fs) {
+                    return '(no filesystem)';
+                }
+                const bytes = fs.readFile(f);
+                const tail = bytes.length > 400000 ? bytes.subarray(bytes.length - 400000) : bytes;
+                return `(${bytes.length} bytes${tail !== bytes ? ', last 400000 shown' : ''})\n` +
+                    new TextDecoder().decode(tail);
+            } catch (e) {
+                return `(cannot read: ${e})`;
+            }
+        }, file).catch((e) => `(page did not answer: ${e.message})`);
+        log(`file ${file}:`);
+        for (const line of text.split('\n')) {
+            console.log(`file| ${line}`);
+        }
     }
 }
 
@@ -266,6 +302,7 @@ try {
         if (snap.state === 'failed') {
             log(`PAGE FAILED: ${snap.failure}`);
             await shot('failed', true);
+            await dumpFiles();
             exitCode = 1;
             break;
         }
@@ -296,6 +333,7 @@ try {
         }
     }
     await shot('final', true);
+    await dumpFiles();
 } catch (e) {
     log(`TEST ERROR: ${e.stack || e}`);
     await shot('error', true);

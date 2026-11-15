@@ -73,10 +73,11 @@ export function buildKernelCmdline(cfg, manifest) {
  */
 export function buildQemuArgs(cfg, manifest, paths) {
     const accel = [`tcg`, `tb-size=${cfg.tb}`];
+    // QEMU-Wasm sets up its WebAssembly JIT only in the multi-threaded TCG
+    // vCPU thread (init_wasm32() in tcg-accel-ops-mttcg.c), which is QEMU's
+    // default for x86_64 guests. Never ask for thread=single.
     if (cfg.smp > 1) {
-        // Multi-threaded TCG crashes QEMU-Wasm with an x86_64 guest; by
-        // default extra CPUs share one thread (round robin).
-        accel.push(cfg.mttcg ? 'thread=multi' : 'thread=single');
+        accel.push('thread=multi');
     }
     // virtio-blk disks by default (what Android-x86's qemu-android uses).
     // disk=ide presents both images as IDE CD-ROMs instead (/dev/sr0 and
@@ -101,8 +102,7 @@ export function buildQemuArgs(cfg, manifest, paths) {
         '-global', `VGA.yres=${cfg.height}`,
 
         // Absolute pointer, as in Android-x86's qemu-android script.
-        '-usb',
-        '-device', 'usb-tablet',
+        ...(cfg.usb ? ['-usb', '-device', 'usb-tablet'] : []),
 
         '-serial', 'mon:stdio',
         '-parallel', 'none',

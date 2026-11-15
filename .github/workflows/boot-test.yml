@@ -19,6 +19,10 @@ on:
         description: Minutes to let Android boot
         type: number
         default: 40
+      dump:
+        description: Files in QEMU's in-memory filesystem to print at the end (comma separated)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -57,6 +61,7 @@ jobs:
           PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
           QUERY: ${{ inputs.query }}
           MINUTES: ${{ inputs.minutes }}
+          DUMP_FILES: ${{ inputs.dump }}
         run: |
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"

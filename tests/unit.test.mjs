@@ -29,7 +29,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     const desktop = parseConfig('', { userAgent: MAC });
     assert.deepEqual([desktop.mem, desktop.tb, desktop.smp, desktop.width, desktop.height, desktop.dpi],
         [1536, 384, 1, 480, 800, 160]);
-    assert.deepEqual([desktop.mttcg, desktop.jit], [false, -1]);
+    assert.deepEqual([desktop.usb, desktop.jit], [true, -1]);
     assert.equal(parseConfig('?jit=0', {}).jit, 0);
     assert.equal(parseConfig('?jit=-5', {}).jit, -1);
     assert.equal(parseConfig('?jit=99999999999', {}).jit, 2147483647);
@@ -91,8 +91,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
         'file.url=https://example.test/porty/image/system,file.size=900000000,' +
         'file.chunk-size=2097152,file.cache-chunks=16,file.parallel=4');
     assert.equal(drives[1], 'if=virtio,index=1,media=disk,format=raw,file=/img/ramdisk.img');
-    assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=single');
-    assert.equal(buildQemuArgs(parseConfig('?smp=2&mttcg=1', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
+    assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
+    assert.ok(!buildQemuArgs(parseConfig('?usb=0', {}), manifest, paths).includes('usb-tablet'));
     const ide = buildQemuArgs(parseConfig('?disk=ide', {}), manifest, paths).filter((a) => a.startsWith('if=ide'));
     assert.ok(ide[0].includes('media=cdrom') && ide[1].endsWith('read-only=on'));
     // commas in the URL are escaped for QEMU's option parser
