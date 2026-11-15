@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Porty: Android-x86 9 in your browser</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="description" content="Runs 64-bit Android-x86 9.0 locally in the browser with QEMU compiled to WebAssembly.">
+<meta name="theme-color" content="#101418">
+<link rel="icon" href="data:,">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="css/style.css">
+<!--
+  GitHub Pages cannot send COOP/COEP headers, and without them browsers hide
+  SharedArrayBuffer (which QEMU's threads need).  coi-serviceworker (MIT)
+  registers a service worker that adds the headers and reloads the page once.
+  "require-corp" is forced because Safari has no "credentialless" mode, and
+  every resource of this page is same-origin anyway.
+-->
+<script>
+window.coi = {
+    coepCredentialless: function () { return false; },
+    shouldDeregister: function () { return /[?&]nocoi=1/.test(location.search); },
+    shouldRegister: function () { return !/[?&]nocoi=1/.test(location.search); }
+};
+</script>
+<script src="coi-serviceworker.js"></script>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/xterm-pty.js"></script>
+</head>
+<body>
+<main id="app" data-state="idle">
+
+  <section id="intro" class="panel">
+    <h1>Porty</h1>
+    <p class="lead">A real 64-bit Android (Android-x86 9.0) running on your device, inside this
+      browser tab. No app, no server: a PC is emulated by QEMU compiled to WebAssembly.</p>
+
+    <button id="start" class="primary" type="button" disabled>Start Android</button>
+    <p id="precheck" class="note" role="status">Checking this browser...</p>
+
+    <ul class="limits">
+      <li><strong>Experimental and slow.</strong> Every x86 instruction is translated in the
+        browser. Booting takes minutes, not seconds, and may not finish on a phone.</li>
+      <li><strong>Large download.</strong> Tens of MB to start, then several hundred MB of the
+        system image are fetched on demand while Android boots. Use Wi-Fi.</li>
+      <li><strong>Needs memory.</strong> <span id="memnote">1 GB or more of RAM is reserved for the
+        guest.</span> Close other tabs first.</li>
+      <li><strong>Live session.</strong> Nothing is saved. Reloading the page starts from scratch.</li>
+      <li><strong>No Google Play, no Google apps.</strong> This is the open-source Android-x86 image.</li>
+      <li><strong>No network, no cellular, no SMS, no calls, no camera, no sound.</strong></li>
+    </ul>
+
+    <details id="advanced">
+      <summary>Settings and URL parameters</summary>
+      <p class="note">Current configuration: <code id="cfgline"></code></p>
+      <table id="params"></table>
+    </details>
+
+    <p class="credits">Built on <a href="https://github.com/ktock/qemu-wasm">QEMU-Wasm</a>,
+      <a href="https://www.qemu.org/">QEMU</a> and
+      <a href="https://www.android-x86.org/">Android-x86</a>.
+      <a href="https://github.com/0null0x/porty">Source, licenses and build recipe</a>.
+      <span id="buildid"></span></p>
+  </section>
+
+  <section id="machine" hidden>
+    <header id="toolbar">
+      <span id="pill" class="pill">Starting</span>
+      <span id="stats" class="stats"></span>
+      <span class="spacer"></span>
+      <button id="btn-pause" type="button" title="Pause or resume the virtual machine">Pause</button>
+      <button id="btn-reset" type="button" title="Reboot the virtual machine">Reset</button>
+      <button id="btn-serial" type="button" title="Show the serial console">Console</button>
+      <button id="btn-full" type="button" title="Full screen">Full</button>
+    </header>
+
+    <div id="stage">
+      <canvas id="screen" width="720" height="400" tabindex="0" aria-label="Android screen"></canvas>
+      <div id="overlay">
+        <p id="stage-text">Starting</p>
+        <div id="bar" hidden><div id="bar-fill"></div></div>
+        <p id="stage-detail"></p>
+        <pre id="logline" aria-live="off"></pre>
+      </div>
+    </div>
+
+    <nav id="navbar" aria-label="Android navigation">
+      <button id="nav-back" type="button">Back</button>
+      <button id="nav-home" type="button">Home</button>
+      <button id="nav-recents" type="button">Recents</button>
+      <button id="nav-keyboard" type="button">Keyboard</button>
+    </nav>
+
+    <section id="serial-panel" hidden>
+      <div id="terminal"></div>
+      <p class="note">Serial console (ttyS0). Android-x86 puts a root shell here once it is up.
+        Ctrl-A C switches to the QEMU monitor.</p>
+    </section>
+
+    <!-- owns the on-screen keyboard; never visible -->
+    <input id="softkeys" type="text" inputmode="text" autocomplete="off" autocorrect="off"
+           autocapitalize="off" spellcheck="false" aria-hidden="true" tabindex="-1">
+  </section>
+
+  <section id="failure" class="panel" hidden>
+    <h2>Porty stopped</h2>
+    <p id="fail-message"></p>
+    <p id="fail-hint" class="note"></p>
+    <pre id="fail-log"></pre>
+    <button id="fail-copy" type="button">Copy details</button>
+    <button id="fail-reload" class="primary" type="button">Reload</button>
+  </section>
+
+</main>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
