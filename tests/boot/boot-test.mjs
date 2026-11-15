@@ -1,0 +1,304 @@
+// Boots the deployed Porty site in headless Chrome and reports how far
+// Android gets: page state, the serial console, and screenshots printed as
+// base64 JPEG between marker lines (so they can be recovered from the job
+// log with tests/boot/extract-shots.py).
+//
+// usage: node tests/boot/boot-test.mjs
+//   SITE_URL       deployed site, with trailing slash (required)
+//   QUERY          extra page parameters, e.g. "smp=1&mem=1024" (optional)
+//   MINUTES        how long to let Android boot (default 40)
+//   CHROME         Chrome binary (default /usr/bin/google-chrome)
+//   PUPPETEER_DIR  directory that has node_modules/puppeteer-core
+//
+// Exit status: 0 when the page ran to the deadline or Android finished
+// booting, 1 when the page or QEMU failed, 2 on bad usage.
+// SPDX-License-Identifier: GPL-2.0-or-later
+import { appendFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+
+const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
+const puppeteer = require('puppeteer-core');
+
+const siteUrl = process.env.SITE_URL || '';
+if (!/^https?:\/\/.+\/$/.test(siteUrl)) {
+    console.error('SITE_URL must be the site root with a trailing slash');
+    process.exit(2);
+}
+const minutes = Math.max(1, Math.min(240, Number(process.env.MINUTES) || 40));
+const params = new URLSearchParams((process.env.QUERY || '').trim().replace(/^\?/, ''));
+params.set('serial', '1');
+const url = `${siteUrl}?${params}`;
+
+const t0 = Date.now();
+const elapsed = () => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+};
+const log = (msg) => console.log(`[${elapsed()}] ${msg}`);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// eslint-disable-next-line no-control-regex
+const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b[()][A-Z0-9]/g, '');
+
+const browser = await puppeteer.launch({
+    executablePath: process.env.CHROME || '/usr/bin/google-chrome',
+    headless: true,
+    protocolTimeout: 300000,
+    args: [
+        '--no-sandbox', '--disable-gpu', '--window-size=480,900',
+        '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+    ],
+});
+const page = await browser.newPage();
+await page.setViewport({ width: 480, height: 900 });
+page.on('pageerror', (e) => log(`pageerror: ${e}`));
+page.on('console', (m) => {
+    if (m.type() === 'error') {
+        log(`console.error: ${m.text()}`);
+    }
+});
+
+/** Print a screenshot of the guest display (and optionally the page). */
+async function shot(label, wholePage = false) {
+    try {
+        const s = await page.evaluate(() => {
+            const c = document.getElementById('screen');
+            if (!c || !c.width || !c.height) {
+                return null;
+            }
+            const scale = Math.min(1, 640 / Math.max(c.width, c.height));
+            const w = Math.max(1, Math.round(c.width * scale));
+            const h = Math.max(1, Math.round(c.height * scale));
+            const t = document.createElement('canvas');
+            t.width = w;
+            t.height = h;
+            const g = t.getContext('2d');
+            g.drawImage(c, 0, 0, w, h);
+            const px = g.getImageData(0, 0, w, h).data;
+            let lit = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                if (px[i] + px[i + 1] + px[i + 2] > 30) {
+                    lit++;
+                }
+            }
+            return {
+                size: `${c.width}x${c.height}`,
+                lit: Math.round((1000 * lit) / (w * h)) / 10,
+                jpeg: t.toDataURL('image/jpeg', 0.75).split(',')[1],
+            };
+        });
+        if (s) {
+            emit(`screen ${label}`, `${s.size} lit=${s.lit}%`, s.jpeg);
+        } else {
+            log(`screenshot ${label}: no guest display yet`);
+        }
+        if (wholePage) {
+            const b64 = await page.screenshot({ type: 'jpeg', quality: 60, encoding: 'base64' });
+            emit(`page ${label}`, '480x900', b64);
+        }
+    } catch (e) {
+        log(`screenshot ${label} failed: ${e.message}`);
+    }
+}
+
+function emit(name, info, b64) {
+    log(`screenshot ${name}: ${info}, ${b64.length} base64 chars`);
+    console.log(`-----BEGIN PORTY SCREENSHOT ${name.replace(/\s+/g, '_')} ${info}-----`);
+    for (let i = 0; i < b64.length; i += 1000) {
+        console.log(b64.slice(i, i + 1000));
+    }
+    console.log('-----END PORTY SCREENSHOT-----');
+}
+
+let exitCode = 0;
+let booted = false;
+let finalState = '';
+let lastSnap = null;
+const serialTail = [];
+
+try {
+    // --- open the page and wait for cross-origin isolation -----------------
+    log(`opening ${url}`);
+    await page.goto(url, { waitUntil: 'load', timeout: 120000 });
+    for (let attempt = 1; ; attempt++) {
+        try {
+            // coi-serviceworker reloads the page once; the context may vanish.
+            await page.waitForFunction(() => globalThis.crossOriginIsolated === true, { timeout: 120000 });
+            await page.waitForFunction(() => !document.getElementById('start').disabled, { timeout: 60000 });
+            break;
+        } catch (e) {
+            if (attempt >= 3) {
+                throw e;
+            }
+            log(`waiting for the page again (${e.message})`);
+            await sleep(3000);
+        }
+    }
+    log('page is cross-origin isolated and ready');
+    log(`precheck: ${await page.$eval('#precheck', (e) => e.textContent.replace(/\s+/g, ' ').trim())}`);
+    log(`build: ${await page.$eval('#buildid', (e) => e.textContent.replace(/\s+/g, ' ').trim()).catch(() => '?')}`);
+
+    // --- start, and tee the serial console into a capture buffer ------------
+    await page.click('#start');
+    await page.evaluate(() => {
+        globalThis.__cap = [];
+        const serial = globalThis.__porty && globalThis.__porty.serial;
+        if (serial) {
+            const forward = serial.onText;
+            serial.onText = (text) => {
+                globalThis.__cap.push(text);
+                forward(text);
+            };
+        }
+    });
+    log('started');
+
+    const deadline = t0 + minutes * 60000;
+    const shotsAt = [2, 4, 7, 10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
+        .map((m) => t0 + m * 60000).filter((t) => t < deadline);
+    let printedArgs = false;
+    let carry = '';
+    let recent = '';
+    let probeAt = t0 + 8 * 60000;
+    let bootedAt = 0;
+    let lastStatusLine = '';
+    let lastStatusTime = 0;
+
+    while (Date.now() < deadline) {
+        await sleep(10000);
+        let snap;
+        try {
+            snap = await page.evaluate(() => {
+                const $ = (id) => document.getElementById(id);
+                const text = (id) => ($(id) ? $(id).textContent.replace(/\s+/g, ' ').trim() : '');
+                const e = globalThis.__porty;
+                let disk = null;
+                try {
+                    disk = e && e.module && e.diskStats ? e.diskStats() : null;
+                } catch (err) {
+                    disk = String(err);
+                }
+                const c = $('screen');
+                return {
+                    state: $('app').dataset.state || '',
+                    stage: text('stage-text'),
+                    detail: text('stage-detail'),
+                    logline: text('logline'),
+                    stats: text('stats'),
+                    failure: $('app').dataset.state === 'failed' ? text('failure') : '',
+                    serial: globalThis.__cap ? globalThis.__cap.splice(0).join('') : '',
+                    disk,
+                    screen: c ? `${c.width}x${c.height}` : '',
+                    exited: e ? !!e.exited : false,
+                    args: e && e.args ? e.args.join(' ') : '',
+                    cmdline: e && e.cmdline ? e.cmdline : '',
+                    memory: e ? `guest ${e.cfg && e.cfg.mem} MiB, smp ${e.cfg && e.cfg.smp}, wasm ${e.wasmMemoryMb} MiB, patched ${e.patched}` : '',
+                    notes: e && e.notes ? e.notes.join(' | ') : '',
+                };
+            });
+        } catch (e) {
+            log(`page did not answer: ${e.message}`);
+            continue;
+        }
+        lastSnap = snap;
+        finalState = snap.state;
+
+        if (!printedArgs && snap.args) {
+            printedArgs = true;
+            log(`memory: ${snap.memory}`);
+            log(`qemu argv: ${snap.args}`);
+            log(`kernel cmdline: ${snap.cmdline}`);
+            if (snap.notes) {
+                log(`notes: ${snap.notes}`);
+            }
+        }
+
+        // serial console, line by line
+        if (snap.serial) {
+            recent = (recent + snap.serial).slice(-20000);
+            const lines = (carry + snap.serial).split('\n');
+            carry = lines.pop();
+            for (const raw of lines) {
+                const line = stripAnsi(raw).replace(/\r/g, '');
+                console.log(`serial| ${line}`);
+                serialTail.push(line);
+                if (serialTail.length > 40) {
+                    serialTail.shift();
+                }
+            }
+        }
+
+        const statusLine = `state=${snap.state} screen=${snap.screen} stage="${snap.stage}" ` +
+            `detail="${snap.detail}" stats="${snap.stats}" log="${snap.logline}"` +
+            (snap.disk ? ` disk=${JSON.stringify(snap.disk)}` : '');
+        if (statusLine !== lastStatusLine || Date.now() - lastStatusTime > 60000) {
+            log(statusLine);
+            lastStatusLine = statusLine;
+            lastStatusTime = Date.now();
+        }
+
+        if (snap.state === 'failed') {
+            log(`PAGE FAILED: ${snap.failure}`);
+            await shot('failed', true);
+            exitCode = 1;
+            break;
+        }
+        if (snap.exited) {
+            log('QEMU EXITED');
+            await shot('exited', true);
+            exitCode = 1;
+            break;
+        }
+        while (shotsAt.length && Date.now() >= shotsAt[0]) {
+            shotsAt.shift();
+            await shot(`t${elapsed().replace(':', 'm')}s`);
+        }
+
+        // Ask the serial shell (if Android-x86 runs one) whether boot finished.
+        if (!booted && snap.state === 'running' && Date.now() >= probeAt) {
+            probeAt = Date.now() + 120000;
+            await page.evaluate(() => globalThis.__porty.serial.send('\rgetprop sys.boot_completed\r'));
+        }
+        if (!booted && /getprop sys\.boot_completed[^\n]*\n\s*1\s*\r?\n/.test(stripAnsi(recent))) {
+            booted = true;
+            bootedAt = Date.now();
+            log('ANDROID BOOT COMPLETED (sys.boot_completed=1)');
+            await shot('boot-completed', true);
+        }
+        if (booted && Date.now() - bootedAt > 90000) {
+            break;
+        }
+    }
+    await shot('final', true);
+} catch (e) {
+    log(`TEST ERROR: ${e.stack || e}`);
+    await shot('error', true);
+    exitCode = 1;
+}
+
+const verdict = exitCode ? 'failed' : (booted ? 'booted' : 'still booting at the deadline');
+log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}`);
+if (!exitCode && !booted) {
+    console.log(`::warning::Android did not report sys.boot_completed=1 within ${minutes} minutes (it may have no serial shell; check the screenshots).`);
+}
+if (process.env.GITHUB_STEP_SUMMARY) {
+    const s = lastSnap || {};
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+        '## Porty boot test',
+        '',
+        `- URL: ${url}`,
+        `- Result: **${verdict}** after ${elapsed()} (page state \`${finalState}\`)`,
+        `- Screen: ${s.screen || 'n/a'}; last stage: ${s.stage || 'n/a'} ${s.detail || ''}`,
+        `- ${s.memory || ''}`,
+        '',
+        'Last serial lines:',
+        '',
+        '```',
+        ...serialTail.slice(-25),
+        '```',
+        '',
+    ].join('\n'));
+}
+await Promise.race([browser.close(), sleep(15000)]);
+process.exit(exitCode);

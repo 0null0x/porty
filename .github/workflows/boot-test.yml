@@ -1,0 +1,67 @@
+# Boots the deployed site in headless Chrome after every successful
+# deployment and logs how far Android gets: the serial console, page status
+# and screenshots (base64 JPEG between marker lines; recover them with
+# tests/boot/extract-shots.py).  Can also be started by hand with other page
+# parameters, e.g. "smp=1" or "mem=1024&res=540x960".
+name: Boot test
+
+on:
+  workflow_run:
+    workflows: [Build and deploy]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      query:
+        description: Extra page parameters, e.g. smp=1&mem=1024
+        type: string
+        default: ''
+      minutes:
+        description: Minutes to let Android boot
+        type: number
+        default: 40
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-test
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  boot:
+    name: Boot Android in headless Chrome
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install puppeteer-core
+        working-directory: tests/ui
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Boot
+        env:
+          PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+          QUERY: ${{ inputs.query }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          # Project site of this repository: https://<owner>.github.io/<repo>/
+          SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          CHROME="$(command -v google-chrome || command -v chromium)"
+          export SITE_URL CHROME
+          export MINUTES="${MINUTES:-40}"
+          nproc
+          free -m
+          "$CHROME" --version
+          node tests/boot/boot-test.mjs

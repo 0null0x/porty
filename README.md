@@ -10,16 +10,16 @@ is why it can run in Safari on an iPhone.
 
 Expected address once deployed: **https://0null0x.github.io/porty/**
 
-## Status: unverified
+## Status: builds and deploys; booting unverified
 
-Nothing here has run end to end yet. The WebAssembly build of QEMU can only
-be produced by the GitHub Actions workflow (it needs Docker Hub and the
-Emscripten SDK), and that workflow has not run. What was checked without it
-is listed under [What has been tested](#what-has-been-tested). Treat every
+The first workflow run (2026-11-15) compiled QEMU to WebAssembly (a 12 MB
+module), downloaded and verified the ISO, and deployed a 966 MB site. Nobody
+has seen Android boot in a browser yet. What was checked before that is
+listed under [What has been tested](#what-has-been-tested). Treat every
 statement about booting Android as a plan until the milestones below are
 ticked off.
 
-- [ ] **M1** CI build is green and the site deploys
+- [x] **M1** CI build is green and the site deploys
 - [ ] **M2** desktop browser: kernel boot log appears on the serial console
 - [ ] **M3** desktop browser: Android UI is visible on the canvas
 - [ ] **M4** touch, navigation buttons and keyboard work
@@ -39,9 +39,9 @@ decision, the size budget and what to try when a milestone fails.
      image pipeline (a few seconds);
    - checks out QEMU-Wasm at the pinned commit, applies `patches/qemu-wasm/`,
      builds QEMU-Wasm's own Docker toolchain image and compiles
-     `qemu-system-x86_64` to WebAssembly (expect roughly an hour the first
-     time; the result is cached and reused until the patches or the build
-     script change);
+     `qemu-system-x86_64` to WebAssembly (about 20 minutes for the whole
+     first run; the result is cached and reused until the patches or the
+     build script change);
    - downloads `android-x86_64-9.0-r2.iso` from SourceForge, verifies the
      SHA-1 published by Android-x86, extracts the kernel and ramdisks and
      splits `system.sfs` into 2 MiB chunks (the ISO is cached as well);
@@ -64,6 +64,15 @@ optionally forcing a QEMU rebuild or skipping the deployment.
 2. **iPhone, Safari 26 or later**: plain address, no parameters. The page
    reloads itself once on the first visit (that is the service worker
    enabling cross-origin isolation). Use Wi-Fi and keep the screen on.
+
+After every successful deployment, `.github/workflows/boot-test.yml` opens
+the live site in headless Chrome on a GitHub runner, presses *Start* and lets
+Android boot for 40 minutes. Its log has the serial console, the page status
+every few seconds, and screenshots of the guest display printed as base64
+JPEG between marker lines. Recover them with
+`python3 -I tests/boot/extract-shots.py <log> <out-dir>`. Start it by hand
+from the Actions tab to try other [URL parameters](#url-parameters) (for
+example `smp=1`).
 
 When something goes wrong the page shows the reason, a hint and the last
 lines of the serial console, with a *Copy details* button. From the browser
