@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Porty <porty@users.noreply.github.com>
+From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 18:53:03 +0000
 Subject: [PATCH] ui: add wasmfb, a shared-memory display and input backend for
  the browser

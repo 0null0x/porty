@@ -247,9 +247,11 @@ GitHub documents a 1 GB limit for a published Pages site.
 | page, glue, firmware, xterm | about 1 MB | measured |
 | **total** | **about 0.98 to 1.01 GB** | |
 
-That is on the line. `assemble-site.sh` prints the exact numbers, fails
-above 1 GiB (1,073,741,824 bytes) and warns above 1,000,000,000 bytes; it
-also fails if any single file reaches 100 MB.
+That is on the line. `assemble-site.sh` prints the exact numbers, warns
+above 1,000,000,000 bytes and fails above 1,500,000,000 bytes; it also fails
+if any single file reaches 100 MB. GitHub's deploy step only annotates
+uploads over 1 GB ("Deployment might fail") rather than refusing them, so a
+site slightly over the line is worth trying before shrinking anything.
 
 If GitHub rejects the deployment for size, in order of preference:
 

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Porty <porty@users.noreply.github.com>
+From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 18:53:04 +0000
 Subject: [PATCH] block: add porty, a lazily fetched chunked read-only protocol
  driver

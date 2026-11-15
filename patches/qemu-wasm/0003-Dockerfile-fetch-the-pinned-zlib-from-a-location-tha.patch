@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Porty <porty@users.noreply.github.com>
+From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 19:01:41 +0000
 Subject: [PATCH] Dockerfile: fetch the pinned zlib from a location that keeps
  old releases
