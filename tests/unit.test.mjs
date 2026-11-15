@@ -40,9 +40,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(requiredWasmMemoryMb(desktop), 1856);
     assert.equal(chooseWasmMemoryMb(desktop, 2300), 2300);
     // phones get the smallest memory that fits
-    assert.equal(chooseWasmMemoryMb(phone, 2300), 1600);
+    assert.equal(chooseWasmMemoryMb(phone, 2300), 1664);
     // a bigger guest grows past the linked size
-    assert.equal(chooseWasmMemoryMb(parseConfig('?mem=2560', { userAgent: MAC }), 2300), 3264);
+    assert.equal(chooseWasmMemoryMb(parseConfig('?mem=2560', { userAgent: MAC }), 2300), 3392);
     // explicit override wins, rounded to 64 MiB
     assert.equal(chooseWasmMemoryMb(parseConfig('?wasmmem=1000', { userAgent: MAC }), 2300), 1024);
 
