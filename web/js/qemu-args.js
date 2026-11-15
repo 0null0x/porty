@@ -2,6 +2,25 @@
 // Pure functions (no DOM): shared by the page and by tests/native-e2e.sh.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// 32 bpp modes offered by the VGA BIOS QEMU ships for "-vga std" (SeaBIOS
+// rel-1.16.3, vgasrc/svgamodes.c).  Only these exist for VESA framebuffer
+// drivers (vesafb, uvesafb); the list has no portrait modes.  The kernel's
+// "vga=" parameter takes the VBE mode number plus 0x200.
+export const VBE_MODES = {
+    '640x480': 0x142, '800x600': 0x143, '1024x768': 0x144, '1152x864': 0x14c,
+    '1280x720': 0x18f, '1280x768': 0x177, '1280x800': 0x17a, '1280x960': 0x17d,
+    '1280x1024': 0x145, '1440x900': 0x180, '1600x900': 0x195, '1920x1080': 0x192,
+};
+
+/** The standard VBE mode to use when a VESA driver ends up in charge. */
+export function vesaMode(cfg) {
+    const asked = `${cfg.width}x${cfg.height}`;
+    if (VBE_MODES[asked]) {
+        return asked;
+    }
+    return Math.max(cfg.width, cfg.height) <= 800 ? '800x600' : '1024x768';
+}
+
 /**
  * Kernel command line for Android-x86.
  *
@@ -9,36 +28,37 @@
  * of the ISO's isolinux.cfg at build time (for 9.0-r2 it starts with
  * "root=/dev/ram0 androidboot.selinux=permissive").  The rest mirrors
  * Android-x86's own qemu-android launcher ("console=ttyS0 RAMDISK=vdb") and
- * the documented initrd/init.sh switches:
+ * the switches its initrd and init.sh understand:
  *
  *   RAMDISK=<dev>   read ramdisk.img from a block device (initrd/init)
  *   SRC= DATA=      live session, /data on tmpfs (initrd/scripts/2-mount)
  *   SETUPWIZARD=0   skip the first-run wizard (initrd/init)
  *   DPI=<n>         ro.sf.lcd_density (initrd/scripts/4-dpi)
- *   video=WxH       mode for the DRM fbdev console; init.sh also falls back
- *                   to it for uvesafb
- *   UVESA_MODE=WxH  uvesafb mode when no KMS framebuffer exists (init.sh)
- *   nomodeset       disable KMS -> "VESA mode", no GPU acceleration
+ *   video=WxH       mode for the KMS (bochs-drm) framebuffer; any size
+ *   UVESA_MODE=WxH  mode init.sh gives uvesafb when no framebuffer exists;
+ *                   must be a VBE mode, so it can differ from video=
+ *   nomodeset vga=  gfx=vesa: no KMS, VESA framebuffer like the ISO's
+ *                   "VESA mode" boot entry
  */
 export function buildKernelCmdline(cfg, manifest) {
     if (cfg.cmdline.length) {
         return cfg.cmdline.join(' ');
     }
     const ramdiskDev = cfg.disk === 'ide' ? 'sr1' : 'vdb';
-    const mode = `${cfg.width}x${cfg.height}`;
+    const vesa = vesaMode(cfg);
     const words = [
         ...manifest.cmdline.split(/\s+/).filter(Boolean),
         'console=ttyS0',
         `RAMDISK=${ramdiskDev}`,
         'SRC=',
         'DATA=',
-        `video=${mode}`,
-        `UVESA_MODE=${mode}`,
-        `DPI=${cfg.dpi}`,
     ];
     if (cfg.gfx === 'vesa') {
-        words.push('nomodeset');
+        words.push('nomodeset', `vga=0x${(VBE_MODES[vesa] + 0x200).toString(16)}`);
+    } else {
+        words.push(`video=${cfg.width}x${cfg.height}`);
     }
+    words.push(`UVESA_MODE=${vesa}`, `DPI=${cfg.dpi}`);
     if (!cfg.setup) {
         words.push('SETUPWIZARD=0');
     }

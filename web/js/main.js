@@ -95,6 +95,11 @@ function onSerialText(text) {
     }
 }
 
+function hideOverlay() {
+    graphicsSeen = true;
+    $('overlay').hidden = true;
+}
+
 function fitCanvas() {
     const canvas = $('screen');
     const stage = $('stage');
@@ -162,8 +167,7 @@ function renderLoop() {
         if (!graphicsSeen && display.width && !(display.width === 720 && display.height === 400) &&
             !(display.width === 640 && display.height === 480)) {
             // The guest left VGA text mode: Android's graphics stack is up.
-            graphicsSeen = true;
-            $('overlay').hidden = true;
+            hideOverlay();
         }
         if (now - lastStats >= 1000) {
             const disk = emulator.diskStats();
@@ -226,6 +230,9 @@ async function start() {
 
     input = new Input(emulator.sendInput, $('screen'), $('softkeys'));
     input.attach();
+    // Touching the screen also dismisses the boot overlay (it cannot tell
+    // every guest video mode apart from the BIOS text mode).
+    $('screen').addEventListener('pointerdown', hideOverlay);
     if (cfg.serial) {
         toggleSerial(true);
     }

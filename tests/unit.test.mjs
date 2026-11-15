@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
     chooseWasmMemoryMb, fallbackLadder, isMobile, parseConfig, requiredWasmMemoryMb,
 } from '../web/js/config.js';
-import { buildKernelCmdline, buildQemuArgs } from '../web/js/qemu-args.js';
+import { buildKernelCmdline, buildQemuArgs, vesaMode } from '../web/js/qemu-args.js';
 import { CODE_TO_EVDEV, KEY, charToKey } from '../web/js/keymap.js';
 import { Display } from '../web/js/display.js';
 import { Input, toTablet } from '../web/js/input.js';
@@ -64,9 +64,13 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     const cfg = parseConfig('', { userAgent: MAC });
     assert.equal(buildKernelCmdline(cfg, manifest),
         'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 ' +
-        'RAMDISK=vdb SRC= DATA= video=480x800 UVESA_MODE=480x800 DPI=160 SETUPWIZARD=0');
+        'RAMDISK=vdb SRC= DATA= video=480x800 UVESA_MODE=800x600 DPI=160 SETUPWIZARD=0');
+    // gfx=vesa: no KMS, a real VBE mode for vesafb (0x143 + 0x200) and uvesafb
     assert.match(buildKernelCmdline(parseConfig('?gfx=vesa&setup=1&disk=ide&append=DEBUG=1', {}), manifest),
-        /RAMDISK=sr1 .* nomodeset DEBUG=1$/);
+        /RAMDISK=sr1 SRC= DATA= nomodeset vga=0x343 UVESA_MODE=800x600 DPI=160 DEBUG=1$/);
+    assert.equal(vesaMode(parseConfig('?res=1280x720', {})), '1280x720');
+    assert.equal(vesaMode(parseConfig('?res=720x1280', {})), '1024x768');
+    assert.match(buildKernelCmdline(parseConfig('?gfx=vesa&res=1024x768', {}), manifest), /vga=0x344 UVESA_MODE=1024x768/);
     assert.equal(buildKernelCmdline(parseConfig('?cmdline=a=1%20b', {}), manifest), 'a=1 b');
 
     const args = buildQemuArgs(cfg, manifest, paths);

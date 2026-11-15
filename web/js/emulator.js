@@ -255,10 +255,11 @@ export class Emulator {
             },
             onAbort: (what) => this.fatal(new StartError(`QEMU aborted: ${what}`,
                 'Usually the WebAssembly memory ran out. Try a smaller ?mem= value.')),
-            onExit: (code) => {
-                this.exited = true;
-                this.fatal(new StartError(`QEMU exited with status ${code}.`,
-                    'See the serial console for the reason.'));
+            // Without EXIT_RUNTIME Emscripten skips onExit, but always calls quit.
+            onExit: (code) => this.exitedWith(code),
+            quit: (code, toThrow) => {
+                this.exitedWith(code);
+                throw toThrow;
             },
         };
 
@@ -307,6 +308,14 @@ export class Emulator {
             errors: s[4],
             cacheHits: s[5],
         };
+    }
+
+    exitedWith(code) {
+        this.exited = true;
+        this.fatal(code === 0
+            ? new StartError('The virtual machine powered off.', 'Reload the page to start again.')
+            : new StartError(`QEMU exited with status ${code}.`,
+                'The last lines of the serial console below usually say why.'));
     }
 
     fatal(error) {
