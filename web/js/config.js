@@ -11,12 +11,14 @@ export const WASM_PAGE = 65536;
 export const QEMU_OVERHEAD_MB = 288;
 
 const DEFAULTS = {
-    desktop: { mem: 1536, tb: 384 },
+    // 1536 MiB ran QEMU-Wasm out of its 2300 MiB at the virtio disk probe
+    // (boot tests, 2026-11-15); 1024 boots through to Android's init.
+    desktop: { mem: 1024, tb: 384 },
     mobile: { mem: 1024, tb: 256 },
 };
 
 export const PARAM_HELP = [
-    ['mem', 'guest RAM in MiB (512-3072). Default 1536 on desktop, 1024 on phones.'],
+    ['mem', 'guest RAM in MiB (512-3072). Default 1024 (1536 runs out of WebAssembly memory).'],
     ['wasmmem', 'size of the WebAssembly memory in MiB. Default: sized to fit.'],
     ['tb', 'TCG translation cache in MiB (64-1024).'],
     ['smp', 'guest CPUs, 1-4 (default 1).'],

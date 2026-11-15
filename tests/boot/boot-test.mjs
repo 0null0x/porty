@@ -320,7 +320,11 @@ try {
         // Ask the serial shell (if Android-x86 runs one) whether boot finished.
         if (!booted && snap.state === 'running' && Date.now() >= probeAt) {
             probeAt = Date.now() + 120000;
-            await page.evaluate(() => globalThis.__porty.serial.send('\rgetprop sys.boot_completed\r'));
+            // Progress first (informational), then the line the regex below reads.
+            await page.evaluate(() => globalThis.__porty.serial.send(
+                '\rgetprop init.svc.zygote; getprop init.svc.surfaceflinger; getprop init.svc.bootanim\r'));
+            await sleep(3000);
+            await page.evaluate(() => globalThis.__porty.serial.send('getprop sys.boot_completed\r'));
         }
         if (!booted && /getprop sys\.boot_completed[^\n]*\n\s*1\s*\r?\n/.test(stripAnsi(recent))) {
             booted = true;

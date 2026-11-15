@@ -18,7 +18,7 @@ on:
       minutes:
         description: Minutes to let Android boot
         type: number
-        default: 40
+        default: 100
       dump:
         description: Files in QEMU's in-memory filesystem to print at the end (comma separated)
         type: string
@@ -72,7 +72,7 @@ jobs:
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
           CHROME="$(command -v google-chrome || command -v chromium)"
           export SITE_URL CHROME
-          export MINUTES="${MINUTES:-40}"
+          export MINUTES="${MINUTES:-100}"
           nproc
           free -m
           "$CHROME" --version

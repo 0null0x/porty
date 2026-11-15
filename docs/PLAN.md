@@ -400,6 +400,30 @@ from a helper-call record read by `tcg_qemu_tb_exec_tci`, which suggests a
 stale or misread block. Reverted to the plain build to measure the boot
 without the page bug first.
 
+**Fourth round: two real bugs fixed, Android's init reached.**
+
+- QEMU-Wasm's wasm32 backend passed `args[1], args[2]` to
+  `tcg_out_ctpop_i32/i64` instead of `args[0], args[1]`, so every POPCNT
+  wrote its result into its input register (patch 0005). That was the
+  `WARN_ON(num_online_cpus() != 1)` panic at 0.8 s with any POPCNT-capable
+  CPU model. With the fix the default `Nehalem` model boots past it.
+- QEMU-Wasm's own x86_64 Alpine demo reaches its login prompt in 77 s in the
+  same headless Chrome (`control` input of the Boot test), so the browser
+  and runner are fine.
+- `mem=1536` runs out of the 2300 MiB WebAssembly memory ("Aborted(OOM)")
+  when the kernel probes the virtio disk, or fails earlier with libffi's
+  "Unexpected rtype"; `mem=1024` does not. Default is now 1024.
+- With `cpu=Nehalem,-popcnt&mem=1024` (before the POPCNT fix) the kernel
+  booted completely in about seven minutes of real time ("Run /init as init
+  process" at 35 s of guest time), the Android-x86 initrd found the system
+  image on Porty's streamed disk ("Detecting Android-x86... found at
+  /dev/vda") and the display switched to 480x800, but after 30 minutes the
+  screen was still black: Android's own boot had not drawn anything yet.
+  The emulation is slow (the BIOS screen was still up after two minutes).
+- `androidboot.console=ttyS0` is now on the command line so Android's root
+  shell appears on the serial console and the boot test can ask for
+  `sys.boot_completed`; the automatic boot test runs for up to 100 minutes.
+
 **Next steps, in order of cost:**
 
 1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly

@@ -28,7 +28,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
 
     const desktop = parseConfig('', { userAgent: MAC });
     assert.deepEqual([desktop.mem, desktop.tb, desktop.smp, desktop.width, desktop.height, desktop.dpi],
-        [1536, 384, 1, 480, 800, 160]);
+        [1024, 384, 1, 480, 800, 160]);
     assert.deepEqual([desktop.usb, desktop.jit], [true, -1]);
     assert.equal(parseConfig('?jit=0', {}).jit, 0);
     assert.equal(parseConfig('?jit=-5', {}).jit, -1);
@@ -37,7 +37,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([phone.mem, phone.tb], [1024, 256]);
 
     // desktop keeps the linked size (no patching) when the config fits
-    assert.equal(requiredWasmMemoryMb(desktop), 2240);
+    assert.equal(requiredWasmMemoryMb(desktop), 1728);
     assert.equal(chooseWasmMemoryMb(desktop, 2300), 2300);
     // phones get the smallest memory that fits
     assert.equal(chooseWasmMemoryMb(phone, 2300), 1600);
@@ -58,8 +58,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(evil.cpu, 'Nehalem');
     assert.deepEqual(evil.qemu, ['-snapshot']);
 
-    const ladder = fallbackLadder(desktop);
+    const ladder = fallbackLadder(parseConfig('?mem=1536', {}));
     assert.deepEqual(ladder.map((s) => s.mem), [1280, 1024, 896, 768]);
+    assert.deepEqual(fallbackLadder(desktop).map((s) => s.mem), [896, 768]);
     assert.ok(ladder.every((s) => s.tb <= desktop.tb));
 }
 
@@ -67,7 +68,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
 {
     const cfg = parseConfig('', { userAgent: MAC });
     assert.equal(buildKernelCmdline(cfg, manifest),
-        'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 ' +
+        'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 androidboot.console=ttyS0 ' +
         'RAMDISK=vdb SRC= DATA= video=480x800 UVESA_MODE=800x600 DPI=160 SETUPWIZARD=0');
     // gfx=vesa: no KMS, a real VBE mode for vesafb (0x143 + 0x200) and uvesafb
     assert.match(buildKernelCmdline(parseConfig('?gfx=vesa&setup=1&disk=ide&append=DEBUG=1', {}), manifest),
@@ -79,7 +80,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
 
     const args = buildQemuArgs(cfg, manifest, paths);
     const value = (flag) => args[args.indexOf(flag) + 1];
-    assert.equal(value('-m'), '1536M');
+    assert.equal(value('-m'), '1024M');
     assert.equal(value('-accel'), 'tcg,tb-size=384');
     assert.equal(value('-display'), 'wasmfb');
     assert.equal(value('-cpu'), 'Nehalem');

@@ -127,7 +127,7 @@ JS
 
 # The page's own code must be able to turn this manifest into a QEMU argv.
 node "$repo/tests/print-qemu-args.mjs" "$work/dist/image/manifest.json" /img /pc-bios '?mem=1024' > "$work/argv.txt"
-grep -q -- 'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 RAMDISK=vdb' "$work/argv.txt" \
+grep -q -- 'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 androidboot.console=ttyS0 RAMDISK=vdb' "$work/argv.txt" \
     || fail "kernel command line was not derived from isolinux.cfg"
 grep -q -- 'file.driver=porty' "$work/argv.txt" || fail "no porty drive in argv"
 pass "manifest -> QEMU argv"

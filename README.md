@@ -67,7 +67,7 @@ optionally forcing a QEMU rebuild or skipping the deployment.
 
 After every successful deployment, `.github/workflows/boot-test.yml` opens
 the live site in headless Chrome on a GitHub runner, presses *Start* and lets
-Android boot for 40 minutes. Its log has the serial console, the page status
+Android boot for up to 100 minutes. Its log has the serial console, the page status
 every few seconds, and screenshots of the guest display printed as base64
 JPEG between marker lines. Recover them with
 `python3 -I tests/boot/extract-shots.py <log> <out-dir>`. Start it by hand
@@ -85,7 +85,7 @@ console, `__porty` exposes the running emulator (`__porty.args`,
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `mem` | 1536 (phones: 1024) | Guest RAM in MiB (512 to 3072) |
+| `mem` | 1024 | Guest RAM in MiB (512 to 3072; 1536 runs QEMU-Wasm out of memory) |
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
 | `tb` | 384 (phones: 256) | TCG translation cache in MiB |
 | `smp` | 1 | Guest CPUs, 1 to 4 (`smp=2` crashes QEMU-Wasm with this guest today) |

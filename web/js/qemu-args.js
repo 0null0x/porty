@@ -49,6 +49,10 @@ export function buildKernelCmdline(cfg, manifest) {
     const words = [
         ...manifest.cmdline.split(/\s+/).filter(Boolean),
         'console=ttyS0',
+        // Android's init then runs its root console shell on the serial port
+        // (userdebug builds), which is how the boot test asks for
+        // sys.boot_completed.
+        'androidboot.console=ttyS0',
         `RAMDISK=${ramdiskDev}`,
         'SRC=',
         'DATA=',

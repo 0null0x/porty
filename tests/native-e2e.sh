@@ -183,7 +183,7 @@ check() { # <description> <grep pattern>
     if grep -a -q -- "$2" "$work/qemu.log"; then echo "PASS  $1"; else echo "FAIL  $1"; fail=1; fi
 }
 echo "qemu exit status: $rc"
-check "guest booted with the ISO's base command line" "PORTY-TEST: cmdline root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 RAMDISK=$rd"
+check "guest booted with the ISO's base command line" "PORTY-TEST: cmdline root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 androidboot.console=ttyS0 RAMDISK=$rd"
 check "framebuffer is ${W}x${H}"                    "PORTY-TEST: fb .* size ${W},${H}"
 check "whole-device hash matches (parallel readers)" "PORTY-TEST: disk-md5 $sfs_md5"
 check "whole-device hash matches (cached re-read)"   "PORTY-TEST: disk-md5-again $sfs_md5"
