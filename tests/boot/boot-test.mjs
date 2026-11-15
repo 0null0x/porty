@@ -10,8 +10,10 @@
 //   CHROME         Chrome binary (default /usr/bin/google-chrome)
 //   PUPPETEER_DIR  directory that has node_modules/puppeteer-core
 //
-// Exit status: 0 when the page ran to the deadline or Android finished
-// booting, 1 when the page or QEMU failed, 2 on bad usage.
+// Exit status: 0 whatever happened to Android (the verdict is in the log,
+// the job summary and a warning annotation: a red run would e-mail the
+// repository owner for every experiment); 1 only with BOOT_TEST_STRICT=1
+// when the page or QEMU failed; 2 on bad usage.
 // SPDX-License-Identifier: GPL-2.0-or-later
 import { appendFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -302,7 +304,10 @@ try {
 
 const verdict = exitCode ? 'failed' : (booted ? 'booted' : 'still booting at the deadline');
 log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}`);
-if (!exitCode && !booted) {
+if (exitCode) {
+    const why = lastSnap && lastSnap.failure ? lastSnap.failure.slice(0, 200) : 'see the log';
+    console.log(`::warning title=Porty boot test failed::${params} - ${why}`);
+} else if (!booted) {
     console.log(`::warning::Android did not report sys.boot_completed=1 within ${minutes} minutes (it may have no serial shell; check the screenshots).`);
 }
 if (process.env.GITHUB_STEP_SUMMARY) {
@@ -324,4 +329,4 @@ if (process.env.GITHUB_STEP_SUMMARY) {
     ].join('\n'));
 }
 await Promise.race([browser.close(), sleep(15000)]);
-process.exit(exitCode);
+process.exit(process.env.BOOT_TEST_STRICT === '1' ? exitCode : 0);

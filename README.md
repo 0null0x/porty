@@ -72,7 +72,9 @@ every few seconds, and screenshots of the guest display printed as base64
 JPEG between marker lines. Recover them with
 `python3 -I tests/boot/extract-shots.py <log> <out-dir>`. Start it by hand
 from the Actions tab to try other [URL parameters](#url-parameters) (for
-example `smp=1`).
+example `smp=1`). The job stays green whatever happens to Android, because
+GitHub e-mails the repository owner about every failed run; the verdict is
+in the run's summary and in a warning annotation.
 
 When something goes wrong the page shows the reason, a hint and the last
 lines of the serial console, with a *Copy details* button. From the browser
