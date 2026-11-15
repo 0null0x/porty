@@ -30,7 +30,15 @@ case "$bus" in
 esac
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 busybox="$(command -v busybox)"
-W=480; H=800
+# EXTRA_QUERY adds URL parameters; W/H are the framebuffer size to expect.
+# e.g. EXTRA_QUERY='&gfx=vesa' W=800 H=600 SKIP_PAINT=1 exercises the VBE
+# ("vga=") path.  SKIP_PAINT=1 drops the drawing check: with a firmware
+# framebuffer the test kernel's simpledrm does not flush writes to /dev/fb0
+# into video memory (confirmed by dumping guest VRAM), so there is nothing
+# for any display backend to show.
+extra_query="${EXTRA_QUERY:-}"
+W="${W:-480}"; H="${H:-800}"
+REQ_W=480; REQ_H=800
 
 for tool in xorriso mksquashfs cpio gzip zstd node md5sum; do
     command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 2; }
@@ -146,9 +154,15 @@ if [[ "$bus" == ide ]]; then
     truncate -s %2048 "$work/image/ramdisk.img"
 fi
 
+# Only the firmware files the site ships (build/pc-bios.list).
+mkdir "$work/bios"
+while read -r rom; do
+    [[ -n "$rom" ]] && cp "$bios/$rom" "$work/bios/"
+done < "$repo/build/pc-bios.list"
+
 # --- boot with the page's own argv ---------------------------------------------
 mapfile -t args < <(node "$repo/tests/print-qemu-args.mjs" "$work/image/manifest.json" \
-    "$work/image" "$bios" "?mem=512&tb=64&smp=2&res=${W}x${H}&cache=4&parallel=3&disk=$bus&append=panic=-1")
+    "$work/image" "$work/bios" "?mem=512&tb=64&smp=2&res=${REQ_W}x${REQ_H}&cache=4&parallel=3&disk=$bus&append=panic=-1${extra_query}")
 # Pointer sweep, left click, then the keys A (30) and BACK (158), repeated
 # so that at least one burst lands while the guest is listening.
 script=""
@@ -183,7 +197,7 @@ check "guest finished"                               "PORTY-TEST: done"
 
 if [[ -f "$work/fb.ppm" ]]; then
     # Row 50 must be white (painted by the guest), row 400 must not be.
-    if python3 -I - "$work/fb.ppm" "$W" "$H" <<'PY'
+    if python3 -I - "$work/fb.ppm" "$W" "$H" "${SKIP_PAINT:-0}" <<'PY'
 import sys
 path, want_w, want_h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 data = open(path, "rb").read()
@@ -196,8 +210,11 @@ def report(good, text):
     print(("PASS  " if good else "FAIL  ") + text)
 report((w, h) == (want_w, want_h), f"framebuffer dump is {w}x{h}")
 row = lambda y: pixels[y * w * 3:(y + 1) * w * 3]
-report(row(50) == b"\xff" * (w * 3), "guest drawing is visible in the dump (row 50 is white)")
-report(row(400) != b"\xff" * (w * 3), "row 400 is not white")
+if len(sys.argv) > 4 and sys.argv[4] == "1":
+    print("SKIP  guest drawing check (SKIP_PAINT=1)")
+else:
+    report(row(50) == b"\xff" * (w * 3), "guest drawing is visible in the dump (row 50 is white)")
+    report(row(400) != b"\xff" * (w * 3), "row 400 is not white")
 sys.exit(0 if ok else 1)
 PY
     then :; else fail=1; fi

@@ -1,0 +1,11 @@
+{
+  "name": "porty-ui-test",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless-browser test of the Porty page (see run.sh)",
+  "license": "GPL-2.0-or-later",
+  "devDependencies": {
+    "puppeteer-core": "23.11.1"
+  }
+}
