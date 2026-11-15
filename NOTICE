@@ -1,0 +1,65 @@
+Porty
+=====
+
+Porty runs Android-x86 in a web browser using QEMU compiled to WebAssembly.
+
+The files in this repository are licensed under the GNU General Public
+License, version 2 or (at your option) any later version; see LICENSE.
+Exceptions are listed below and keep their own licenses.
+
+The published site bundles, and this repository builds on, the following
+third-party work.
+
+QEMU-Wasm and QEMU
+    https://github.com/ktock/qemu-wasm   (QEMU 8.2.0 patched by Kohei Tokunaga
+    for Emscripten, including a TCG backend that emits WebAssembly)
+    https://www.qemu.org/
+    License: GPL-2.0 (QEMU as a whole; see COPYING and LICENSE in that tree).
+    The site's qemu/out.js, qemu/qemu-system-x86_64.wasm and
+    qemu/qemu-system-x86_64.worker.js are built from that tree at the commit
+    pinned in build/versions.env, plus the patches in patches/qemu-wasm/.
+    Complete corresponding source = that commit + those patches; the build
+    recipe is build/build-qemu.sh and .github/workflows/build-and-deploy.yml.
+    The firmware under qemu/pc-bios/ (SeaBIOS, its VGA BIOS, linuxboot and
+    kvmvapic option ROMs) is copied unmodified from the same tree; SeaBIOS is
+    LGPL-3.0, source: https://www.seabios.org/ (QEMU's roms/ submodules).
+
+    The WebAssembly build statically links zlib (zlib license), libffi (MIT),
+    GLib (LGPL-2.1-or-later), PCRE2 (BSD) and pixman (MIT), at the versions
+    given in the Dockerfile of the QEMU-Wasm tree, and Emscripten's runtime
+    and system libraries (MIT / University of Illinois-NCSA, musl: MIT).
+
+Android-x86
+    https://www.android-x86.org/
+    The site redistributes, unmodified, the kernel, initrd.img, ramdisk.img
+    and system.sfs of android-x86_64-9.0-r2.iso (system.sfs is split into
+    fixed-size pieces that concatenate back to the original file).  The ISO
+    is not stored in this repository; the build downloads it and verifies
+    the SHA-1 published in the release note:
+        https://www.android-x86.org/releases/releasenote-9-0-r2.html
+    Android-x86 is a collection of software under many licenses (the Linux
+    kernel under GPL-2.0, the Android Open Source Project mostly under
+    Apache-2.0, and others).  Source code, as stated in the release note:
+        https://osdn.net/projects/android-x86/scm/
+        repo init -u git://git.osdn.net/gitroot/android-x86/manifest \
+             -b pie-x86 -m android-x86-9.0-r2.xml
+        https://www.android-x86.org/source.html
+    "Android" is a trademark of Google LLC.  Porty is not affiliated with
+    Google or with the Android-x86 project.
+
+coi-serviceworker 0.1.7
+    https://github.com/gzuidhof/coi-serviceworker
+    Copyright (c) 2021 Guido Zuidhof.  License: MIT.
+    web/coi-serviceworker.js is an unmodified copy; license text in
+    web/vendor/coi-serviceworker/LICENSE.
+
+xterm.js 5.3.0 and xterm-pty 0.10.1
+    https://github.com/xtermjs/xterm.js   License: MIT.
+    https://github.com/mame/xterm-pty     License: MIT.
+    Installed from npm at build time (web/package-lock.json) and copied to
+    vendor/ in the site together with their license texts.  xterm-pty's
+    emscripten-pty.js is also linked into the QEMU build by QEMU-Wasm.
+
+Design precedent (no code used)
+    Webdroid, which runs Android-x86 4.4 on the v86 emulator, showed that a
+    browser-hosted Android on an iPhone is practical.
