@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write  # live progress as a commit status (tests/boot/boot-test.mjs)
 
 # A new deployment cancels the boot test of the previous one; hand-started
 # runs with different parameters run side by side.
@@ -63,6 +64,7 @@ jobs:
       - name: Boot
         env:
           PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+          GITHUB_TOKEN: ${{ github.token }}
           QUERY: ${{ inputs.query }}
           MINUTES: ${{ inputs.minutes }}
           DUMP_FILES: ${{ inputs.dump }}

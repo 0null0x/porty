@@ -91,6 +91,42 @@ page.on('workercreated', (worker) => {
     });
 });
 
+/**
+ * Live progress as a commit status ("porty/boot ..."), which the GitHub API
+ * shows while the run is going; job logs and annotations only appear when
+ * it ends. Needs GITHUB_TOKEN with statuses: write; silently skipped
+ * without it.
+ */
+async function postStatus(state, description) {
+    const { GITHUB_TOKEN: token, GITHUB_REPOSITORY: repo, GITHUB_SHA: sha } = process.env;
+    if (!token || !repo || !sha) {
+        return;
+    }
+    const server = process.env.GITHUB_SERVER_URL || 'https://github.com';
+    const api = process.env.GITHUB_API_URL || 'https://api.github.com';
+    try {
+        const res = await fetch(`${api}/repos/${repo}/statuses/${sha}`, {
+            method: 'POST',
+            headers: {
+                authorization: `Bearer ${token}`,
+                accept: 'application/vnd.github+json',
+                'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+                state,
+                context: `porty/boot ${(process.env.QUERY || '').trim() || 'defaults'}`.slice(0, 100),
+                description: description.replace(/\s+/g, ' ').slice(0, 139),
+                target_url: `${server}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID || ''}`,
+            }),
+        });
+        if (!res.ok) {
+            log(`status update failed: HTTP ${res.status}`);
+        }
+    } catch (e) {
+        log(`status update failed: ${e.message}`);
+    }
+}
+
 /** Print a screenshot of the guest display (and optionally the page). */
 async function shot(label, wholePage = false) {
     try {
@@ -216,8 +252,9 @@ try {
     log('started');
 
     const deadline = t0 + minutes * 60000;
-    // Progress notes as GitHub annotations: readable through the API while
-    // the run is still going (the log is not). At most 9, under GitHub's cap.
+    // Progress: a commit status every two minutes (readable while the run is
+    // going), plus a notice annotation at a few points (readable at the end).
+    let nextStatus = 0;
     const notesAt = [5, 10, 15, 20, 30, 45, 60, 80, 100]
         .map((m) => t0 + m * 60000).filter((t) => t < deadline);
     const shotsAt = [2, 4, 7, 10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
@@ -316,12 +353,17 @@ try {
             exitCode = 1;
             break;
         }
+        const lastLine = serialTail.filter((l) => l.trim() && !/unsupported syscall/.test(l)).slice(-1)[0] || '';
+        const fetched = snap.disk && typeof snap.disk === 'object' ? `${Math.round(snap.disk.megabytes)}MB` : '';
+        if (Date.now() >= nextStatus) {
+            nextStatus = Date.now() + 120000;
+            await postStatus('pending', `${elapsed()} ${snap.screen} ${fetched} | ${lastLine.trim()}`);
+        }
         if (notesAt.length && Date.now() >= notesAt[0]) {
             notesAt.shift();
             const tail = serialTail.filter((l) => l.trim() && !/unsupported syscall/.test(l)).slice(-4)
                 .map((l) => l.trim().slice(0, 140)).join(' | ');
-            const read = snap.disk && typeof snap.disk === 'object' ? `${Math.round(snap.disk.megabytes)} MB fetched` : '';
-            const msg = `${elapsed()} state=${snap.state} screen=${snap.screen} ${read} ${snap.stats} :: ${tail}`;
+            const msg = `${elapsed()} state=${snap.state} screen=${snap.screen} ${fetched} ${snap.stats} :: ${tail}`;
             console.log(`::notice title=Porty boot ${elapsed()}::${msg.replace(/[\r\n%]/g, ' ')}`);
         }
         while (shotsAt.length && Date.now() >= shotsAt[0]) {
@@ -358,6 +400,7 @@ try {
 
 const verdict = exitCode ? 'failed' : (booted ? 'booted' : 'still booting at the deadline');
 log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}`);
+await postStatus(exitCode ? 'failure' : (booted ? 'success' : 'error'), `${verdict} after ${elapsed()}`);
 if (exitCode) {
     const why = lastSnap && lastSnap.failure ? lastSnap.failure.slice(0, 200) : 'see the log';
     console.log(`::warning title=Porty boot test failed::${params} - ${why}`);
