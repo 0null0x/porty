@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Porty <porty@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:53:03 +0000
+Subject: [PATCH] ui: add wasmfb, a shared-memory display and input backend for
+ the browser
+
+QEMU-Wasm runs QEMU's main loop in a Web Worker while the canvas lives on
+the browser main thread.  wasmfb publishes the location of the current
+DisplaySurface in the shared linear memory (porty_fb_poll) so JavaScript can
+blit it without an extra copy inside QEMU, and drains a lock-free input ring
+(porty_input_event) from the main loop into ui/input.c.
+
+Native builds compile the same code; PORTY_FB_DUMP and PORTY_INPUT_SCRIPT
+exist so the backend can be tested without a browser.
+---
+ qapi/ui.json   |   8 +-
+ ui/meson.build |   1 +
+ ui/wasmfb.c    | 474 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 482 insertions(+), 1 deletion(-)
+ create mode 100644 ui/wasmfb.c
+
+diff --git a/qapi/ui.json b/qapi/ui.json
+index a0158baf23..6b2836f662 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1482,6 +1482,11 @@
+ #
+ # @dbus: Start a D-Bus service for the display.  (Since 7.0)
+ #
++# @wasmfb: Porty's browser display.  Publishes the framebuffer in the
++#     WebAssembly linear memory for JavaScript to blit to a canvas,
++#     and takes pointer/keyboard input from a shared ring buffer.
++#     (Since 8.2)
++#
+ # Since: 2.12
+ ##
+ { 'enum'    : 'DisplayType',
+@@ -1494,7 +1499,8 @@
+     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
+     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
+     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
+-    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
++    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
++    { 'name': 'wasmfb' }
+   ]
+ }
+ 
+diff --git a/ui/meson.build b/ui/meson.build
+index 0ccb3387ee..e7571fb69c 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -17,6 +17,7 @@ system_ss.add(files(
+   'ui-hmp-cmds.c',
+   'ui-qmp-cmds.c',
+   'util.c',
++  'wasmfb.c',
+ ))
+ system_ss.add(when: pixman, if_true: files('console-vc.c'), if_false: files('console-vc-stubs.c'))
+ if dbus_display
+diff --git a/ui/wasmfb.c b/ui/wasmfb.c
+new file mode 100644
+index 0000000000..bbdce33ccc
+--- /dev/null
++++ b/ui/wasmfb.c
+@@ -0,0 +1,474 @@
++/*
++ * Porty "wasmfb" display + input backend for QEMU-Wasm.
++ *
++ * Copyright (c) 2026 The Porty contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * QEMU compiled with Emscripten (-pthread -sPROXY_TO_PTHREAD) runs its main
++ * loop in a Web Worker.  The canvas lives on the browser main thread.  Both
++ * sides see the same WebAssembly.Memory (a SharedArrayBuffer), so this
++ * backend never copies pixels: it only publishes *where* the current
++ * DisplaySurface lives.  JavaScript on the main thread calls the exported
++ * porty_* functions (they are plain wasm functions and only touch atomics and
++ * a tiny spinlock, so calling them off the QEMU thread is safe) and then
++ * reads the pixels straight out of the shared heap.
++ *
++ * Input travels the other way through a single-producer/single-consumer
++ * ring: JS enqueues with porty_input_event(), a QEMU timer drains the ring
++ * inside the main loop (with the BQL held) and feeds ui/input.c.
++ *
++ * Native (non-Emscripten) builds compile the very same code.  They gain two
++ * environment variables that exist purely so the backend can be exercised
++ * without a browser:
++ *   PORTY_FB_DUMP=<prefix>   write <prefix>.ppm whenever the frame changes
++ *                            (at most once per second)
++ *   PORTY_INPUT_SCRIPT="ms:type:a:b:c;ms:type:a:b:c;..."
++ *                            inject input events at the given times
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/atomic.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qemu/error-report.h"
++#include "ui/console.h"
++#include "ui/input.h"
++#include "ui/surface.h"
++#include "sysemu/runstate.h"
++#include "sysemu/sysemu.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#define PORTY_EXPORT EMSCRIPTEN_KEEPALIVE
++#else
++#define PORTY_EXPORT __attribute__((used, visibility("default")))
++#endif
++
++#define PORTY_FB_MAGIC 0x31424650u /* "PFB1" little endian */
++
++/*
++ * Layout is ABI shared with web/js/display.js: 16 little-endian uint32_t.
++ * Only append fields; never reorder.
++ */
++typedef struct PortyFbInfo {
++    uint32_t magic;     /*  0 */
++    uint32_t gen;       /*  1: bumped on every surface switch */
++    uint32_t data;      /*  2: linear-memory offset of the pixels, 0 if none */
++    uint32_t width;     /*  3 */
++    uint32_t height;    /*  4 */
++    uint32_t stride;    /*  5: bytes per row */
++    uint32_t format;    /*  6: pixman_format_code_t */
++    uint32_t bpp;       /*  7: bits per pixel */
++    uint32_t frame;     /*  8: bumped on every dpy_gfx_update */
++    uint32_t x0;        /*  9: dirty rectangle accumulated since the */
++    uint32_t y0;        /* 10: previous porty_fb_poll(); empty when  */
++    uint32_t x1;        /* 11: x1 <= x0 or y1 <= y0                   */
++    uint32_t y1;        /* 12 */
++    uint32_t refreshes; /* 13: main-loop heartbeat (dpy_refresh calls) */
++    uint32_t running;   /* 14: 1 while the VM is running, 0 when paused */
++    uint32_t reserved;  /* 15 */
++} PortyFbInfo;
++
++QEMU_BUILD_BUG_ON(sizeof(PortyFbInfo) != 16 * sizeof(uint32_t));
++
++typedef struct PortyInputEvent {
++    int32_t type;
++    int32_t a;
++    int32_t b;
++    int32_t c;
++} PortyInputEvent;
++
++enum {
++    PORTY_EV_ABS     = 1,  /* a = x, b = y, both 0..0x7fff */
++    PORTY_EV_BTN     = 2,  /* a = 0 left / 1 middle / 2 right, b = down */
++    PORTY_EV_KEY     = 3,  /* a = Linux evdev key code, b = down */
++    PORTY_EV_WHEEL   = 4,  /* a > 0 up, a < 0 down */
++    PORTY_EV_CONTROL = 10, /* a = PORTY_CTL_* */
++};
++
++enum {
++    PORTY_CTL_RESET     = 1,
++    PORTY_CTL_PAUSE     = 2,
++    PORTY_CTL_RESUME    = 3,
++    PORTY_CTL_POWERDOWN = 4,
++    PORTY_CTL_QUIT      = 5,
++};
++
++#define PORTY_RING_SIZE 512u /* power of two */
++#define PORTY_INPUT_POLL_MS 8
++
++static struct {
++    DisplayChangeListener dcl;
++    QemuConsole *con;
++    QEMUTimer *input_timer;
++
++    /* guards live (taken by the QEMU thread and by porty_fb_poll callers) */
++    int lock;
++    PortyFbInfo live;
++    PortyFbInfo snapshot;
++    void *pixels;
++
++    PortyInputEvent ring[PORTY_RING_SIZE];
++    uint32_t head; /* written by the producer (JS main thread) */
++    uint32_t tail; /* written by the consumer (QEMU main loop) */
++    uint32_t dropped;
++
++#ifndef __EMSCRIPTEN__
++    const char *dump_prefix;
++    uint32_t dump_frame;
++    int64_t dump_last_ms;
++    char *script;
++    char *script_pos;
++    int64_t script_t0;
++#endif
++} porty = {
++    .live = { .magic = PORTY_FB_MAGIC },
++};
++
++static inline void porty_lock(void)
++{
++    while (qatomic_xchg(&porty.lock, 1)) {
++        /* critical sections are a handful of loads/stores: just spin */
++    }
++}
++
++static inline void porty_unlock(void)
++{
++    qatomic_set(&porty.lock, 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* Functions exported to JavaScript                                    */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Returns the address of a snapshot of the framebuffer description and
++ * clears the accumulated dirty rectangle.  Meant to be called from exactly
++ * one thread (the browser main thread, once per animation frame).
++ */
++PORTY_EXPORT uint32_t *porty_fb_poll(void);
++uint32_t *porty_fb_poll(void)
++{
++    porty_lock();
++    porty.snapshot = porty.live;
++    porty.live.x0 = UINT32_MAX;
++    porty.live.y0 = UINT32_MAX;
++    porty.live.x1 = 0;
++    porty.live.y1 = 0;
++    porty_unlock();
++    return (uint32_t *)&porty.snapshot;
++}
++
++/* Returns 1 when queued, 0 when the ring is full (event dropped). */
++PORTY_EXPORT int porty_input_event(int type, int a, int b, int c);
++int porty_input_event(int type, int a, int b, int c)
++{
++    uint32_t head = qatomic_read(&porty.head);
++    uint32_t tail = qatomic_load_acquire(&porty.tail);
++    PortyInputEvent *ev;
++
++    if (head - tail >= PORTY_RING_SIZE) {
++        qatomic_inc(&porty.dropped);
++        return 0;
++    }
++    ev = &porty.ring[head & (PORTY_RING_SIZE - 1)];
++    ev->type = type;
++    ev->a = a;
++    ev->b = b;
++    ev->c = c;
++    qatomic_store_release(&porty.head, head + 1);
++    return 1;
++}
++
++PORTY_EXPORT int porty_abi_version(void);
++int porty_abi_version(void)
++{
++    return 1;
++}
++
++/* ------------------------------------------------------------------ */
++/* Input: drained in the QEMU main loop                                */
++/* ------------------------------------------------------------------ */
++
++static void porty_handle_control(int cmd)
++{
++    switch (cmd) {
++    case PORTY_CTL_RESET:
++        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
++        break;
++    case PORTY_CTL_PAUSE:
++        if (runstate_is_running()) {
++            vm_stop(RUN_STATE_PAUSED);
++        }
++        break;
++    case PORTY_CTL_RESUME:
++        if (!runstate_is_running()) {
++            vm_start();
++        }
++        break;
++    case PORTY_CTL_POWERDOWN:
++        qemu_system_powerdown_request();
++        break;
++    case PORTY_CTL_QUIT:
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++        break;
++    default:
++        break;
++    }
++}
++
++static void porty_dispatch(const PortyInputEvent *ev)
++{
++    static const InputButton btn_map[] = {
++        INPUT_BUTTON_LEFT, INPUT_BUTTON_MIDDLE, INPUT_BUTTON_RIGHT,
++    };
++    QemuConsole *con = porty.con;
++
++    switch (ev->type) {
++    case PORTY_EV_ABS:
++        qemu_input_queue_abs(con, INPUT_AXIS_X, ev->a,
++                             INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX);
++        qemu_input_queue_abs(con, INPUT_AXIS_Y, ev->b,
++                             INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX);
++        qemu_input_event_sync();
++        break;
++    case PORTY_EV_BTN:
++        if (ev->a >= 0 && ev->a < (int)ARRAY_SIZE(btn_map)) {
++            qemu_input_queue_btn(con, btn_map[ev->a], !!ev->b);
++            qemu_input_event_sync();
++        }
++        break;
++    case PORTY_EV_KEY: {
++        int qcode = ev->a > 0 ? qemu_input_linux_to_qcode(ev->a) : 0;
++        if (qcode) {
++            qemu_input_event_send_key_qcode(con, qcode, !!ev->b);
++        }
++        break;
++    }
++    case PORTY_EV_WHEEL:
++        if (ev->a) {
++            InputButton btn = ev->a > 0 ? INPUT_BUTTON_WHEEL_UP
++                                        : INPUT_BUTTON_WHEEL_DOWN;
++            qemu_input_queue_btn(con, btn, true);
++            qemu_input_event_sync();
++            qemu_input_queue_btn(con, btn, false);
++            qemu_input_event_sync();
++        }
++        break;
++    case PORTY_EV_CONTROL:
++        porty_handle_control(ev->a);
++        break;
++    default:
++        break;
++    }
++}
++
++static void porty_drain_input(void)
++{
++    uint32_t tail = qatomic_read(&porty.tail);
++    uint32_t head = qatomic_load_acquire(&porty.head);
++
++    while (tail != head) {
++        PortyInputEvent ev = porty.ring[tail & (PORTY_RING_SIZE - 1)];
++        tail++;
++        qatomic_store_release(&porty.tail, tail);
++        porty_dispatch(&ev);
++    }
++}
++
++#ifndef __EMSCRIPTEN__
++static void porty_run_script(void)
++{
++    int64_t now;
++
++    if (!porty.script_pos) {
++        return;
++    }
++    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - porty.script_t0;
++    while (*porty.script_pos) {
++        long long ms;
++        int type, a, b, c, n = 0;
++
++        if (sscanf(porty.script_pos, "%lld:%d:%d:%d:%d%n",
++                   &ms, &type, &a, &b, &c, &n) != 5) {
++            error_report("wasmfb: bad PORTY_INPUT_SCRIPT near '%s'",
++                         porty.script_pos);
++            porty.script_pos = NULL;
++            return;
++        }
++        if (ms > now) {
++            return;
++        }
++        porty_input_event(type, a, b, c);
++        porty.script_pos += n;
++        if (*porty.script_pos == ';') {
++            porty.script_pos++;
++        }
++    }
++    porty.script_pos = NULL;
++}
++
++static void porty_dump_frame(void)
++{
++    g_autofree char *tmp = NULL;
++    g_autofree char *path = NULL;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    PortyFbInfo fb = porty.live;
++    uint8_t *src = porty.pixels;
++    FILE *f;
++    uint32_t x, y;
++
++    if (!porty.dump_prefix || !src || fb.bpp != 32 ||
++        fb.frame == porty.dump_frame || now - porty.dump_last_ms < 1000) {
++        return;
++    }
++    porty.dump_frame = fb.frame;
++    porty.dump_last_ms = now;
++
++    path = g_strdup_printf("%s.ppm", porty.dump_prefix);
++    tmp = g_strdup_printf("%s.ppm.tmp", porty.dump_prefix);
++    f = fopen(tmp, "wb");
++    if (!f) {
++        return;
++    }
++    fprintf(f, "P6\n%u %u\n255\n", fb.width, fb.height);
++    for (y = 0; y < fb.height; y++) {
++        const uint8_t *row = src + (size_t)y * fb.stride;
++        for (x = 0; x < fb.width; x++) {
++            /* PIXMAN_x8r8g8b8 on little endian: B, G, R, X in memory */
++            fputc(row[x * 4 + 2], f);
++            fputc(row[x * 4 + 1], f);
++            fputc(row[x * 4 + 0], f);
++        }
++    }
++    fclose(f);
++    if (rename(tmp, path) < 0) {
++        unlink(tmp);
++    }
++}
++#endif /* !__EMSCRIPTEN__ */
++
++static void porty_input_timer_cb(void *opaque)
++{
++#ifndef __EMSCRIPTEN__
++    porty_run_script();
++#endif
++    porty_drain_input();
++    qatomic_set(&porty.live.running, runstate_is_running() ? 1 : 0);
++    timer_mod(porty.input_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + PORTY_INPUT_POLL_MS);
++}
++
++/* ------------------------------------------------------------------ */
++/* DisplayChangeListener                                               */
++/* ------------------------------------------------------------------ */
++
++static void wasmfb_gfx_switch(DisplayChangeListener *dcl,
++                              DisplaySurface *surface)
++{
++    porty_lock();
++    porty.pixels = surface ? surface_data(surface) : NULL;
++    porty.live.data = (uint32_t)(uintptr_t)porty.pixels;
++    porty.live.width = surface ? surface_width(surface) : 0;
++    porty.live.height = surface ? surface_height(surface) : 0;
++    porty.live.stride = surface ? surface_stride(surface) : 0;
++    porty.live.format = surface ? surface_format(surface) : 0;
++    porty.live.bpp = surface ? surface_bits_per_pixel(surface) : 0;
++    porty.live.gen++;
++    porty.live.frame++;
++    porty.live.x0 = 0;
++    porty.live.y0 = 0;
++    porty.live.x1 = porty.live.width;
++    porty.live.y1 = porty.live.height;
++    porty_unlock();
++}
++
++static void wasmfb_gfx_update(DisplayChangeListener *dcl,
++                              int x, int y, int w, int h)
++{
++    uint32_t x0 = MAX(x, 0);
++    uint32_t y0 = MAX(y, 0);
++    uint32_t x1 = MAX(x + w, 0);
++    uint32_t y1 = MAX(y + h, 0);
++
++    porty_lock();
++    porty.live.x0 = MIN(porty.live.x0, x0);
++    porty.live.y0 = MIN(porty.live.y0, y0);
++    porty.live.x1 = MAX(porty.live.x1, MIN(x1, porty.live.width));
++    porty.live.y1 = MAX(porty.live.y1, MIN(y1, porty.live.height));
++    porty.live.frame++;
++    porty_unlock();
++}
++
++/*
++ * Only accept the one layout the JS blitter understands (B, G, R, X bytes).
++ * hw/display/vga.c then keeps a 32 bpp shadow surface for 15/16/24 bpp guest
++ * modes instead of handing us the guest's video memory directly.
++ */
++static bool wasmfb_check_format(DisplayChangeListener *dcl,
++                                pixman_format_code_t format)
++{
++    return format == PIXMAN_x8r8g8b8 || format == PIXMAN_a8r8g8b8;
++}
++
++static void wasmfb_refresh(DisplayChangeListener *dcl)
++{
++    graphic_hw_update(dcl->con);
++    porty_drain_input();
++    qatomic_inc(&porty.live.refreshes);
++#ifndef __EMSCRIPTEN__
++    porty_dump_frame();
++#endif
++}
++
++static const DisplayChangeListenerOps wasmfb_ops = {
++    .dpy_name             = "wasmfb",
++    .dpy_refresh          = wasmfb_refresh,
++    .dpy_gfx_update       = wasmfb_gfx_update,
++    .dpy_gfx_switch       = wasmfb_gfx_switch,
++    .dpy_gfx_check_format = wasmfb_check_format,
++};
++
++static void wasmfb_init(DisplayState *ds, DisplayOptions *opts)
++{
++    porty.con = qemu_console_lookup_by_index(0);
++    if (!porty.con) {
++        error_report("wasmfb: no graphical console; add a display device");
++        exit(1);
++    }
++
++#ifndef __EMSCRIPTEN__
++    porty.dump_prefix = getenv("PORTY_FB_DUMP");
++    if (getenv("PORTY_INPUT_SCRIPT")) {
++        porty.script = g_strdup(getenv("PORTY_INPUT_SCRIPT"));
++        porty.script_pos = porty.script;
++        porty.script_t0 = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    }
++#endif
++
++    porty.live.x0 = UINT32_MAX;
++    porty.live.y0 = UINT32_MAX;
++    porty.live.running = 1;
++
++    porty.dcl.ops = &wasmfb_ops;
++    porty.dcl.con = porty.con;
++    register_displaychangelistener(&porty.dcl);
++
++    porty.input_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
++                                     porty_input_timer_cb, NULL);
++    timer_mod(porty.input_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + PORTY_INPUT_POLL_MS);
++}
++
++static QemuDisplay qemu_display_wasmfb = {
++    .type = DISPLAY_TYPE_WASMFB,
++    .init = wasmfb_init,
++};
++
++static void register_wasmfb(void)
++{
++    qemu_display_register(&qemu_display_wasmfb);
++}
++
++type_init(register_wasmfb);

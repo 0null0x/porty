@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Porty <porty@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:01:41 +0000
+Subject: [PATCH] Dockerfile: fetch the pinned zlib from a location that keeps
+ old releases
+
+https://zlib.net/zlib-<version>.tar.xz only exists for the newest zlib
+release; once a newer one is published the URL returns 404 and the image
+no longer builds.  Use the GitHub release asset, with zlib.net's fossils
+directory as a fallback.
+---
+ Dockerfile | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index 183b2c5c8f..2207b19c65 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -34,7 +34,10 @@ RUN mkdir -p $TARGET
+ FROM build-base AS zlib-emscripten-dev
+ ARG ZLIB_VERSION
+ RUN mkdir -p /zlib
+-RUN curl -Ls https://zlib.net/zlib-$ZLIB_VERSION.tar.xz | tar xJC /zlib --strip-components=1
++# zlib.net only keeps the newest release at this path; older tarballs move
++# to /fossils/.  Fetch the pinned version from the GitHub release instead.
++RUN curl -fLs https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.xz | tar xJC /zlib --strip-components=1 \
++    || curl -fLs https://zlib.net/fossils/zlib-$ZLIB_VERSION.tar.gz | tar xzC /zlib --strip-components=1
+ WORKDIR /zlib
+ RUN emconfigure ./configure --prefix=$TARGET --static
+ RUN make install

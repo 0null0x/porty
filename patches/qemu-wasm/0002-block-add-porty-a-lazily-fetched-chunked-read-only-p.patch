@@ -1,0 +1,576 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Porty <porty@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:53:04 +0000
+Subject: [PATCH] block: add porty, a lazily fetched chunked read-only protocol
+ driver
+
+Serves an image published as fixed-size chunk files.  Under Emscripten each
+chunk is fetched with a synchronous XMLHttpRequest from a thread-pool thread
+(a Web Worker), so neither QEMU's main loop nor the browser main thread
+blocks on the network.  Native builds read the chunks from a directory,
+which lets the cache and coroutine logic be tested outside the browser.
+---
+ block/meson.build |   1 +
+ block/porty.c     | 541 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 542 insertions(+)
+ create mode 100644 block/porty.c
+
+diff --git a/block/meson.build b/block/meson.build
+index 59ff6d380c..9f594ace93 100644
+--- a/block/meson.build
++++ b/block/meson.build
+@@ -21,6 +21,7 @@ block_ss.add(files(
+   'mirror.c',
+   'nbd.c',
+   'null.c',
++  'porty.c',
+   'preallocate.c',
+   'progress_meter.c',
+   'qapi.c',
+diff --git a/block/porty.c b/block/porty.c
+new file mode 100644
+index 0000000000..ac8912a2db
+--- /dev/null
++++ b/block/porty.c
+@@ -0,0 +1,541 @@
++/*
++ * Porty chunked read-only block driver ("porty").
++ *
++ * Copyright (c) 2026 The Porty contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * A disk image is published as fixed-size chunk files
++ *
++ *     <url>/000000.bin, <url>/000001.bin, ...
++ *
++ * (every chunk is exactly chunk-size bytes, the last one may be short).
++ * Chunks are fetched lazily, the first time the guest reads them:
++ *
++ *  - Emscripten: with a synchronous XMLHttpRequest issued from a QEMU
++ *    thread-pool thread.  Every pthread is a Web Worker, where synchronous
++ *    binary XHR is allowed, so neither the QEMU main loop nor the browser
++ *    main thread ever blocks on the network.  (Emscripten's own filesystem
++ *    lives on the browser main thread in pthread builds, which is why a
++ *    lazily loaded *file* cannot do this job.)
++ *  - native builds: <url> is a local directory and chunks are read with
++ *    pread(), which lets the exact same cache/coroutine logic be tested
++ *    outside the browser.
++ *
++ * A small LRU cache of decoded chunks lives on the C heap.  The guest page
++ * cache and the browser HTTP cache sit on either side of it, so it only has
++ * to be big enough to absorb sequential access patterns.
++ *
++ * Usage:
++ *   -drive if=none,id=sys,format=raw,read-only=on,file.driver=porty,\
++ *          file.url=<url>,file.size=<bytes>,file.chunk-size=<bytes>
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qmp/qdict.h"
++#include "qemu/atomic.h"
++#include "qemu/module.h"
++#include "qemu/option.h"
++#include "qemu/coroutine.h"
++#include "qemu/iov.h"
++#include "qemu/memalign.h"
++#include "block/block-io.h"
++#include "block/block_int.h"
++#include "block/thread-pool.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#define PORTY_EXPORT EMSCRIPTEN_KEEPALIVE
++#else
++#define PORTY_EXPORT __attribute__((used, visibility("default")))
++#endif
++
++#define PORTY_OPT_URL        "url"
++#define PORTY_OPT_CHUNK_SIZE "chunk-size"
++#define PORTY_OPT_CACHE      "cache-chunks"
++#define PORTY_OPT_PARALLEL   "parallel"
++
++#define PORTY_DEFAULT_CHUNK    (2 * 1024 * 1024)
++#define PORTY_MAX_CHUNK        (64 * 1024 * 1024)
++#define PORTY_DEFAULT_CACHE    16
++#define PORTY_MIN_CACHE        4
++#define PORTY_DEFAULT_PARALLEL 4
++#define PORTY_FETCH_ATTEMPTS   4
++
++/*
++ * Download statistics, shared with web/js/emulator.js (8 x uint32_t, ABI:
++ * only append).  Updated with atomics from thread-pool threads and read by
++ * the browser main thread through porty_disk_stats().
++ */
++typedef struct PortyDiskStats {
++    uint32_t chunks_total;    /* 0: number of chunks in the image */
++    uint32_t chunks_fetched;  /* 1: successful fetches (not cache hits) */
++    uint32_t bytes_fetched_kb;/* 2 */
++    uint32_t in_flight;       /* 3: fetches currently running */
++    uint32_t errors;          /* 4: failed fetch attempts */
++    uint32_t cache_hits;      /* 5 */
++    uint32_t last_chunk;      /* 6: index of the most recent fetch */
++    uint32_t reserved;        /* 7 */
++} PortyDiskStats;
++
++QEMU_BUILD_BUG_ON(sizeof(PortyDiskStats) != 8 * sizeof(uint32_t));
++
++static PortyDiskStats porty_stats;
++
++PORTY_EXPORT uint32_t *porty_disk_stats(void);
++uint32_t *porty_disk_stats(void)
++{
++    return (uint32_t *)&porty_stats;
++}
++
++typedef enum {
++    PORTY_ENTRY_EMPTY,
++    PORTY_ENTRY_LOADING,
++    PORTY_ENTRY_READY,
++} PortyEntryState;
++
++typedef struct PortyCacheEntry {
++    PortyEntryState state;
++    int64_t index;
++    uint64_t last_use;
++    uint8_t *buf;
++    CoQueue waiters;
++} PortyCacheEntry;
++
++typedef struct BDRVPortyState {
++    char *url;
++    int64_t length;
++    int64_t chunk_size;
++    int64_t nb_chunks;
++
++    PortyCacheEntry *cache;
++    int cache_entries;
++    uint64_t use_counter;
++
++    int parallel;
++    int in_flight;
++    CoQueue slot_waiters;
++} BDRVPortyState;
++
++typedef struct PortyFetchJob {
++    BDRVPortyState *s;
++    int64_t index;
++    uint8_t *buf;
++    size_t len;
++} PortyFetchJob;
++
++static QemuOptsList runtime_opts = {
++    .name = "porty",
++    .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
++    .desc = {
++        {
++            .name = PORTY_OPT_URL,
++            .type = QEMU_OPT_STRING,
++            .help = "base URL (Emscripten) or directory (native) of the "
++                    "chunk files",
++        },
++        {
++            .name = BLOCK_OPT_SIZE,
++            .type = QEMU_OPT_SIZE,
++            .help = "size of the image in bytes",
++        },
++        {
++            .name = PORTY_OPT_CHUNK_SIZE,
++            .type = QEMU_OPT_SIZE,
++            .help = "size of one chunk file in bytes (default 2M)",
++        },
++        {
++            .name = PORTY_OPT_CACHE,
++            .type = QEMU_OPT_NUMBER,
++            .help = "number of chunks kept in memory (default 16)",
++        },
++        {
++            .name = PORTY_OPT_PARALLEL,
++            .type = QEMU_OPT_NUMBER,
++            .help = "maximum number of concurrent fetches (default 4)",
++        },
++        { /* end of list */ }
++    },
++};
++
++/* ------------------------------------------------------------------ */
++/* Fetching one chunk (runs in a thread-pool thread)                   */
++/* ------------------------------------------------------------------ */
++
++#ifdef __EMSCRIPTEN__
++/*
++ * Returns the number of bytes stored at dst, or a negative number:
++ * -(HTTP status) for HTTP errors, -1 for network errors / exceptions and
++ * -2 when the body was larger than the buffer.
++ */
++EM_JS(int, porty_js_fetch, (const char *url, uint8_t *dst, int cap), {
++    /* Note: only double-quoted strings in here (C preprocessor tokens). */
++    try {
++        var xhr = new XMLHttpRequest();
++        xhr.open("GET", UTF8ToString(url), false);
++        xhr.responseType = "arraybuffer";
++        xhr.send(null);
++        if (xhr.status !== 200) {
++            return -(xhr.status || 1);
++        }
++        var body = new Uint8Array(xhr.response);
++        if (body.length > cap) {
++            return -2;
++        }
++        HEAPU8.set(body, dst >>> 0);
++        return body.length;
++    } catch (e) {
++        return -1;
++    }
++})
++
++static int porty_fetch_once(const char *path, uint8_t *buf, size_t len)
++{
++    int n = porty_js_fetch(path, buf, (int)len);
++
++    if (n < 0) {
++        return -EIO;
++    }
++    return n;
++}
++#else
++static int porty_fetch_once(const char *path, uint8_t *buf, size_t len)
++{
++    size_t done = 0;
++    int fd = open(path, O_RDONLY);
++
++    if (fd < 0) {
++        return -errno;
++    }
++    while (done < len) {
++        ssize_t n = pread(fd, buf + done, len - done, done);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            close(fd);
++            return -errno;
++        }
++        if (n == 0) {
++            break;
++        }
++        done += n;
++    }
++    close(fd);
++    return done;
++}
++#endif
++
++static int porty_fetch_worker(void *opaque)
++{
++    PortyFetchJob *job = opaque;
++    g_autofree char *path = g_strdup_printf("%s/%06" PRId64 ".bin",
++                                            job->s->url, job->index);
++    int attempt;
++    int ret = -EIO;
++
++    qatomic_inc(&porty_stats.in_flight);
++    qatomic_set(&porty_stats.last_chunk, (uint32_t)job->index);
++    for (attempt = 0; attempt < PORTY_FETCH_ATTEMPTS; attempt++) {
++        if (attempt) {
++            g_usleep(250000u << attempt); /* 0.5 s, 1 s, 2 s */
++        }
++        ret = porty_fetch_once(path, job->buf, job->len);
++        if (ret == (int)job->len) {
++            qatomic_inc(&porty_stats.chunks_fetched);
++            qatomic_add(&porty_stats.bytes_fetched_kb,
++                        (uint32_t)(job->len / 1024));
++            ret = 0;
++            break;
++        }
++        /* a short body is as bad as an error: never hand out partial data */
++        qatomic_inc(&porty_stats.errors);
++        ret = ret < 0 ? ret : -EIO;
++    }
++    qatomic_dec(&porty_stats.in_flight);
++    return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Cache (only touched from coroutines in the node's AioContext)       */
++/* ------------------------------------------------------------------ */
++
++static PortyCacheEntry *porty_cache_lookup(BDRVPortyState *s, int64_t index)
++{
++    int i;
++
++    for (i = 0; i < s->cache_entries; i++) {
++        if (s->cache[i].state != PORTY_ENTRY_EMPTY &&
++            s->cache[i].index == index) {
++            return &s->cache[i];
++        }
++    }
++    return NULL;
++}
++
++static PortyCacheEntry *porty_cache_victim(BDRVPortyState *s)
++{
++    PortyCacheEntry *victim = NULL;
++    int i;
++
++    for (i = 0; i < s->cache_entries; i++) {
++        PortyCacheEntry *e = &s->cache[i];
++
++        if (e->state == PORTY_ENTRY_EMPTY) {
++            return e;
++        }
++        if (e->state == PORTY_ENTRY_READY &&
++            (!victim || e->last_use < victim->last_use)) {
++            victim = e;
++        }
++    }
++    return victim;
++}
++
++static size_t porty_chunk_len(BDRVPortyState *s, int64_t index)
++{
++    int64_t start = index * s->chunk_size;
++
++    return MIN(s->chunk_size, s->length - start);
++}
++
++/*
++ * Returns a READY entry for @index.  The entry stays valid until the
++ * calling coroutine yields.
++ */
++static int coroutine_fn porty_co_get_chunk(BDRVPortyState *s, int64_t index,
++                                           PortyCacheEntry **out)
++{
++    PortyCacheEntry *e;
++    PortyFetchJob job;
++    int ret;
++
++    for (;;) {
++        e = porty_cache_lookup(s, index);
++        if (e && e->state == PORTY_ENTRY_READY) {
++            qatomic_inc(&porty_stats.cache_hits);
++            break;
++        }
++        if (e) {
++            /* somebody else is already fetching this chunk */
++            qemu_co_queue_wait(&e->waiters, NULL);
++            continue;
++        }
++        if (s->in_flight >= s->parallel) {
++            qemu_co_queue_wait(&s->slot_waiters, NULL);
++            continue;
++        }
++        e = porty_cache_victim(s);
++        if (!e) {
++            /* every entry is loading; cannot happen while cache > parallel */
++            qemu_co_queue_wait(&s->slot_waiters, NULL);
++            continue;
++        }
++
++        e->state = PORTY_ENTRY_LOADING;
++        e->index = index;
++        s->in_flight++;
++
++        job = (PortyFetchJob) {
++            .s = s,
++            .index = index,
++            .buf = e->buf,
++            .len = porty_chunk_len(s, index),
++        };
++        if (job.len < s->chunk_size) {
++            /* short last chunk: reads past the end of the image see zeroes */
++            memset(e->buf + job.len, 0, s->chunk_size - job.len);
++        }
++        ret = thread_pool_submit_co(porty_fetch_worker, &job);
++
++        s->in_flight--;
++        if (ret < 0) {
++            e->state = PORTY_ENTRY_EMPTY;
++            e->index = -1;
++        } else {
++            e->state = PORTY_ENTRY_READY;
++        }
++        /*
++         * Wake everybody: a woken coroutine may be satisfied from the cache
++         * without taking the free slot, so waking just one could strand the
++         * others.
++         */
++        qemu_co_queue_restart_all(&e->waiters);
++        qemu_co_queue_restart_all(&s->slot_waiters);
++        if (ret < 0) {
++            return ret;
++        }
++        break;
++    }
++
++    e->last_use = ++s->use_counter;
++    *out = e;
++    return 0;
++}
++
++static int coroutine_fn porty_co_preadv(BlockDriverState *bs, int64_t offset,
++                                        int64_t bytes, QEMUIOVector *qiov,
++                                        BdrvRequestFlags flags)
++{
++    BDRVPortyState *s = bs->opaque;
++    size_t qiov_offset = 0;
++
++    while (bytes > 0) {
++        int64_t index = offset / s->chunk_size;
++        size_t in_chunk = offset % s->chunk_size;
++        size_t n = MIN((int64_t)(s->chunk_size - in_chunk), bytes);
++        PortyCacheEntry *e;
++        int ret;
++
++        if (offset >= s->length) {
++            qemu_iovec_memset(qiov, qiov_offset, 0, bytes);
++            break;
++        }
++        ret = porty_co_get_chunk(s, index, &e);
++        if (ret < 0) {
++            return ret;
++        }
++        /* no yield between getting the entry and copying out of it */
++        qemu_iovec_from_buf(qiov, qiov_offset, e->buf + in_chunk, n);
++
++        offset += n;
++        bytes -= n;
++        qiov_offset += n;
++    }
++    return 0;
++}
++
++static int64_t coroutine_fn porty_co_getlength(BlockDriverState *bs)
++{
++    BDRVPortyState *s = bs->opaque;
++
++    return s->length;
++}
++
++static void porty_refresh_limits(BlockDriverState *bs, Error **errp)
++{
++    bs->bl.request_alignment = 1;
++}
++
++static void porty_close(BlockDriverState *bs)
++{
++    BDRVPortyState *s = bs->opaque;
++    int i;
++
++    for (i = 0; i < s->cache_entries; i++) {
++        qemu_vfree(s->cache[i].buf);
++    }
++    g_free(s->cache);
++    g_free(s->url);
++}
++
++static int porty_file_open(BlockDriverState *bs, QDict *options, int flags,
++                           Error **errp)
++{
++    BDRVPortyState *s = bs->opaque;
++    QemuOpts *opts;
++    const char *url;
++    int64_t cache;
++    int ret = -EINVAL;
++    int i;
++
++    opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
++    if (!qemu_opts_absorb_qdict(opts, options, errp)) {
++        goto out;
++    }
++
++    url = qemu_opt_get(opts, PORTY_OPT_URL);
++    if (!url || !*url) {
++        error_setg(errp, "porty: the 'url' option is required");
++        goto out;
++    }
++    s->length = qemu_opt_get_size(opts, BLOCK_OPT_SIZE, 0);
++    if (s->length <= 0) {
++        error_setg(errp, "porty: the 'size' option is required");
++        goto out;
++    }
++    s->chunk_size = qemu_opt_get_size(opts, PORTY_OPT_CHUNK_SIZE,
++                                      PORTY_DEFAULT_CHUNK);
++    if (s->chunk_size < BDRV_SECTOR_SIZE || s->chunk_size > PORTY_MAX_CHUNK ||
++        !is_power_of_2(s->chunk_size)) {
++        error_setg(errp, "porty: chunk-size must be a power of two between "
++                   "512 and %d", PORTY_MAX_CHUNK);
++        goto out;
++    }
++    s->parallel = qemu_opt_get_number(opts, PORTY_OPT_PARALLEL,
++                                      PORTY_DEFAULT_PARALLEL);
++    s->parallel = MAX(1, MIN(s->parallel, 16));
++    cache = qemu_opt_get_number(opts, PORTY_OPT_CACHE, PORTY_DEFAULT_CACHE);
++    cache = MAX(cache, PORTY_MIN_CACHE);
++    cache = MAX(cache, s->parallel + 1);
++    cache = MIN(cache, 4096);
++
++    ret = bdrv_apply_auto_read_only(bs, "porty images are read-only", errp);
++    if (ret < 0) {
++        goto out;
++    }
++
++    s->url = g_strdup(url);
++    /* tolerate a trailing slash so that "<url>/%06d.bin" stays canonical */
++    while (strlen(s->url) > 1 && s->url[strlen(s->url) - 1] == '/') {
++        s->url[strlen(s->url) - 1] = '\0';
++    }
++    s->nb_chunks = DIV_ROUND_UP(s->length, s->chunk_size);
++    s->cache_entries = MIN(cache, MAX(s->nb_chunks, s->parallel + 1));
++    s->cache = g_new0(PortyCacheEntry, s->cache_entries);
++    for (i = 0; i < s->cache_entries; i++) {
++        s->cache[i].buf = qemu_try_memalign(4096, s->chunk_size);
++        if (!s->cache[i].buf) {
++            error_setg(errp, "porty: cannot allocate the chunk cache");
++            while (i-- > 0) {
++                qemu_vfree(s->cache[i].buf);
++            }
++            g_free(s->cache);
++            g_free(s->url);
++            s->cache = NULL;
++            s->url = NULL;
++            s->cache_entries = 0;
++            ret = -ENOMEM;
++            goto out;
++        }
++        s->cache[i].state = PORTY_ENTRY_EMPTY;
++        s->cache[i].index = -1;
++        qemu_co_queue_init(&s->cache[i].waiters);
++    }
++    qemu_co_queue_init(&s->slot_waiters);
++    qatomic_set(&porty_stats.chunks_total, (uint32_t)s->nb_chunks);
++
++    bs->supported_read_flags = 0;
++    ret = 0;
++out:
++    qemu_opts_del(opts);
++    return ret;
++}
++
++static const char *const porty_strong_runtime_opts[] = {
++    PORTY_OPT_URL,
++    BLOCK_OPT_SIZE,
++    PORTY_OPT_CHUNK_SIZE,
++    NULL
++};
++
++static BlockDriver bdrv_porty = {
++    .format_name            = "porty",
++    .protocol_name          = "porty",
++    .instance_size          = sizeof(BDRVPortyState),
++
++    .bdrv_file_open         = porty_file_open,
++    .bdrv_close             = porty_close,
++    .bdrv_co_getlength      = porty_co_getlength,
++    .bdrv_refresh_limits    = porty_refresh_limits,
++    .bdrv_co_preadv         = porty_co_preadv,
++
++    .strong_runtime_opts    = porty_strong_runtime_opts,
++};
++
++static void bdrv_porty_init(void)
++{
++    bdrv_register(&bdrv_porty);
++}
++
++block_init(bdrv_porty_init);
