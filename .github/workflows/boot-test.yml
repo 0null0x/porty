@@ -23,8 +23,10 @@ on:
 permissions:
   contents: read
 
+# A new deployment cancels the boot test of the previous one; hand-started
+# runs with different parameters run side by side.
 concurrency:
-  group: boot-test
+  group: boot-test-${{ github.event_name }}-${{ inputs.query }}
   cancel-in-progress: true
 
 defaults:

@@ -52,11 +52,34 @@ const browser = await puppeteer.launch({
 });
 const page = await browser.newPage();
 await page.setViewport({ width: 480, height: 900 });
-page.on('pageerror', (e) => log(`pageerror: ${e}`));
-page.on('console', (m) => {
-    if (m.type() === 'error') {
-        log(`console.error: ${m.text()}`);
+page.on('pageerror', (e) => log(`pageerror: ${(e && e.stack) || e}`));
+// Error objects arrive as handles; turn them into their stacks.
+const describe = (handle) => handle.evaluate((v) => {
+    if (v instanceof Error) {
+        return v.stack || String(v);
     }
+    if (v && typeof v === 'object') {
+        try {
+            return JSON.stringify(v);
+        } catch (e) {
+            return String(v);
+        }
+    }
+    return String(v);
+}).catch(() => '?');
+page.on('console', async (m) => {
+    if (m.type() === 'error') {
+        const parts = await Promise.all(m.args().map(describe));
+        log(`console.error: ${parts.join(' ') || m.text()}`);
+    }
+});
+// Uncaught exceptions inside QEMU's threads (Web Workers), with their wasm
+// stacks: the page itself only gets "worker sent an error!" and a line number.
+page.on('workercreated', (worker) => {
+    const name = worker.url().split('/').pop().split('?')[0];
+    worker.client.on('Runtime.exceptionThrown', ({ exceptionDetails: d }) => {
+        log(`worker exception (${name}): ${(d.exception && d.exception.description) || d.text}`);
+    });
 });
 
 /** Print a screenshot of the guest display (and optionally the page). */

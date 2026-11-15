@@ -10,6 +10,12 @@ name: Build and deploy
 on:
   push:
     branches: [main]
+    # Changes that cannot alter the site do not redeploy it.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'tests/boot/**'
+      - '.github/workflows/boot-test.yml'
   workflow_dispatch:
     inputs:
       rebuild_qemu:
