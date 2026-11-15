@@ -1,0 +1,237 @@
+# Builds QEMU-Wasm with the Porty patches, prepares the Android-x86 image and
+# deploys the static site to GitHub Pages.
+#
+# One-time setup: Settings > Pages > Build and deployment > Source = "GitHub Actions".
+#
+# Actions are pinned to full commit SHAs (the tag each SHA carried when it
+# was pinned is in the trailing comment).
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rebuild_qemu:
+        description: Rebuild QEMU-Wasm even if a cached build exists
+        type: boolean
+        default: false
+      deploy:
+        description: Deploy to GitHub Pages after building
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  checks:
+    name: Lint and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools
+
+      - name: Shell scripts
+        run: shellcheck -x build/*.sh scripts/*.sh tests/*.sh
+
+      - name: JavaScript syntax
+        run: |
+          for f in web/js/*.js tests/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: Unit tests
+        run: |
+          node tests/wasm-patch.test.mjs
+          node tests/unit.test.mjs
+
+      - name: Image and site pipeline on a miniature ISO
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          tests/site-smoke.sh "$RUNNER_TEMP/smoke"
+
+  build:
+    name: Build QEMU-Wasm and the site
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+          df -h /
+
+      # ------------------------------------------------------------ QEMU ---
+      - name: Restore cached QEMU-Wasm build
+        id: qemu-cache
+        if: ${{ !inputs.rebuild_qemu }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-wasm"
+
+      - name: Set up Docker Buildx
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Prepare an empty Docker build context
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: mkdir -p "$RUNNER_TEMP/empty-context"
+
+      # QEMU-Wasm's own Dockerfile: Emscripten 3.1.50 plus zlib, libffi, glib
+      # and pixman built for wasm32.  It uses no build context.
+      - name: Build the toolchain image
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ runner.temp }}/empty-context
+          file: ${{ runner.temp }}/qemu-wasm/Dockerfile
+          tags: porty-qemu-build:local
+          load: true
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=qemu-wasm-toolchain
+          cache-to: type=gha,scope=qemu-wasm-toolchain,mode=max
+
+      - name: Compile qemu-system-x86_64 to WebAssembly
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        env:
+          WASM_MEMORY_MB: ${{ steps.versions.outputs.wasm_memory_mb }}
+        run: |
+          mkdir -p out/qemu
+          docker run --rm \
+            -e WASM_MEMORY_MB \
+            -v "$RUNNER_TEMP/qemu-wasm:/qemu" \
+            -v "$PWD:/porty:ro" \
+            -v "$PWD/out/qemu:/out" \
+            porty-qemu-build:local \
+            bash /porty/build/build-qemu.sh
+          sudo chown -R "$(id -u):$(id -g)" out/qemu
+          ls -l out/qemu
+
+      - name: Save the QEMU-Wasm build
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Free disk space
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          docker system prune --all --force >/dev/null || true
+          sudo rm -rf "$RUNNER_TEMP/qemu-wasm"
+          df -h /
+
+      - name: Verify the QEMU-Wasm build
+        env:
+          WASM_MEMORY_MB: ${{ steps.versions.outputs.wasm_memory_mb }}
+        run: |
+          python3 scripts/wasm-info.py out/qemu/qemu-system-x86_64.wasm --expect-memory-mb "$WASM_MEMORY_MB"
+          test -s out/qemu/out.js
+          test -s out/qemu/qemu-system-x86_64.worker.js
+          test -s out/qemu/build-info.json
+
+      # ------------------------------------------------------- Android ---
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Save the Android-x86 ISO
+        if: steps.iso-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Extract kernel, ramdisks and chunk system.sfs
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
+          rm -rf out/iso
+          df -h /
+
+      # ----------------------------------------------------------- site ---
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install browser-side dependencies
+        working-directory: web
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Assemble the site
+        run: scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$GITHUB_SHA"
+
+      - name: Configure Pages
+        if: ${{ github.event_name == 'push' || inputs.deploy }}
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload the Pages artifact
+        if: ${{ github.event_name == 'push' || inputs.deploy }}
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.deploy }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          timeout: 1800000
