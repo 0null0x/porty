@@ -1,0 +1,48 @@
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 22:50:00 +0000
+Subject: [PATCH] tcg/wasm32: extend the inputs of mulu2_i32 and muls2_i32
+
+TCG registers are 64-bit globals here and only the low 32 bits of an i32
+value are defined (add_i32 and friends are plain i64 operations).  The
+interpreter multiplies (uint32_t)/(int32_t) casts of the operands, but
+the generated Wasm multiplied the whole 64-bit registers, so once a block
+was hot enough to be compiled, a 32x32->64 MUL or IMUL gave a wrong
+product whenever an operand had stale upper bits.  Compilers turn
+x % 384 into exactly such a multiply; an x86_64 Android-x86 kernel then
+computes garbage in SELinux's ebitmap_read() and context_struct_compute_av()
+and dies the same way on every boot.
+
+Zero-extend (mulu2) or sign-extend (muls2) the low 32 bits of both
+operands first, as the i32 division and comparison code already does.
+---
+diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
+index 9840000..6823295 100644
+--- a/tcg/wasm32/tcg-target.c.inc
++++ b/tcg/wasm32/tcg-target.c.inc
+@@ -1462,16 +1462,26 @@ static void tcg_wasm_out_sub2(TCGContext *s, TCGReg retl, TCGReg reth,
+ 
+ static void tcg_wasm_out_mulu2_i32(TCGContext *s, TCGReg retl, TCGReg reth, TCGReg arg1, TCGReg arg2)
+ {
++    /* only the low 32 bits of an i32 operand are defined */
+     tcg_wasm_out_op_global_get_r(s, arg1);
++    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_i64_extend_i32_u(s);
+     tcg_wasm_out_op_global_get_r(s, arg2);
++    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_i64_extend_i32_u(s);
+     tcg_wasm_out_op_i64_mul(s);
+     tcg_wasm_out_op_set_r_as_i64(s, retl, reth);
+ }
+ 
+ static void tcg_wasm_out_muls2_i32(TCGContext *s, TCGReg retl, TCGReg reth, TCGReg arg1, TCGReg arg2)
+ {
++    /* only the low 32 bits of an i32 operand are defined */
+     tcg_wasm_out_op_global_get_r(s, arg1);
++    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_i64_extend_i32_s(s);
+     tcg_wasm_out_op_global_get_r(s, arg2);
++    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_i64_extend_i32_s(s);
+     tcg_wasm_out_op_i64_mul(s);
+     tcg_wasm_out_op_set_r_as_i64(s, retl, reth);
+ }
