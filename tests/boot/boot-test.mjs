@@ -216,6 +216,10 @@ try {
     log('started');
 
     const deadline = t0 + minutes * 60000;
+    // Progress notes as GitHub annotations: readable through the API while
+    // the run is still going (the log is not). At most 9, under GitHub's cap.
+    const notesAt = [5, 10, 15, 20, 30, 45, 60, 80, 100]
+        .map((m) => t0 + m * 60000).filter((t) => t < deadline);
     const shotsAt = [2, 4, 7, 10, 15, 20, 25, 30, 40, 50, 60, 90, 120]
         .map((m) => t0 + m * 60000).filter((t) => t < deadline);
     let printedArgs = false;
@@ -311,6 +315,14 @@ try {
             await shot('exited', true);
             exitCode = 1;
             break;
+        }
+        if (notesAt.length && Date.now() >= notesAt[0]) {
+            notesAt.shift();
+            const tail = serialTail.filter((l) => l.trim() && !/unsupported syscall/.test(l)).slice(-4)
+                .map((l) => l.trim().slice(0, 140)).join(' | ');
+            const read = snap.disk && typeof snap.disk === 'object' ? `${Math.round(snap.disk.megabytes)} MB fetched` : '';
+            const msg = `${elapsed()} state=${snap.state} screen=${snap.screen} ${read} ${snap.stats} :: ${tail}`;
+            console.log(`::notice title=Porty boot ${elapsed()}::${msg.replace(/[\r\n%]/g, ' ')}`);
         }
         while (shotsAt.length && Date.now() >= shotsAt[0]) {
             shotsAt.shift();
