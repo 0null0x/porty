@@ -23,6 +23,10 @@ on:
         description: Files in QEMU's in-memory filesystem to print at the end (comma separated)
         type: string
         default: ''
+      control:
+        description: Run QEMU-Wasm's own Alpine x86_64 demo instead of Porty (control experiment)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,7 +34,7 @@ permissions:
 # A new deployment cancels the boot test of the previous one; hand-started
 # runs with different parameters run side by side.
 concurrency:
-  group: boot-test-${{ github.event_name }}-${{ inputs.query }}
+  group: boot-test-${{ github.event_name }}-${{ inputs.query }}-${{ inputs.control }}
   cancel-in-progress: true
 
 defaults:
@@ -62,6 +66,7 @@ jobs:
           QUERY: ${{ inputs.query }}
           MINUTES: ${{ inputs.minutes }}
           DUMP_FILES: ${{ inputs.dump }}
+          CONTROL: ${{ inputs.control }}
         run: |
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
@@ -71,4 +76,8 @@ jobs:
           nproc
           free -m
           "$CHROME" --version
-          node tests/boot/boot-test.mjs
+          if [[ "${CONTROL:-false}" == true ]]; then
+            node tests/boot/control-demo.mjs
+          else
+            node tests/boot/boot-test.mjs
+          fi
