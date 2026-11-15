@@ -379,6 +379,27 @@ than at Porty's display and disk code. Also learned: QEMU-Wasm calls
 `init_wasm32()` only from the multi-threaded TCG vCPU thread, so
 `thread=single` must never be used.
 
+**Third round: most of the "crashes" were the page giving up.** A JavaScript
+stack trace of the exit showed `callMain -> exitJS -> _proc_exit -> quit`.
+With `PROXY_TO_PTHREAD`, Emscripten's `callMain()` hands `main()` to a
+pthread and then calls `exitJS(0, implicit)`, which always calls the page's
+`quit` hook, while QEMU goes on running. `emulator.js` took that call for
+"the virtual machine powered off", so the page stopped drawing and the boot
+test closed the browser within seconds of every start. The kernel panics
+seen in that window (the `rcu_scheduler_starting` warning, "IO-APIC + timer
+doesn't work!") still need watching, but no run so far gave QEMU more than
+about ten seconds. Fixed: `quit` before `createQemu()` resolves is ignored.
+
+Also tried in this round: building without `-sMALLOC=mimalloc` (QEMU-Wasm's
+author removed it "to prevent runtime error" on the `fixmalloc` branch, never
+merged into master); kept. A build with 2 MiB stacks, `STACK_OVERFLOW_CHECK=2`
+and `ASSERTIONS=1` found no stack overflow, but QEMU's vCPU thread then
+failed in its interpreter within a second, in both JIT and interpreter-only
+modes: libffi's "Unexpected rtype 28005" (the bytes "em", as in "memory")
+from a helper-call record read by `tcg_qemu_tb_exec_tci`, which suggests a
+stale or misread block. Reverted to the plain build to measure the boot
+without the page bug first.
+
 **Next steps, in order of cost:**
 
 1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly

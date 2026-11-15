@@ -271,7 +271,14 @@ export class Emulator {
             // Without EXIT_RUNTIME Emscripten skips onExit, but always calls quit.
             onExit: (code) => this.exitedWith(code),
             quit: (code, toThrow) => {
-                this.exitedWith(code);
+                // With PROXY_TO_PTHREAD, callMain() hands main() to a pthread
+                // and then calls exitJS(0, implicit) -> quit_(0) at once, while
+                // QEMU goes on running. Only a quit after start-up is QEMU
+                // really exiting (an exit in QEMU's thread reaches this thread
+                // as a message, after createQemu() has resolved).
+                if (this.qemuStarted) {
+                    this.exitedWith(code);
+                }
                 throw toThrow;
             },
         };
@@ -279,6 +286,7 @@ export class Emulator {
         this.status('Starting QEMU', `${this.cfg.mem} MiB guest RAM, ${this.wasmMemoryMb} MiB WebAssembly memory`);
         const { default: createQemu } = await import(`${qemuBase}out.js${v}`);
         const instance = await createQemu(Module);
+        this.qemuStarted = true;
         this.module = instance;
 
         // Same workaround as QEMU-Wasm's own example page: never report the

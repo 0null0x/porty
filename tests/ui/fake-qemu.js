@@ -42,6 +42,18 @@ export default async function createFakeQemu(Module) {
         hook({ FS });
     }
 
+    // Emscripten with PROXY_TO_PTHREAD: callMain() hands main() to a pthread,
+    // then exitJS(0, implicit) calls quit_(0) synchronously, before the
+    // factory's promise resolves, while QEMU goes on running. The page must
+    // not take that call for the virtual machine switching off.
+    if (typeof Module.quit === 'function') {
+        try {
+            Module.quit(0, { name: 'ExitStatus', status: 0 });
+        } catch (e) {
+            // emulator.js rethrows the ExitStatus, as Emscripten's own quit_ does
+        }
+    }
+
     const u32 = new Uint32Array(memory.buffer);
     const u8 = new Uint8Array(memory.buffer);
     const events = [];

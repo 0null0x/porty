@@ -10,7 +10,7 @@
 #           qemu-system-x86_64.worker.js, pc-bios/ and build-info.json
 #
 # The configure/make invocation is the one from QEMU-Wasm's README
-# ("For building qemu-system-x86_64"), with four deliberate changes:
+# ("For building qemu-system-x86_64"), with three deliberate changes:
 #   * -g2 instead of -g: keep function names and unminified JS glue, but no
 #     DWARF, which would blow the GitHub Pages size budget;
 #   * the linear memory size comes from build/versions.env;
@@ -18,11 +18,7 @@
 #     author dropped mimalloc "to prevent runtime error" on the fixmalloc
 #     branch (commit 3948df46, 2025-05-01), but master's README still has
 #     it, and with it the Android kernel died at random points in every
-#     boot test;
-#   * 2 MiB stacks for the main thread and every pthread (Emscripten's
-#     default is 64 KiB with no overflow detection, against 8 MiB for QEMU
-#     on Linux), with STACK_OVERFLOW_CHECK=2 and ASSERTIONS=1 so an overflow
-#     or a runtime misuse aborts with a message instead of corrupting memory.
+#     boot test.
 set -euo pipefail
 
 : "${WASM_MEMORY_MB:?WASM_MEMORY_MB is not set}"
@@ -33,7 +29,7 @@ emcc --version
 
 cd /build
 
-EXTRA_CFLAGS="-O3 -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=${WASM_MEMORY_MB}MB -sWASM_BIGINT -sSTACK_SIZE=2097152 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 -sSTACK_OVERFLOW_CHECK=2 -sASSERTIONS=1 --js-library=/build/node_modules/xterm-pty/emscripten-pty.js -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
+EXTRA_CFLAGS="-O3 -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=${WASM_MEMORY_MB}MB -sWASM_BIGINT --js-library=/build/node_modules/xterm-pty/emscripten-pty.js -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
 
 emconfigure /qemu/configure --static --target-list=x86_64-softmmu --cpu=wasm32 --cross-prefix= \
     --without-default-features --enable-system --with-coroutine=fiber --enable-virtfs \
