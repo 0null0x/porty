@@ -357,9 +357,38 @@ interpreted). Android's x86_64 ABI requires POPCNT, so turning it off is not
 a fix. QEMU-Wasm's own x86_64 demo boots a small Alpine kernel that may
 simply not hit either path.
 
-**Next experiment:** patch 0004 makes the compile threshold a run-time
-setting. `?smp=1&jit=2147483647` (interpreter only) and `?smp=1&jit=0`
-(compile everything) separate a code-generator bug from anything else.
+**Second round (same day).** Patch 0004 made the compile threshold a run-time
+setting (`?jit=`), and the boot test learned to print QEMU's own log
+(`qemu=-d cpu_reset,guest_errors -D /tmp/q.log`, `dump=/tmp/q.log`) and
+trace points (`-trace qemu_system_shutdown_request -trace runstate_set`).
+
+| Parameters | Result |
+| --- | --- |
+| defaults (`smp=1`) | kernel panics in `check_timer()`: "IO-APIC + timer doesn't work!" (timer interrupts did not arrive while the kernel waited for them), or dies as before |
+| `jit=2147483647` (interpreter only) | the page reports an exit within seconds, before the kernel prints anything |
+| `jit=0` (compile every block) | kernel reaches 0.2 s, then the same kind of exit |
+| any of the above with the trace points | QEMU logs only the two start-up CPU resets and `prelaunch -> running`: it never requests a shutdown, a reset or a power-down, yet the program exits with status 0 |
+
+So the guest is not switching itself off and QEMU is not deciding to quit: the
+WebAssembly program ends underneath QEMU (the page's `quit`/`onExit` hooks
+fire with status 0). Together with the earlier "memory access out of bounds",
+"Cannot convert undefined to a BigInt" and libffi's "Unexpected rtype"
+errors from worker threads, this points at QEMU-Wasm's runtime (Emscripten
+pthreads, Asyncify-based coroutines and its per-block Wasm modules) rather
+than at Porty's display and disk code. Also learned: QEMU-Wasm calls
+`init_wasm32()` only from the multi-threaded TCG vCPU thread, so
+`thread=single` must never be used.
+
+**Next steps, in order of cost:**
+
+1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly
+   `-sSAFE_HEAP=1`), deployed beside the normal one and selected with a page
+   parameter, so the runtime reports what goes wrong instead of exiting.
+2. Try ktock's newer branches (`sync-upstream`, `dev-wasm-j`) or the
+   upstream QEMU series for 64-bit guests, which may already fix this.
+3. Reproduce with QEMU-Wasm's own Alpine x86_64 image and settings to tell
+   "QEMU-Wasm is unstable with any x86_64 guest under load" from "this
+   kernel hits a specific bug".
 
 ## 8. Open questions for the first real run
 
