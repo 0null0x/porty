@@ -20,7 +20,7 @@ set -euo pipefail
 jobs="${BUILD_JOBS:-$(nproc)}"
 
 git config --global --add safe.directory '*'
-emcc --version | head -n 1
+emcc --version
 
 cd /build
 
