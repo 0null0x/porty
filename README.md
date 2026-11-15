@@ -88,7 +88,9 @@ console, `__porty` exposes the running emulator (`__porty.args`,
 | `mem` | 1536 (phones: 1024) | Guest RAM in MiB (512 to 3072) |
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
 | `tb` | 384 (phones: 256) | TCG translation cache in MiB |
-| `smp` | 2 | Guest CPUs, 1 to 4 (multi-threaded TCG above 1) |
+| `smp` | 1 | Guest CPUs, 1 to 4 (extra CPUs share one thread unless `mttcg=1`) |
+| `mttcg` | off | `1` gives each guest CPU its own thread (multi-threaded TCG; crashes QEMU-Wasm with this guest today) |
+| `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
 | `cpu` | `Nehalem` | QEMU CPU model (SSE4.2 and POPCNT, which Android's x86_64 ABI requires; no AVX) |
 | `res` | `480x800` | Guest resolution |
 | `dpi` | from `res` | Android screen density |
@@ -159,8 +161,14 @@ appearing.** The guest cannot see its disk. Try `?disk=ide`.
 **The console shows Android starting, but the canvas stays in text mode or
 black.** Try `?gfx=vesa`, then `?res=1024x768`, then both.
 
-**It works but crawls.** Try `?smp=4` on a desktop, `?smp=1` if the log shows
-lock-ups, and a smaller screen such as `?res=320x480&dpi=120`.
+**It works but crawls.** Try a smaller screen such as `?res=320x480&dpi=120`.
+Extra CPUs (`?smp=2`) share one host thread unless `mttcg=1`, so they add
+no speed today.
+
+**The kernel crashes or the machine powers off early in boot.** See
+"Findings" in [docs/PLAN.md](docs/PLAN.md). `?jit=2147483647` runs the
+guest in QEMU's interpreter only, which tells a WebAssembly code-generator
+bug apart from everything else.
 
 **After a new deployment the page behaves strangely.** GitHub Pages caches
 files for ten minutes; reload after that.

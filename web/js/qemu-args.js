@@ -74,7 +74,9 @@ export function buildKernelCmdline(cfg, manifest) {
 export function buildQemuArgs(cfg, manifest, paths) {
     const accel = [`tcg`, `tb-size=${cfg.tb}`];
     if (cfg.smp > 1) {
-        accel.push('thread=multi');
+        // Multi-threaded TCG crashes QEMU-Wasm with an x86_64 guest; by
+        // default extra CPUs share one thread (round robin).
+        accel.push(cfg.mttcg ? 'thread=multi' : 'thread=single');
     }
     // virtio-blk disks by default (what Android-x86's qemu-android uses).
     // disk=ide presents both images as IDE CD-ROMs instead (/dev/sr0 and

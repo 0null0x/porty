@@ -19,7 +19,9 @@ export const PARAM_HELP = [
     ['mem', 'guest RAM in MiB (512-3072). Default 1536 on desktop, 1024 on phones.'],
     ['wasmmem', 'size of the WebAssembly memory in MiB. Default: sized to fit.'],
     ['tb', 'TCG translation cache in MiB (64-1024).'],
-    ['smp', 'guest CPUs, 1-4 (default 2; uses multi-threaded TCG when > 1).'],
+    ['smp', 'guest CPUs, 1-4 (default 1).'],
+    ['mttcg', '1 runs each guest CPU in its own thread when smp > 1 (crashes QEMU-Wasm today).'],
+    ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
     ['dpi', 'Android screen density (default derived from res).'],
@@ -100,7 +102,12 @@ export function parseConfig(search, env = {}) {
         wasmmem: intParam(params, 'wasmmem', 0, 512, 4032),
         wasmmemExplicit: params.has('wasmmem'),
         memExplicit: params.has('mem'),
-        smp: intParam(params, 'smp', 2, 1, 4),
+        // One CPU by default: with -smp 2 and multi-threaded TCG, QEMU-Wasm
+        // dies within seconds (first boot test, 2026-11-15).
+        smp: intParam(params, 'smp', 1, 1, 4),
+        mttcg: boolParam(params, 'mttcg', false),
+        // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
+        jit: intParam(params, 'jit', -1, -1, 2147483647),
         cpu: /^[A-Za-z0-9_,+=.-]+$/.test(cpu) ? cpu : 'Nehalem',
         width,
         height,

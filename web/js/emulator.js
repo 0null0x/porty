@@ -253,6 +253,19 @@ export class Emulator {
                 console.warn(text);
                 this.serial.write(`${text}\r\n`);
             },
+            // Runs on the page's thread after the module is instantiated and
+            // before main() starts QEMU, so no code block has been compiled yet.
+            onRuntimeInitialized: () => {
+                if (this.cfg.jit < 0) {
+                    return;
+                }
+                if (typeof Module._porty_set_jit_threshold === 'function') {
+                    const n = Module._porty_set_jit_threshold(this.cfg.jit);
+                    this.notes.push(`JIT threshold: ${n} runs per code block.`);
+                } else {
+                    this.notes.push('This QEMU build has no adjustable JIT threshold; ?jit= ignored.');
+                }
+            },
             onAbort: (what) => this.fatal(new StartError(`QEMU aborted: ${what}`,
                 'Usually the WebAssembly memory ran out. Try a smaller ?mem= value.')),
             // Without EXIT_RUNTIME Emscripten skips onExit, but always calls quit.

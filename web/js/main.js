@@ -24,7 +24,9 @@ let lastLogLines = [];
 // ---------------------------------------------------------------- intro ---
 function describeConfig() {
     return `mem=${cfg.mem} tb=${cfg.tb} smp=${cfg.smp} cpu=${cfg.cpu} res=${cfg.width}x${cfg.height} ` +
-        `dpi=${cfg.dpi} gfx=${cfg.gfx} disk=${cfg.disk}` + (cfg.mobile ? ' (phone defaults)' : '');
+        `dpi=${cfg.dpi} gfx=${cfg.gfx} disk=${cfg.disk}` +
+        (cfg.mttcg ? ' mttcg=1' : '') + (cfg.jit >= 0 ? ` jit=${cfg.jit}` : '') +
+        (cfg.mobile ? ' (phone defaults)' : '');
 }
 
 function fillIntro() {

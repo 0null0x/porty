@@ -325,7 +325,43 @@ visits; a snapshot of a booted guest loaded with `-incoming` (QEMU-Wasm has
 a migration example); `virtio-gpu` instead of software GL is not available
 without a GL backend in the browser build.
 
-## 7. Open questions for the first real run
+## 7. Findings from the first runs (2026-11-15)
+
+**M1 passed on the first run.** QEMU-Wasm compiled with the Porty patches in
+about four minutes on a GitHub runner (12 MB `.wasm`, shared 2300 MiB
+memory); the ISO matched the published SHA-1 (965,738,496 bytes); the site
+came to 966,554,587 bytes, under the 1 GB line. Whole workflow: about 21
+minutes, then about 3 minutes with the caches warm.
+
+**Boot test (headless Chrome 157 on a 4-vCPU runner, against the live
+site):**
+
+| Parameters | Result |
+| --- | --- |
+| defaults then (`smp=2`, multi-threaded TCG) | QEMU dies within 2 s, before the kernel prints anything: "memory access out of bounds", then "Cannot convert undefined to a BigInt", in worker threads |
+| `smp=1` | SeaBIOS runs, the kernel boots to about 0.8 s of guest time, then `WARN_ON(num_online_cpus() != 1)` in `rcu_scheduler_starting` fires (with one CPU; on `Nehalem` that count is a POPCNT instruction), is not recognised as a warning and becomes an oops: "Attempted to kill the idle task", panic |
+| `smp=1` with `cpu=qemu64`, `cpu=max`, `cpu=Nehalem,-popcnt` or `append=nokaslr` | Dies at a different point each time, from 0.2 s to 2.1 s of guest time: panics, or the machine simply powers off |
+| `smp=1`, all memory below 2 GiB (`mem=1024&tb=256&wasmmem=1664`) | Same panic as `smp=1`, so addresses above 2 GiB are not the cause |
+| `smp=1&mem=512&tb=500&cpu=qemu64` (QEMU-Wasm's own x86_64 demo settings) | Machine powers off at 0.2 s |
+
+What that says: the Porty display and disk code is unlikely to be involved
+(one disk chunk has been read when the kernel dies, and the display is still
+in text mode), and changing the CPU model or the memory layout does not fix
+it. There are probably two guest mis-execution bugs in QEMU-Wasm: a wrong
+POPCNT result (the `rcu_scheduler_starting` warning goes away without
+POPCNT, with `cpu=qemu64` or `cpu=Nehalem,-popcnt`, which then run longest),
+and something that stops the machine at a point that moves from run to run,
+which smells of interrupts arriving in the middle of code compiled to
+WebAssembly (blocks that ran 1500 times are compiled; everything else is
+interpreted). Android's x86_64 ABI requires POPCNT, so turning it off is not
+a fix. QEMU-Wasm's own x86_64 demo boots a small Alpine kernel that may
+simply not hit either path.
+
+**Next experiment:** patch 0004 makes the compile threshold a run-time
+setting. `?smp=1&jit=2147483647` (interpreter only) and `?smp=1&jit=0`
+(compile everything) separate a code-generator bug from anything else.
+
+## 8. Open questions for the first real run
 
 - Exact size of `system.sfs` and of the `.wasm` (section 4).
 - Does Android-x86's kernel have `bochs-drm`, and does it accept

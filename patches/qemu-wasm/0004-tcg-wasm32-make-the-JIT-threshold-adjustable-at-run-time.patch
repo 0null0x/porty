@@ -1,0 +1,57 @@
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 20:20:00 +0000
+Subject: [PATCH] tcg/wasm32: make the JIT threshold adjustable at run time
+
+INSTANTIATE_NUM (1500) decides after how many interpreted executions a
+TB is compiled to its own Wasm module.  Turn it into a variable with an
+exported setter, porty_set_jit_threshold(), so the page can run a guest
+with the Wasm code generator effectively off (interpreter only) or on
+for every TB, without rebuilding.  That is what separates code-generator
+bugs from bugs elsewhere when a guest misbehaves.
+---
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index d60ce4b..5095aeb 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -30,6 +30,21 @@
+ #include <emscripten/threading.h>
+ #include "wasm32.h"
+ 
++int porty_jit_threshold = INSTANTIATE_NUM_DEFAULT;
++
++/*
++ * Porty: set how many times a TB runs in the interpreter before it is
++ * compiled to Wasm.  0 compiles every TB on first use; 2147483647 in effect
++ * never compiles (interpreter only); a negative value restores the default.
++ * Returns the value in effect.  The page calls this from
++ * onRuntimeInitialized, before main() starts any vCPU.
++ */
++EMSCRIPTEN_KEEPALIVE int porty_set_jit_threshold(int n)
++{
++    porty_jit_threshold = n < 0 ? INSTANTIATE_NUM_DEFAULT : n;
++    return porty_jit_threshold;
++}
++
+ __thread uintptr_t tci_tb_ptr;
+ 
+ /* Disassemble TCI bytecode. */
+diff --git a/tcg/wasm32.h b/tcg/wasm32.h
+index 82ac7e3..8d493a1 100644
+--- a/tcg/wasm32.h
++++ b/tcg/wasm32.h
+@@ -37,6 +37,14 @@ int get_core_nums();
+ 
+ void init_wasm32();
+ 
+-#define INSTANTIATE_NUM 1500
++/*
++ * Executions of a TB before it is compiled to its own Wasm module (until
++ * then TCI interprets it).  Porty: a variable rather than a constant, so the
++ * page can change it (?jit=) to tell bugs in the Wasm code generator from
++ * bugs elsewhere; see porty_set_jit_threshold() in wasm32.c.
++ */
++#define INSTANTIATE_NUM_DEFAULT 1500
++extern int porty_jit_threshold;
++#define INSTANTIATE_NUM porty_jit_threshold
+ 
+ #endif
