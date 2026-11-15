@@ -37,10 +37,11 @@ for f in qemu-system-x86_64 qemu-system-x86_64.wasm qemu-system-x86_64.worker.js
     [[ -s "/build/$f" ]] || { echo "::error::build did not produce $f" >&2; exit 1; }
 done
 
-# The Porty entry points must have survived linking.
+# The Porty entry points must have survived linking *and* be reachable from
+# the page: Emscripten attaches EMSCRIPTEN_KEEPALIVE exports as Module['_x'].
 for sym in porty_fb_poll porty_input_event porty_abi_version porty_disk_stats; do
-    grep -q "_${sym}" /build/qemu-system-x86_64 \
-        || { echo "::error::export _${sym} is missing from the JS glue" >&2; exit 1; }
+    grep -q -F -e "Module['_${sym}']" -e "Module[\"_${sym}\"]" /build/qemu-system-x86_64 \
+        || { echo "::error::Module._${sym} is missing from the JS glue" >&2; exit 1; }
 done
 
 mkdir -p /out/pc-bios
