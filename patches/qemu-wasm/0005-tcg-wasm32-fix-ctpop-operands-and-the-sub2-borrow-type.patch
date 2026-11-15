@@ -1,0 +1,51 @@
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 21:30:00 +0000
+Subject: [PATCH] tcg/wasm32: fix ctpop operands and the sub2 borrow type
+
+tcg_out_op() passed args[1] and args[2] to tcg_out_ctpop_i32/i64, but
+ctpop has one output and one input: args[0] and args[1], as for neg and
+not.  Every population count therefore wrote its result into its input
+register and counted whatever register args[2] happened to name, in
+both the TCI bytecode and the generated Wasm.  An x86_64 Linux guest on
+a CPU with POPCNT (Nehalem and later) sees num_online_cpus() != 1 in
+rcu_scheduler_starting() and panics; Android's x86_64 ABI requires
+POPCNT, so it cannot simply be turned off.
+
+Also widen the i32 borrow produced by i64.gt_u in tcg_wasm_out_sub2()
+before i64.sub, as tcg_wasm_out_add2() does for its carry; without it a
+block containing sub2 fails Wasm validation.  QEMU-Wasm's author fixed
+the same omission on the dev-e branch ("Fix sub2_i64", 5a65998d).
+---
+diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
+index 3c85588..9840000 100644
+--- a/tcg/wasm32/tcg-target.c.inc
++++ b/tcg/wasm32/tcg-target.c.inc
+@@ -1443,6 +1443,7 @@ static void tcg_wasm_out_sub2(TCGContext *s, TCGReg retl, TCGReg reth,
+         tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+         tcg_wasm_out_op_global_get_r(s, al);
+         tcg_wasm_out_op_i64_gt_u(s);
++        tcg_wasm_out_op_i64_extend_i32_s(s);
+ 
+         tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+         tcg_wasm_out_op_global_set_r(s, retl);
+@@ -1452,6 +1453,7 @@ static void tcg_wasm_out_sub2(TCGContext *s, TCGReg retl, TCGReg reth,
+         tcg_wasm_out_op_global_get_r(s, retl);
+         tcg_wasm_out_op_global_get_r(s, al);
+         tcg_wasm_out_op_i64_gt_u(s);
++        tcg_wasm_out_op_i64_extend_i32_s(s);
+     }
+ 
+     tcg_wasm_out_op_i64_sub(s);
+@@ -3688,10 +3690,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         tcg_out_not(s, opc, args[0], args[1]);
+         break;
+     case INDEX_op_ctpop_i32:
+-        tcg_out_ctpop_i32(s, opc, args[1], args[2]);
++        tcg_out_ctpop_i32(s, opc, args[0], args[1]);
+         break;
+     case INDEX_op_ctpop_i64:
+-        tcg_out_ctpop_i64(s, opc, args[1], args[2]);
++        tcg_out_ctpop_i64(s, opc, args[0], args[1]);
+         break;
+     case INDEX_op_add2_i32:
+     case INDEX_op_add2_i64:
