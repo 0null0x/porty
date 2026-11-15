@@ -98,7 +98,7 @@ console, `__porty` exposes the running emulator (`__porty.args`,
 | `disk` | `virtio` | `ide` presents the images as IDE CD-ROMs instead |
 | `setup` | off | `1` keeps Android's first-run setup wizard |
 | `serial` | off | `1` opens the serial console at start |
-| `cache`, `parallel` | 16, 4 | Disk chunks kept in RAM, concurrent chunk downloads |
+| `cache`, `parallel` | 64 (phones: 32), 4 | 2 MiB disk chunks kept in RAM, concurrent chunk downloads |
 | `fps` | 30 | Canvas refresh cap |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |
 | `cmdline` | | Replace the whole kernel command line |

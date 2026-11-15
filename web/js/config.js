@@ -13,8 +13,10 @@ export const QEMU_OVERHEAD_MB = 288;
 const DEFAULTS = {
     // 1536 MiB ran QEMU-Wasm out of its 2300 MiB at the virtio disk probe
     // (boot tests, 2026-11-15); 1024 boots through to Android's init.
-    desktop: { mem: 1024, tb: 384 },
-    mobile: { mem: 1024, tb: 256 },
+    // cache: 2 MiB disk chunks kept in RAM. With 16, a boot re-downloaded
+    // 1.25 GB for a 943 MB image and reached each stage later than with 64.
+    desktop: { mem: 1024, tb: 384, cache: 64 },
+    mobile: { mem: 1024, tb: 256, cache: 32 },
 };
 
 export const PARAM_HELP = [
@@ -31,7 +33,7 @@ export const PARAM_HELP = [
     ['disk', '"virtio" (default) or "ide".'],
     ['setup', '1 keeps the Android setup wizard (default: skipped).'],
     ['serial', '1 opens the serial console panel at start.'],
-    ['cache', 'disk chunks kept in RAM (default 16).'],
+    ['cache', '2 MiB disk chunks kept in RAM (default 64, phones 32).'],
     ['parallel', 'concurrent chunk downloads (default 4).'],
     ['prefetch', '1 warms the browser cache with the first chunks in the background.'],
     ['append', 'extra kernel command line arguments.'],
@@ -118,7 +120,7 @@ export function parseConfig(search, env = {}) {
         disk: params.get('disk') === 'ide' ? 'ide' : 'virtio',
         setup: boolParam(params, 'setup', false),
         serial: boolParam(params, 'serial', false),
-        cache: intParam(params, 'cache', 16, 4, 256),
+        cache: intParam(params, 'cache', base.cache, 4, 256),
         parallel: intParam(params, 'parallel', 4, 1, 8),
         prefetch: boolParam(params, 'prefetch', false),
         fps: intParam(params, 'fps', 30, 1, 60),

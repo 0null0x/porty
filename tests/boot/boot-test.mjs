@@ -282,7 +282,26 @@ try {
                     disk = String(err);
                 }
                 const c = $('screen');
+                let lit = -1;
+                try {
+                    if (c && c.width) {
+                        const t = document.createElement('canvas');
+                        t.width = 48;
+                        t.height = 80;
+                        const g = t.getContext('2d');
+                        g.drawImage(c, 0, 0, 48, 80);
+                        const px = g.getImageData(0, 0, 48, 80).data;
+                        let on = 0;
+                        for (let i = 0; i < px.length; i += 4) {
+                            on += px[i] + px[i + 1] + px[i + 2] > 30 ? 1 : 0;
+                        }
+                        lit = Math.round((100 * on) / (48 * 80));
+                    }
+                } catch (e) {
+                    lit = -1;
+                }
                 return {
+                    lit,
                     state: $('app').dataset.state || '',
                     stage: text('stage-text'),
                     detail: text('stage-detail'),
@@ -357,7 +376,7 @@ try {
         const fetched = snap.disk && typeof snap.disk === 'object' ? `${Math.round(snap.disk.megabytes)}MB` : '';
         if (Date.now() >= nextStatus) {
             nextStatus = Date.now() + 120000;
-            await postStatus('pending', `${elapsed()} ${snap.screen} ${fetched} | ${lastLine.trim()}`);
+            await postStatus('pending', `${elapsed()} ${snap.screen} lit${snap.lit}% ${fetched} | ${lastLine.trim()}`);
         }
         if (notesAt.length && Date.now() >= notesAt[0]) {
             notesAt.shift();

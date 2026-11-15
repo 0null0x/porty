@@ -37,7 +37,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([phone.mem, phone.tb], [1024, 256]);
 
     // desktop keeps the linked size (no patching) when the config fits
-    assert.equal(requiredWasmMemoryMb(desktop), 1728);
+    assert.equal(requiredWasmMemoryMb(desktop), 1856);
     assert.equal(chooseWasmMemoryMb(desktop, 2300), 2300);
     // phones get the smallest memory that fits
     assert.equal(chooseWasmMemoryMb(phone, 2300), 1600);
@@ -90,7 +90,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(drives[0],
         'if=virtio,index=0,media=disk,format=raw,read-only=on,file.driver=porty,' +
         'file.url=https://example.test/porty/image/system,file.size=900000000,' +
-        'file.chunk-size=2097152,file.cache-chunks=16,file.parallel=4');
+        'file.chunk-size=2097152,file.cache-chunks=64,file.parallel=4');
     assert.equal(drives[1], 'if=virtio,index=1,media=disk,format=raw,file=/img/ramdisk.img');
     assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
     assert.ok(!buildQemuArgs(parseConfig('?usb=0', {}), manifest, paths).includes('usb-tablet'));
