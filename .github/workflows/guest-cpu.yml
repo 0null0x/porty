@@ -1,0 +1,273 @@
+# Guest CPU experiments: boots the image the site publishes in a NATIVE QEMU
+# (TCG, one vCPU) with the phone's arguments and the page's initrd, once per
+# variant, lets it settle, and then starts apps cold (Gallery by a finger tap
+# on its icon sent to the USB tablet as the page sends it, Settings by am
+# start), recording when Android drew them and where the guest's CPU went:
+# by process, by thread, and the frames surfaceflinger composed
+# (tests/guest-cpu-native.py).  The variants (page parameters) and apps are
+# in tests/guest-cpu-variants.json.
+#
+# Runners differ by more than 2x in guest speed, so every job boots all
+# variants one after the other on its own runner (the order rotated from
+# job to job), and times are compared within a job.
+#
+# The run never fails, because every failed run emails the repository owner.
+# Each job posts the commit status "porty/check guest-cpu <n>" and adds a
+# table to the job summary; the log has "PORTY_RESULT <json>" per variant.
+name: Guest CPU
+
+on:
+  push:
+    branches: [swarm/guest-cpu]
+    paths:
+      - .github/workflows/guest-cpu.yml
+      - tests/guest-cpu-native.py
+      - tests/guest-cpu-variants.json
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: Variants to run, comma separated (default, the "run" list of the plan)
+        default: ''
+      jobs:
+        description: Jobs, each on its own runner with every variant (default, the plan's)
+        default: ''
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: guest-cpu-${{ github.ref }}-${{ inputs.variants }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The variants to boot
+        id: plan
+        continue-on-error: true
+        env:
+          VARIANTS: ${{ inputs.variants }}
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          python3 -I -c '
+          import json, os, re, sys
+          plan = json.load(open(sys.argv[1]))
+          names = [n for n in re.split(r"[,\s]+", os.environ.get("VARIANTS", "")) if n] or plan["run"]
+          names = [n for n in names if n in plan["variants"]]
+          jobs = os.environ.get("JOBS", "")
+          jobs = max(1, min(6, int(jobs))) if jobs.isdigit() else plan["jobs"]
+          # one job per runner, all variants in it, the order rotated
+          include = [{"variants": "+".join(names[j % len(names):] + names[:j % len(names)]), "job": j + 1}
+                     for j in range(jobs)]
+          print("matrix=" + json.dumps({"include": include}))
+          ' tests/guest-cpu-variants.json | tee -a "$GITHUB_OUTPUT"
+
+  measure:
+    name: job ${{ matrix.job }} (${{ matrix.variants }})
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VARIANTS: ${{ matrix.variants }}
+      JOB: ${{ matrix.job }}
+      STATUS_CONTEXT: porty/check guest-cpu ${{ matrix.job }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      # --- native QEMU from the patched QEMU-Wasm tree (as in snapshot.yml) ---
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          tail -5 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          out/native-qemu/qemu-system-x86_64 -display help | grep -q wasmfb
+
+      # --- the image the site publishes (build-and-deploy.yml caches it) ------
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: prepare
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          rm -rf out/iso
+
+      - name: The image
+        id: image
+        continue-on-error: true
+        env:
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+        run: |
+          test -s out/image/manifest.json
+          echo "published image from the cache: ${CACHE_HIT:-false}"
+
+      - name: Boot Android and start the apps
+        id: boot
+        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 185
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "runner CPU: $CPU, $(nproc) threads"
+          mkdir -p out/gc
+          # The launch probe's own shell function (tests/boot/cpu-probe.mjs).
+          node --input-type=module -e "import('./tests/boot/cpu-probe.mjs').then((m) => process.stdout.write(m.PCPU_FUNCTION + '\n'))" > out/gc/pcpu.sh
+          first=1
+          for v in ${VARIANTS//+/ }; do
+            mkdir -p "out/gc/$v"
+            QUERY="$(python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])); v = p["variants"][sys.argv[2]]; q = v.get("query", ""); print(v.get("base", p["base"]) + ("&" + q if q else ""))' tests/guest-cpu-variants.json "$v")"
+            echo "===== variant $v: $QUERY"
+            gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context="$STATUS_CONTEXT" \
+              -f description="booting $v ($QUERY) on $CPU" -f target_url="$RUN_URL" >/dev/null 2>&1 || true
+            node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/gc/$v/initrd-page.img" "?$QUERY"
+            node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+              "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
+              | awk -v initrd="$PWD/out/gc/$v/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+              > "out/gc/$v/argv-native.txt"
+            grep -qxF "$PWD/out/gc/$v/initrd-page.img" "out/gc/$v/argv-native.txt"
+            python3 -I tests/guest-cpu-native.py \
+              --qemu out/native-qemu/qemu-system-x86_64 \
+              --argv-file "out/gc/$v/argv-native.txt" \
+              --work "out/gc/$v/boot" --cpu "$CPU" --query "$QUERY" \
+              --pcpu out/gc/pcpu.sh --plan tests/guest-cpu-variants.json --variant "$v" \
+              --facts "$first" --show-screens "$first" || true
+            first=0
+          done
+
+      - name: Upload the logs
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest-cpu-${{ matrix.job }}
+          path: |
+            out/gc/*/boot/result.json
+            out/gc/*/boot/serial.log
+            out/gc/*/boot/*.png
+            out/gc/*/argv-native.txt
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          files=()
+          for v in ${VARIANTS//+/ }; do
+            [[ -s "out/gc/$v/boot/result.json" ]] && files+=("out/gc/$v/boot/result.json")
+          done
+          details="$(python3 -I tests/guest-cpu-report.py "${files[@]}" 2>&1)"
+          first="$(sed -n 1p <<<"$details")"
+          state=success
+          grep -q '^ok' <<<"$first" || state=failure
+          echo "$details"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${first:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## Guest CPU: job $JOB ($VARIANTS)"
+            echo
+            sed -n '1,$p' <<<"$details"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
