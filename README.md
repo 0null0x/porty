@@ -89,9 +89,10 @@ for a much newer Android.
   code into WebAssembly, which the browser compiles to native code.
 - The page downloads Android-x86's kernel and ramdisks and the PC firmware,
   then boots the kernel directly, without a boot menu.
-- Android's system image (roughly 950 MB) is never downloaded whole. A small
-  block driver added to QEMU fetches it in 2 MiB pieces as Android reads
-  them, from QEMU's own worker threads.
+- Android's system image (about 780 MB, compressed) is never downloaded
+  whole. A small block driver added to QEMU fetches it in 2 MiB pieces as
+  Android reads them, from QEMU's own worker threads, and QEMU unpacks them
+  (the image is a compressed qcow2 of the ext4 system partition).
 - The guest's video memory is shared with the page, which copies the rows
   that changed onto a canvas every frame. Taps, clicks and keys enter the
   guest as a USB tablet and a keyboard.
@@ -141,7 +142,7 @@ and say how far it got, with that message.
 - **Memory.** By default the tab reserves 2300 MiB of memory on a desktop,
   1024 MiB of which is Android's RAM, and 1280 MiB on a phone (768 MiB for
   Android). Close other tabs and apps first.
-- **Bandwidth.** Tens of MB to start, then the parts of the roughly 950 MB
+- **Bandwidth.** Tens of MB to start, then the parts of the roughly 780 MB
   system image that Android reads while booting (several hundred MB). Use
   Wi-Fi.
 
@@ -188,7 +189,7 @@ Example: `https://0null0x.github.io/porty/?serial=1&mem=1024&smp=1&res=1024x768`
   smaller guests when the browser refuses the allocation, but a tab that is
   killed later for using too much memory cannot be caught.
 - **Download size.** Tens of MB up front, then the parts of the roughly
-  950 MB system image that Android touches while booting.
+  780 MB system image that Android touches while booting.
 - **Live session only.** `/data` is a RAM disk inside the guest. Reloading
   the page, or the browser discarding the tab, loses everything.
 - **No network** in the guest, so also no app installs from the internet.
@@ -256,8 +257,12 @@ inside your browser tab, on your device. The site is static files on GitHub
 Pages, the page has no analytics, and Android has no network connection.
 
 **Can I install apps or use Google Play?** No. Android has no internet
-connection inside Porty, there is no way to import an APK, and the
-Android-x86 image does not include Google Play or Google apps.
+connection inside Porty, and there is no way to import an APK. The
+Android-x86 9.0-r2 ISO does ship Google's apps (Play services, the Play
+Store, Chrome, Gmail and others); Porty removes them from the system image
+it publishes, which also saves most of an hour of first-boot work. What is
+left of Google's is the WebView and three small packages Android needs to
+start (the package installer and the "ext" services).
 
 **Why is it so slow?** Every x86 instruction is translated inside the
 browser, without hardware virtualisation, and Android draws its screen in
