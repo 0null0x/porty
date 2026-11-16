@@ -195,7 +195,7 @@ class Machine:
         self.rearm = False      # set after a reboot: the guest lost what was set up
         self.boot_started = 0.0 # when the current boot began, seconds after start
         self.strict = False     # True: a reboot raises Rebooted
-        self.max_reboots = 12
+        self.max_reboots = 6
         self.reboots = []       # seconds after start at which the guest came up again
         self.total = 0
         self.counter = 0
@@ -556,6 +556,8 @@ def do_save(opts, argv):
                     while time.monotonic() < end and vm.alive():
                         vm.pump(2.0)
                 log(f"guest load: {guest.get('loadavg')}")
+                run("top", "top -b -n 1 -m 14 | head -22 | cut -c1-150", 240)
+                run("log_tail", "logcat -d -t 25 | cut -c1-200", 180)
 
                 run("wake", "input keyevent 224", 180)
                 end = time.monotonic() + 10

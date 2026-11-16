@@ -66,7 +66,7 @@ def main():
             if save.get(key):
                 out.append(f"- {key}: `{json.dumps(save[key])}`")
         guest = save.get("guest", {})
-        for key in ("provisioned", "provision_workaround", "home", "suspends", "zygote_crashes",
+        for key in ("provisioned", "provision_workaround", "home", "suspends", "zygote_crashes", "top",
                     "fingerprint", "focus", "clocksource", "dmesg_tsc", "cpu_model", "cpu_mhz",
                     "cpu_flags", "loadavg", "meminfo_before", "zero_fill", "zero_fill_mb",
                     "meminfo_after", "uptime", "date"):
