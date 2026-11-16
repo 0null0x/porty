@@ -145,7 +145,14 @@ def run_checks(vm, opts, result):
 
     focus = run("focus", "dumpsys window | grep -e mCurrentFocus -e mFocusedApp")
     current = next((line.strip() for line in focus.split("\n") if "mCurrentFocus" in line), "")
-    check("launcher_focused", "launcher" in current.lower(), current or "no mCurrentFocus line")
+    # The focused app, not the focused window: natively, without time
+    # dilation, SystemUI often stops responding right after the boot, and
+    # its "isn't responding" dialog then has the window focus over the
+    # launcher.  That is a speed problem, not a provisioning one; it is
+    # reported in the detail.
+    focused_app = next((line.strip() for line in focus.split("\n") if "mFocusedApp" in line), "")
+    over = f"; window: {current}" if current and "launcher" not in current.lower() else ""
+    check("launcher_focused", "launcher" in focused_app.lower(), (focused_app or "no mFocusedApp line") + over)
 
     # The crash buffer holds every Java crash ("Process: <name>, PID") and
     # native one (">>> <name> <<<") of this boot; the main and system
