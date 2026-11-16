@@ -1,0 +1,82 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 02:45:00 +0000
+Subject: [PATCH] tcg/wasm32: optionally stop waiting for the GC before
+ compiling more TBs
+
+When the cap on compiled TBs is reached, half of the thread's instances
+are dropped, but they keep counting against the cap until a
+FinalizationRegistry callback reports that the JavaScript garbage
+collector reclaimed them.  The counters of patch 0009 show the cap
+reached within two minutes of an Android boot and then no TB compiled for
+many minutes: the dropped instances were not reported reclaimed, so all
+new hot code ran in the interpreter.
+
+porty_set_jit_wait_gc(0) makes dropped instances stop counting at once
+(the collector still frees them whenever it runs; later callbacks are
+ignored).  The default stays QEMU-Wasm's behaviour, so the page can
+compare the two (?jitgc=0).
+---
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index a41b187180..96cd5696ed 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -166,6 +166,24 @@ EMSCRIPTEN_KEEPALIVE uint32_t *porty_jit_stats(void)
+     return out;
+ }
+ 
++/*
++ * Porty: whether dropped compiled TBs keep counting against the cap until
++ * the JavaScript garbage collector has reclaimed them (QEMU-Wasm's
++ * behaviour, 1) or stop counting when they are dropped (0).  Waiting bounds
++ * what the browser holds, but in the boot tests the dropped instances were
++ * not reported reclaimed for many minutes: once the cap was reached, no TB
++ * was compiled and all new hot code ran in the interpreter.  Set by the
++ * page (?jitgc=) before main() starts any vCPU; returns the value in effect.
++ */
++static int porty_jit_wait_gc = 1;
++
++int porty_set_jit_wait_gc(int on);
++EMSCRIPTEN_KEEPALIVE int porty_set_jit_wait_gc(int on)
++{
++    qatomic_set(&porty_jit_wait_gc, on ? 1 : 0);
++    return on ? 1 : 0;
++}
++
+ __thread int instance_running_begin = 0;
+ __thread int instance_running_end = 0;
+ 
+@@ -192,6 +210,11 @@ static int instance_pending_gc_local()
+ static void check_instance_garbage_collected()
+ {
+     if (instance_garbage_collected_local > 0) {
++        if (!qatomic_read(&porty_jit_wait_gc)) {
++            /* Porty: these stopped counting when they were dropped. */
++            instance_garbage_collected_local = 0;
++            return;
++        }
+         if (instance_garbage_collected_local > instance_pending_gc_local()) {
+             printf("unexpected number of removed instances %d > %d",
+                    instance_garbage_collected_local, instance_pending_gc_local()); fflush(stdout);
+@@ -205,7 +228,9 @@ static void check_instance_garbage_collected()
+ 
+ static void remove_instance_running_local()
+ {
+-    if (instance_pending_gc_local() > 0) {
++    bool wait_gc = qatomic_read(&porty_jit_wait_gc);
++
++    if (wait_gc && instance_pending_gc_local() > 0) {
+         return;
+     }
+     int to_remove = instance_running_local / 2;
+@@ -218,6 +243,11 @@ static void remove_instance_running_local()
+     if (to_remove_instance_idx > 0) {
+         remove_module_js();
+     }
++    if (!wait_gc) {
++        /* Porty: gone as far as the cap goes; the collector frees them later. */
++        qatomic_sub(&instance_alive_global, to_remove);
++        instance_alive_local -= to_remove;
++    }
+ }
+ 
+ static void add_instance_running_local(int fidx, void *tb_ptr)

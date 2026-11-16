@@ -264,6 +264,14 @@ export class Emulator {
                         this.notes.push('This QEMU build has no adjustable JIT cap; ?jitcap= ignored.');
                     }
                 }
+                if (this.cfg.jitgc === false) {
+                    if (typeof Module._porty_set_jit_wait_gc === 'function') {
+                        Module._porty_set_jit_wait_gc(0);
+                        this.notes.push('Dropped compiled blocks stop counting at once (jitgc=0).');
+                    } else {
+                        this.notes.push('This QEMU build cannot skip the garbage-collector wait; ?jitgc= ignored.');
+                    }
+                }
                 if (this.cfg.jit < 0) {
                     return;
                 }

@@ -41,7 +41,7 @@ function describeConfig() {
     return `mem=${cfg.mem} tb=${cfg.tb} cache=${cfg.cache} smp=${cfg.smp} cpu=${cfg.cpu} ` +
         `res=${cfg.width}x${cfg.height} dpi=${cfg.dpi} gfx=${cfg.gfx} disk=${cfg.disk}` +
         (cfg.usb ? '' : ' usb=0') + (cfg.jit >= 0 ? ` jit=${cfg.jit}` : '') +
-        (cfg.jitcap > 0 ? ` jitcap=${cfg.jitcap}` : '') +
+        (cfg.jitcap > 0 ? ` jitcap=${cfg.jitcap}` : '') + (cfg.jitgc === false ? ' jitgc=0' : '') +
         (cfg.mobile ? (cfg.phoneLevel ? ` (phone, smaller memory step ${cfg.phoneLevel})` : ' (phone defaults)') : '');
 }
 

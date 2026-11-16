@@ -49,7 +49,8 @@ done
 # The Porty entry points must have survived linking *and* be reachable from
 # the page: Emscripten attaches EMSCRIPTEN_KEEPALIVE exports as Module['_x'].
 for sym in porty_fb_poll porty_input_event porty_abi_version porty_disk_stats porty_set_jit_threshold \
-           porty_heap_stats porty_coroutine_count porty_set_jit_max_instances porty_jit_stats; do
+           porty_heap_stats porty_coroutine_count porty_set_jit_max_instances porty_jit_stats \
+           porty_set_jit_wait_gc; do
     grep -q -F -e "Module['_${sym}']" -e "Module[\"_${sym}\"]" /build/qemu-system-x86_64 \
         || { echo "::error::Module._${sym} is missing from the JS glue" >&2; exit 1; }
 done

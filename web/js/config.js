@@ -7,8 +7,11 @@ export const WASM_PAGE = 65536;
 
 // Memory QEMU itself needs on top of guest RAM, the TCG code buffer and the
 // disk chunk cache: VGA memory, BIOS/option ROMs, glib/QEMU heaps, thread
-// and coroutine stacks. Measured with porty_heap_stats() and dlmalloc:
-// about 290 MiB through Android's boot (2026-11-16); 352 leaves room.
+// and coroutine stacks, softmmu TLBs. Measured with porty_heap_stats() and
+// dlmalloc: about 290 MiB through Android's boot, about 110 MiB since patch
+// 0008 shrank the coroutines (2026-11-16). The rest is headroom on purpose:
+// QEMU quietly keeps smaller TLBs when the heap is full, and a boot with
+// 2 MiB to spare ran several times slower.
 export const QEMU_OVERHEAD_MB = 352;
 
 // Phones, from the default down: what a start uses after Safari killed the
@@ -16,8 +19,9 @@ export const QEMU_OVERHEAD_MB = 352;
 // refuses the WebAssembly memory.  iOS reloads a tab whose memory goes much
 // past 1.5 GB (WebKit bug 277848), and the browser's own share (compiled
 // code, the page) comes on top of the WebAssembly memory, so phones keep
-// the guest small.  In the boot tests mem=768 reached Android's shell
-// sooner than mem=1024 did.
+// the guest small.  In the boot tests 768/128/16 was not slower than the
+// desktop settings: Android's shell after 8 minutes, the boot animation
+// after about 30.
 export const PHONE_LEVELS = [
     { mem: 768, tb: 128, cache: 16 },
     { mem: 640, tb: 96, cache: 12 },
@@ -43,6 +47,7 @@ export const PARAM_HELP = [
     ['usb', '0 leaves out the USB tablet (no touch input; for diagnosis).'],
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
+    ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
     ['dpi', 'Android screen density (default derived from res).'],
@@ -132,6 +137,8 @@ export function parseConfig(search, env = {}) {
         // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
         jit: intParam(params, 'jit', -1, -1, 2147483647),
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
+        // false: patch 0010's "do not wait for the garbage collector".
+        jitgc: boolParam(params, 'jitgc', true),
         cpu: /^[A-Za-z0-9_,+=.-]+$/.test(cpu) ? cpu : 'Nehalem',
         width,
         height,

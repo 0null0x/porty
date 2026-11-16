@@ -39,6 +39,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([phone.mem, phone.tb, phone.cache, phone.jitcap], [768, 128, 16, 4000]);
     assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
     assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
+    assert.deepEqual([desktop.jitgc, parseConfig('?jitgc=0', {}).jitgc], [true, false]);
 
     // desktop keeps the linked size (no patching) when the config fits
     assert.equal(requiredWasmMemoryMb(desktop), 1920);

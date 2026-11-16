@@ -156,6 +156,7 @@ and say how far it got, with that message.
 | `usb` | on | `0` leaves out the USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
 | `jitcap` | 15000 (phones: 4000) | Compiled code blocks kept at once (256 to 15000). Each is a module in the browser's own memory |
+| `jitgc` | on | `0`: dropped compiled blocks stop counting against `jitcap` at once instead of after garbage collection (experiment) |
 | `cpu` | `Nehalem` | QEMU CPU model (SSE4.2 and POPCNT, which Android's x86_64 ABI requires; no AVX) |
 | `res` | `480x800` | Guest resolution |
 | `dpi` | from `res` | Android screen density |
