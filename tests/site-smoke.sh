@@ -235,4 +235,54 @@ if "$repo/scripts/assemble-site.sh" --qemu "$work/qemu" --image "$work/image" \
     fail "assemble-site.sh overwrote a non-empty output directory"
 fi
 pass "assemble-site.sh refuses a non-empty output directory"
+
+# --- snapshot: a saved machine for the page to resume ---------------------------------
+json() { python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }
+patches_sha="$(cat "$repo"/patches/qemu-wasm/*.patch | sha256sum | cut -d' ' -f1)"
+[[ "$(json "$work/dist/build.json" porty_patches_sha256)" == "$patches_sha" ]] \
+    || fail "build.json lacks the hash of the QEMU patches"
+[[ "$(json "$work/dist/build.json" image_manifest_sha256)" == "$(sha256sum "$work/image/manifest.json" | cut -d' ' -f1)" ]] \
+    || fail "build.json lacks the hash of the image manifest"
+[[ "$(json "$work/dist/build.json" snapshot)" == False ]] || fail "a site without a snapshot announces one"
+pass "build.json says what a snapshot must have been saved with"
+
+# Not a real migration stream: the page and assemble-site.sh only look at the
+# packaging.  Compressible and incompressible parts, and a short last chunk.
+{ head -c 150000 /dev/urandom; head -c 120000 /dev/zero; head -c 30001 /dev/urandom; } > "$work/vm.state"
+node "$repo/tests/print-qemu-args.mjs" "$work/image/manifest.json" /img /pc-bios '?mem=768&tb=128&cache=16' > "$work/snapshot-argv.txt"
+pack() { # <out-dir> <qemu commit>
+    python3 -I "$repo/tests/pack-snapshot.py" "$work/vm.state" "$1" --chunk-size 65536 \
+        --argv "$work/snapshot-argv.txt" --query 'mem=768&tb=128&cache=16' --qemu-commit "$2" \
+        --patches-sha256 "$patches_sha" --image-manifest "$work/image/manifest.json" --booted-seconds 1 > /dev/null
+}
+pack "$work/snapshot" "$QEMU_WASM_COMMIT"
+cp "$work/vm.state" "$work/snapshot/vm.state"   # a stray file must not be published
+"$repo/scripts/assemble-site.sh" --qemu "$work/qemu" --image "$work/image" --snapshot "$work/snapshot" \
+    --out "$work/dist-snapshot" --id smoke-test > "$work/assemble-snapshot.log"
+[[ "$(json "$work/dist-snapshot/build.json" snapshot)" == True ]] || fail "build.json does not announce the snapshot"
+for f in manifest.json 000000.zz 000004.zz; do
+    [[ -s "$work/dist-snapshot/snapshot/$f" ]] || fail "site is missing snapshot/$f"
+done
+[[ ! -e "$work/dist-snapshot/snapshot/vm.state" ]] || fail "a file the manifest does not list was published"
+node "$repo/tests/print-snapshot-index.mjs" "$work/dist-snapshot/snapshot/manifest.json" \
+    "$work/dist-snapshot/build.json" > "$work/snapshot.idx" || fail "the page would refuse the snapshot"
+[[ "$(grep -c '^chunk ' "$work/snapshot.idx")" == 5 ]] || fail "the chunk index does not list 5 chunks"
+pass "assemble-site.sh --snapshot publishes a snapshot the page accepts"
+
+cp -r "$work/snapshot" "$work/snapshot-bad"
+printf 'x' >> "$work/snapshot-bad/000002.zz"
+if "$repo/scripts/assemble-site.sh" --qemu "$work/qemu" --image "$work/image" --snapshot "$work/snapshot-bad" \
+       --out "$work/dist-bad" --id smoke-test >/dev/null 2>&1; then
+    fail "assemble-site.sh accepted a snapshot with a damaged chunk"
+fi
+pass "assemble-site.sh rejects a damaged snapshot"
+
+pack "$work/snapshot-stale" 0000000000000000000000000000000000000000
+"$repo/scripts/assemble-site.sh" --qemu "$work/qemu" --image "$work/image" --snapshot "$work/snapshot-stale" \
+    --out "$work/dist-stale" --id smoke-test > "$work/assemble-stale.log" 2>&1 \
+    || fail "a snapshot of another QEMU build failed the site instead of being left out"
+grep -q 'different QEMU-Wasm commit' "$work/assemble-stale.log" || fail "no warning about the stale snapshot"
+[[ ! -e "$work/dist-stale/snapshot" && "$(json "$work/dist-stale/build.json" snapshot)" == False ]] \
+    || fail "a snapshot of another QEMU build was published"
+pass "assemble-site.sh leaves out a snapshot saved with another QEMU build"
 echo "site-smoke: all checks passed"

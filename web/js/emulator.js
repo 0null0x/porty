@@ -6,9 +6,14 @@ import { buildKernelCmdline, buildQemuArgs } from './qemu-args.js';
 import { WASM_PAGE, findMemoryImport, setMemoryImportPages } from './wasm-patch.js';
 import { Display } from './display.js';
 import { applyBootDiet, dietProps } from './boot-diet.js';
+import {
+    SNAPSHOT_DIR, SNAP_DONE, SNAP_FAILED, STAGE_RESUMING, checkSnapshot, describeResume, readSnapshotStats,
+    snapshotArgs, snapshotConfig, snapshotIndex,
+} from './snapshot.js';
 
 const BIOS_DIR = '/pc-bios';
 const IMAGE_DIR = '/img';
+const SNAPSHOT_INDEX = `${IMAGE_DIR}/snapshot.idx`;
 
 export class StartError extends Error {
     constructor(message, hint = '') {
@@ -88,8 +93,12 @@ export class Emulator {
      * @param {string} options.baseUrl   site root, with trailing slash
      * @param {(s: {stage: string, detail?: string, progress?: number}) => void} options.onStatus
      * @param {(e: Error) => void} options.onFatal
+     * @param {{mode?: string, veto?: string, env?: object}} [options.resume]
+     *        whether a snapshot on the site may be resumed (snapshot.js)
+     * @param {(e: Error) => void} [options.onResumeFailed]
+     *        QEMU stopped while loading the snapshot; without it, onFatal
      */
-    constructor({ cfg, canvas, serial, baseUrl, onStatus, onFatal }) {
+    constructor({ cfg, canvas, serial, baseUrl, onStatus, onFatal, resume = {}, onResumeFailed = null }) {
         this.cfg = { ...cfg };
         this.canvas = canvas;
         this.serial = serial;
@@ -101,10 +110,58 @@ export class Emulator {
         this.display = null;
         this.exited = false;
         this.notes = [];
+        this.resume = { mode: 'auto', veto: '', env: {}, ...resume };
+        this.onResumeFailed = onResumeFailed;
+        // Why this start boots although a snapshot was asked for or on offer.
+        this.resumeNote = '';
+        this.resuming = false;
+        this.resumed = false;
     }
 
     status(stage, detail = '', progress = undefined) {
         this.onStatus({ stage, detail, progress });
+    }
+
+    /** Not resuming: say why, once, where the page and the logs show it. */
+    noResume(reason) {
+        this.resumeNote = `Not resuming the saved Android: ${reason}. Booting normally instead.`;
+        this.notes.push(this.resumeNote);
+    }
+
+    /**
+     * Decide whether this start resumes the site's snapshot.
+     * @returns {Promise<{snap: object, cfg: object}|null>}
+     */
+    async planResume(build) {
+        const { mode, veto, env } = this.resume;
+        if (mode === 'off') {
+            return null;
+        }
+        if (!build.snapshot && mode !== 'on') {
+            return null;
+        }
+        if (veto) {
+            this.noResume(veto);
+            return null;
+        }
+        let snap;
+        try {
+            snap = await fetchJson(`${this.baseUrl}${SNAPSHOT_DIR}/manifest.json`);
+        } catch (e) {
+            this.noResume('this site has no snapshot');
+            return null;
+        }
+        const problems = checkSnapshot(snap, build);
+        if (problems.length) {
+            this.noResume(problems.join('; '));
+            return null;
+        }
+        const plan = snapshotConfig(snap, this.cfg, env);
+        if (plan.problems.length) {
+            this.noResume(plan.problems.join('; '));
+            return null;
+        }
+        return { snap, cfg: plan.cfg };
     }
 
     async start() {
@@ -126,6 +183,7 @@ export class Emulator {
         const v = `?v=${encodeURIComponent(build.id)}`;
         this.manifest = manifest;
         this.build = build;
+        let plan = await this.planResume(build);
 
         // --- downloads -------------------------------------------------------
         const files = [
@@ -156,16 +214,6 @@ export class Emulator {
             }
         }
 
-        // Boot diet: one more script for Android-x86's initrd (boot-diet.js).
-        const props = dietProps(this.cfg);
-        blobs.initrd = applyBootDiet(blobs.initrd, props);
-        this.notes.push(props.length
-            ? `Android properties set at boot: ${props.map((p) => p.join('=')).join(', ')}.`
-            : 'No Android properties set at boot (diet=0).');
-        if (this.cfg.propsRejected) {
-            this.notes.push(`${this.cfg.propsRejected} entries of ?props= were ignored (not key=value of letters, digits, . _ -).`);
-        }
-
         // --- WebAssembly memory --------------------------------------------------
         this.status('Reserving memory');
         const imported = findMemoryImport(blobs.wasm);
@@ -178,7 +226,19 @@ export class Emulator {
         const attempts = [{ mem: this.cfg.mem, tb: this.cfg.tb }, ...fallbackLadder(this.cfg)];
         let memory = null;
         let lastError = null;
-        for (const attempt of attempts) {
+        if (plan) {
+            // The snapshot fits one machine only: its memory or a normal boot.
+            const mb = chooseWasmMemoryMb(plan.cfg, builtMb, chunk);
+            try {
+                memory = allocateMemory((mb * MIB) / WASM_PAGE);
+                this.cfg = plan.cfg;
+                this.wasmMemoryMb = mb;
+            } catch (e) {
+                this.noResume(`the browser refused the ${mb} MiB of memory it needs`);
+                plan = null;
+            }
+        }
+        for (const attempt of memory ? [] : attempts) {
             const candidate = { ...this.cfg, ...attempt };
             const first = attempt === attempts[0];
             // An explicit wasmmem only applies to the configuration the user asked for.
@@ -210,17 +270,43 @@ export class Emulator {
         this.patched = wasmBytes !== blobs.wasm;
         blobs.wasm = null;
 
+        // Boot diet: one more script for Android-x86's initrd (boot-diet.js).
+        // (After the memory is settled: a resume uses the snapshot's settings,
+        // so that the initrd is the one the saved machine was started with.)
+        const props = dietProps(this.cfg);
+        blobs.initrd = applyBootDiet(blobs.initrd, props);
+        this.notes.push(props.length
+            ? `Android properties set at boot: ${props.map((p) => p.join('=')).join(', ')}.`
+            : 'No Android properties set at boot (diet=0).');
+        if (this.cfg.propsRejected) {
+            this.notes.push(`${this.cfg.propsRejected} entries of ?props= were ignored (not key=value of letters, digits, . _ -).`);
+        }
+
         // --- QEMU ---------------------------------------------------------------
         const ramdiskPath = `${IMAGE_DIR}/${manifest.ramdisk.file}`;
-        const args = buildQemuArgs(this.cfg, manifest, {
+        const paths = {
             bios: BIOS_DIR,
             kernel: `${IMAGE_DIR}/${manifest.kernel.file}`,
             initrd: `${IMAGE_DIR}/${manifest.initrd.file}`,
             ramdisk: ramdiskPath,
             diskUrl: `${base}image/${manifest.disk.dir}`,
-        });
+        };
+        // A resume runs the snapshot's own machine: its arguments, with
+        // this page's paths, plus the stream to load (QEMU patch 0012).
+        const args = plan ? snapshotArgs(plan.snap, paths, SNAPSHOT_INDEX)
+            : buildQemuArgs(this.cfg, manifest, paths);
+        if (plan) {
+            // Its query should describe the same machine: page-side settings
+            // (boot diet, time dilation) are taken from it.
+            const own = buildQemuArgs(this.cfg, manifest, paths);
+            if (JSON.stringify(own) !== JSON.stringify(args.slice(0, -2))) {
+                this.notes.push('The snapshot\'s QEMU arguments differ from what its settings ' +
+                    `(${plan.snap.query}) give on this page; the snapshot's arguments are used.`);
+            }
+        }
+        const snapshotIndexText = plan ? snapshotIndex(plan.snap, `${base}${SNAPSHOT_DIR}`, true) : null;
         this.args = args;
-        this.cmdline = buildKernelCmdline(this.cfg, manifest);
+        this.cmdline = plan ? (args[args.indexOf('-append') + 1] || '') : buildKernelCmdline(this.cfg, manifest);
 
         let ramdisk = blobs.ramdisk;
         if (this.cfg.disk === 'ide' && ramdisk.length % 2048) {
@@ -256,6 +342,9 @@ export class Emulator {
                 mod.FS.writeFile(`${IMAGE_DIR}/${manifest.kernel.file}`, blobs.kernel);
                 mod.FS.writeFile(`${IMAGE_DIR}/${manifest.initrd.file}`, blobs.initrd);
                 mod.FS.writeFile(ramdiskPath, ramdisk);
+                if (snapshotIndexText) {
+                    mod.FS.writeFile(SNAPSHOT_INDEX, snapshotIndexText);
+                }
                 Object.keys(blobs).forEach((k) => { blobs[k] = null; });
                 ramdisk = null;
             }],
@@ -346,8 +435,56 @@ export class Emulator {
         }
         this.display = new Display(this.canvas, memory, () => instance._porty_fb_poll());
         this.sendInput = (type, a, b, c) => instance._porty_input_event(type, a, b, c);
-        this.status('Booting Android');
+        if (plan) {
+            this.resuming = true;
+            this.snapshot = plan.snap;
+            this.status(STAGE_RESUMING, 'Loading the saved Android', 0);
+        } else {
+            this.status('Booting Android');
+        }
         return this;
+    }
+
+    /** Progress counters of migration/porty-snapshot.c; null without them. */
+    snapshotStats() {
+        const m = this.module;
+        if (!m || typeof m._porty_snapshot_stats !== 'function') {
+            return null;
+        }
+        return readSnapshotStats(new Uint32Array(this.memory.buffer, m._porty_snapshot_stats() >>> 0, 8));
+    }
+
+    /**
+     * Report the progress of a resume; the page calls this while it draws.
+     * @returns {boolean} true while the snapshot is still loading
+     */
+    resumeTick() {
+        if (!this.resuming || this.failed) {
+            return false;
+        }
+        const stats = this.snapshotStats();
+        if (!stats) {
+            // QEMU rejects "-incoming porty:" itself and exits; see fatal().
+            return true;
+        }
+        if (stats.state === SNAP_FAILED) {
+            this.fatal(new StartError('The saved Android could not be loaded.',
+                'A chunk of the snapshot failed to download or did not match.'));
+            return false;
+        }
+        if (stats.state === SNAP_DONE) {
+            this.resuming = false;
+            this.resumed = true;
+            this.status('Android resumed');
+            return false;
+        }
+        const detail = describeResume(stats);
+        const shown = `${detail}|${Math.round(stats.progress * 200)}`;
+        if (shown !== this.resumeShown) {
+            this.resumeShown = shown;
+            this.status(STAGE_RESUMING, detail, stats.progress);
+        }
+        return true;
     }
 
     /** Disk download counters maintained by block/porty.c. */
@@ -404,6 +541,17 @@ export class Emulator {
             return;
         }
         this.failed = true;
+        const stats = this.resuming ? this.snapshotStats() : null;
+        if (stats && stats.state === SNAP_DONE) {
+            // Loaded, but the page had not drawn since: not a failed resume.
+            this.resuming = false;
+            this.resumed = true;
+        }
+        if (this.resuming && this.onResumeFailed) {
+            // The page starts over with a normal boot instead of giving up.
+            this.onResumeFailed(error);
+            return;
+        }
         this.onFatal(error);
     }
 }

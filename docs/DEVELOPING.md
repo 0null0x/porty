@@ -114,6 +114,8 @@ Run locally, without the WebAssembly build:
 | Page logic | `node tests/unit.test.mjs`, `node tests/wasm-patch.test.mjs` |
 | Image and site pipeline on a miniature ISO | `tests/site-smoke.sh /tmp/smoke` |
 | The page in headless Chrome with a fake QEMU module: service-worker isolation, start-up, canvas, input, console | `tests/ui/run.sh /tmp/ui` |
+| Resuming a snapshot, QEMU side: a native QEMU built from the patched tree saves a small Linux guest with `migrate file:`, the stream is packed as published, and a second QEMU resumes it through `-incoming porty:`; damaged snapshots are refused (Branch check: `porty/check native`) | `tests/snapshot-native.sh` |
+| Resuming a snapshot, in the browser: the same guest, saved natively, resumed by the page in the branch's QEMU-Wasm build in headless Chrome (Branch check: `porty/check resume`) | `tests/snapshot-browser.sh` |
 | Workflow and scripts | `actionlint`, `shellcheck -x` |
 
 These local checks do not cover the Emscripten build itself, QEMU-Wasm
