@@ -328,6 +328,9 @@ try {
     const context = await browser.newContext({
         viewport: { width: 480, height: 900 },
         hasTouch: true,
+        // The test's routes do not see what a service worker fetches, so
+        // with COI=route the page's service workers stay off.
+        ...(coiMode === 'route' ? { serviceWorkers: 'block' } : {}),
         ...(device === 'iphone' ? { userAgent: IPHONE_UA } : {}),
     });
     page = await context.newPage();
@@ -1628,6 +1631,12 @@ async function inputProbe() {
 }
 
 // ---------------------------------------------------------- glue rewrites ---
+// What coi-serviceworker adds, for COI=route.
+const ISOLATION_HEADERS = {
+    'cross-origin-opener-policy': 'same-origin',
+    'cross-origin-embedder-policy': 'require-corp',
+    'cross-origin-resource-policy': 'cross-origin',
+};
 // See webkit-glue.mjs.
 /** Runs in the page: the glue counters, or null without them. */
 function readCounters(base) {
@@ -1737,6 +1746,8 @@ try {
             try {
                 const response = await route.fetch();
                 let text = await response.text();
+                const headers = { ...response.headers(), ...ISOLATION_HEADERS };
+                delete headers['content-length'];
                 result.glueLoads = (result.glueLoads || 0) + 1;
                 if (tableGrow > 0) {
                     const hits = text.split('wasmTable.grow(1)').length - 1;
@@ -1751,7 +1762,7 @@ try {
                         log(`GLUE ${glue.join('+')}: ${JSON.stringify(applied)} (load ${result.glueLoads})`);
                     }
                 }
-                await route.fulfill({ response, body: text });
+                await route.fulfill({ status: response.status(), headers, body: text });
             } catch (e) {
                 log(`glue rewrite failed: ${String(e.message).split('\n')[0]}`);
                 await route.continue().catch(() => {});
@@ -1789,16 +1800,16 @@ try {
         // Everything but the big downloads goes through the test, which adds
         // the headers the service worker would have added.
         await page.context().route((u) => !/\/(image|snapshot)\//.test(u.pathname), async (route) => {
+            if ((tableGrow > 0 || glue.length) && /\/qemu\/out\.js/.test(route.request().url())) {
+                // The glue route (registered first) adds the headers itself.
+                await route.fallback();
+                return;
+            }
             try {
                 const response = await route.fetch();
                 await route.fulfill({
                     response,
-                    headers: {
-                        ...response.headers(),
-                        'cross-origin-opener-policy': 'same-origin',
-                        'cross-origin-embedder-policy': 'require-corp',
-                        'cross-origin-resource-policy': 'cross-origin',
-                    },
+                    headers: { ...response.headers(), ...ISOLATION_HEADERS },
                 });
             } catch (e) {
                 await route.continue().catch(() => {});

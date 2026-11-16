@@ -91,42 +91,61 @@ export function parseVariants(text, base = '') {
  * was allocated between them.
  */
 export function gcSummary(text) {
+    // One collection starts with
+    //   [GC<0x..>: START M 2758658kb => EdenCollection, ca=699.1kb h=2023695.5kb ...
+    // (conductor M = mutator or C = collector thread, capacity, kind, then the
+    // scheduler's bytes allocated this cycle and headroom) and ends, maybe on
+    // a later line, with "=> 2622247kb, p=4.5ms (max 215.3), cycle 9.2ms END]"
+    // (heap size after it).  "Requesting GC because ..." lines name no heap.
     const heaps = new Map();
     const get = (id) => {
         if (!heaps.has(id)) {
-            heaps.set(id, { id, full: 0, eden: 0, maxAfterKb: 0, lastAfterKb: 0, maxAllocated: 0, maxAllowed: 0, requests: 0 });
+            heaps.set(id, {
+                id, full: 0, eden: 0, maxCapacityKb: 0, maxAllocatedKb: 0, maxHeadroomKb: 0, lastAfterKb: 0,
+                maxAfterKb: 0, maxPauseMs: 0, first: null, last: null, events: [],
+            });
         }
         return heaps.get(id);
     };
-    let current = null;
+    const open = [];
     for (const line of text.split('\n')) {
-        const m = /\[GC<(0x[0-9a-fA-F]+)>/.exec(line);
-        if (m) {
-            current = get(m[1]);
+        const when = (/(\d\d:\d\d:\d\d\.\d+)Z/.exec(line) || [])[1] || '';
+        for (const m of line.matchAll(/\[GC<(0x[0-9a-fA-F]+)>: START (\w) (\d+)kb => (Eden|Full)Collection, ca=([\d.]+)kb h=([\d.]+)kb/g)) {
+            const h = get(m[1]);
+            const ev = { when, conductor: m[2], capacityKb: Number(m[3]), kind: m[4], allocatedKb: Number(m[5]), headroomKb: Number(m[6]) };
+            h[m[4] === 'Full' ? 'full' : 'eden']++;
+            h.maxCapacityKb = Math.max(h.maxCapacityKb, ev.capacityKb);
+            h.maxAllocatedKb = Math.max(h.maxAllocatedKb, ev.allocatedKb);
+            h.maxHeadroomKb = Math.max(h.maxHeadroomKb, ev.headroomKb);
+            h.first = h.first || when;
+            h.last = when;
+            h.events.push(ev);
+            open.push(h);
         }
-        if (!current) {
-            continue;
-        }
-        if (line.includes('FullCollection')) {
-            current.full++;
-        }
-        if (line.includes('EdenCollection')) {
-            current.eden++;
-        }
-        for (const after of line.matchAll(/=> (\d+)kb, /g)) {
-            const kb = Number(after[1]);
-            current.lastAfterKb = kb;
-            current.maxAfterKb = Math.max(current.maxAfterKb, kb);
-        }
-        const r = /Requesting GC because bytes allocated this cycle: (\d+) exceed bytes allowed: (\d+)/.exec(line);
-        if (r) {
-            current.requests++;
-            current.maxAllocated = Math.max(current.maxAllocated, Number(r[1]));
-            current.maxAllowed = Math.max(current.maxAllowed, Number(r[2]));
+        for (const m of line.matchAll(/=> (\d+)kb, p=([\d.]+)ms \(max ([\d.]+)\), cycle ([\d.]+)ms END/g)) {
+            // Belongs to the oldest open collection of the heap named last on this line, or else the oldest open one.
+            const named = [...line.matchAll(/\[GC<(0x[0-9a-fA-F]+)>/g)].map((x) => x[1]);
+            let i = named.length ? open.findIndex((h) => h.id === named[named.length - 1]) : -1;
+            if (i < 0) {
+                i = 0;
+            }
+            const h = open.splice(i, 1)[0];
+            if (h) {
+                const kb = Number(m[1]);
+                h.lastAfterKb = kb;
+                h.maxAfterKb = Math.max(h.maxAfterKb, kb);
+                h.maxPauseMs = Math.max(h.maxPauseMs, Number(m[3]));
+                const ev = h.events[h.events.length - 1];
+                if (ev && ev.afterKb === undefined) {
+                    ev.afterKb = kb;
+                }
+            }
         }
     }
-    return [...heaps.values()].sort((a, b) => b.maxAfterKb - a.maxAfterKb);
+    return [...heaps.values()].sort((a, b) => (b.full + b.eden) - (a.full + a.eden));
 }
+
+const mib = (kb) => Math.round(kb / 1024);
 
 function runOne(v, index) {
     return new Promise((resolve) => {
@@ -142,6 +161,9 @@ function runOne(v, index) {
             QUERY: v.query,
             BROWSER_ENV: v.env.join(' '),
             GLUE: v.glue.join(','),
+            // Rewritten glue reaches the browser only through the test's
+            // routes, which do not see a service worker's fetches.
+            COI: v.glue.length ? 'route' : (process.env.COI || 'auto'),
             BENCH: '0',
             SCAN: '0',
             MINUTES: String(minutes),
@@ -258,17 +280,26 @@ async function main() {
         out.minutes = Math.round((Date.now() - t) / 6000) / 10;
         if (v.env.some((e) => e.startsWith('JSC_logGC='))) {
             try {
-                const heaps = gcSummary(readFileSync(r.errPath, 'utf8'));
-                out.gc = heaps.slice(0, 12);
+                const text = readFileSync(r.errPath, 'utf8');
+                const heaps = gcSummary(text);
+                out.gc = heaps.slice(0, 16).map(({ events, ...h }) => h);
                 console.log(`[${v.name}] GC LOG: ${r.gcLines} lines, ${heaps.length} heaps`);
-                for (const h of heaps.slice(0, 12)) {
-                    console.log(`[${v.name}] GC heap ${h.id}: ${h.full} full + ${h.eden} eden collections, ` +
-                        `size after GC max ${Math.round(h.maxAfterKb / 1024)} MiB (last ${Math.round(h.lastAfterKb / 1024)}), ` +
-                        `${h.requests} requests, allocated per cycle up to ${Math.round(h.maxAllocated / 1048576)} MiB ` +
-                        `(allowed up to ${Math.round(h.maxAllowed / 1048576)} MiB)`);
+                for (const h of heaps.slice(0, 16)) {
+                    console.log(`[${v.name}] GC heap ${h.id}: ${h.full} full + ${h.eden} eden from ${h.first} to ${h.last}; ` +
+                        `allocated before a collection up to ${mib(h.maxAllocatedKb)} MiB, capacity at the start up to ` +
+                        `${mib(h.maxCapacityKb)} MiB, headroom up to ${mib(h.maxHeadroomKb)} MiB, size after up to ` +
+                        `${mib(h.maxAfterKb)} MiB (last ${mib(h.lastAfterKb)}), longest pause ${h.maxPauseMs} ms`);
                 }
-                const tail = readFileSync(r.errPath, 'utf8').split('\n').filter((l) => /GC</.test(l)).slice(-25);
-                console.log(`[${v.name}] GC LOG TAIL:\n${tail.map((l) => `  ${l.slice(0, 400)}`).join('\n')}`);
+                // The collections of the heaps that allocated most before collecting.
+                for (const h of heaps.filter((x) => x.maxAllocatedKb > 65536).slice(0, 4)) {
+                    const big = h.events.filter((ev) => ev.allocatedKb > 16384 || ev.kind === 'Full').slice(0, 60);
+                    console.log(`[${v.name}] GC heap ${h.id} collections after 16 MiB or more, and full ones:\n` +
+                        big.map((ev) => `  ${ev.when} ${ev.kind} by ${ev.conductor}: allocated ${mib(ev.allocatedKb)} MiB, ` +
+                            `capacity ${mib(ev.capacityKb)} MiB, headroom ${mib(ev.headroomKb)} MiB, after ${ev.afterKb === undefined ? '?' : mib(ev.afterKb)} MiB`).join('\n'));
+                }
+                const requests = text.split('\n').filter((l) => /Requesting GC because/.test(l));
+                console.log(`[${v.name}] GC requests: ${requests.length}; the first and last ten:\n` +
+                    [...requests.slice(0, 10), ...requests.slice(-10)].map((l) => `  ${l.replace(/^.*\]\[err\] /, '').slice(0, 300)}`).join('\n'));
             } catch (e) {
                 console.log(`[${v.name}] GC log not read: ${e.message}`);
             }

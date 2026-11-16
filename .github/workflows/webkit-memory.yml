@@ -163,3 +163,14 @@ jobs:
           grep -m1 'model name' /proc/cpuinfo || true
           mkdir -p "$WORK_DIR"
           timeout -k 30 320m node tests/boot/webkit-variants.mjs || echo "the variants ended with status $?"
+
+      # Every variant's full log and the browser's stderr (the GC log).
+      - name: Keep the logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: webkit-memory-${{ matrix.replica }}
+          path: ${{ runner.temp }}/variants
+          retention-days: 7
+          if-no-files-found: ignore
