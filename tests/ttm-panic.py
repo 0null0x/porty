@@ -117,18 +117,23 @@ class Boot:
             at = again
             self.result["panic"] = "the guest restarted (nothing on the console)"
         self.result["panic_phase"] = self.phase
-        self.result["ttm"] = bool(TTM.search(out))
         self.result["panic_at_seconds"] = round(self.vm.elapsed(), 1)
         if self.booted_at is not None:
             self.result["panic_after_boot_seconds"] = round(self.vm.elapsed() - self.booted_at, 1)
         stamp = re.findall(rb"\[ *(\d+\.\d+)\] ", out[max(0, at - 400):at + 200])
         self.result["panic_guest_uptime"] = float(stamp[-1]) if stamp else None
-        self.log(f"KERNEL PANIC in phase '{self.phase}' ({self.result['panic']}), ttm_bo_vm_open: {self.result['ttm']}")
         # Let the rest of the oops arrive before quoting it.
         end = time.monotonic() + 3
         while time.monotonic() < end and self.vm.alive():
             self.vm.pump(0.5)
+        self.result["ttm"] = bool(TTM.search(self.vm.out))
+        if not PANIC.search(self.vm.out) and self.result["panic"].startswith("invalid opcode") and self.phase != "nopanic":
+            self.result["panic"] += " (no panic line followed)"
+        m = PANIC.search(self.vm.out)
+        if m:
+            self.result["panic"] = m.group(0).decode("utf-8", "replace")
         self.result["console"] = excerpt(self.vm.out, at)
+        self.log(f"KERNEL PANIC in phase '{self.phase}' ({self.result['panic']}), ttm_bo_vm_open: {self.result['ttm']}")
         if self.index == 1 or self.opts.verbose:
             for line in self.result["console"]:
                 print("    | " + line, flush=True)
@@ -172,11 +177,12 @@ class Boot:
                     continue
                 if not armed:
                     armed = True
-                    # No suspend (as the snapshot producer does), and the
-                    # kernel's warnings and worse on the serial console:
-                    # Android's init sets the console log level so low that
-                    # an oops is otherwise silent.
-                    self.sh("echo porty > /sys/power/wake_lock; echo 5 > /proc/sys/kernel/printk", 30)
+                    # No suspend (as the snapshot producer does), and a
+                    # console log level that is not 0: only then does an
+                    # oops print itself (oops_begin's console_verbose()
+                    # leaves a level of 0 alone, and so the guest restarts
+                    # without a word).  1 keeps everything else quiet.
+                    self.sh("echo porty > /sys/power/wake_lock; echo 1 > /proc/sys/kernel/printk", 30)
                 if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
                     self.booted_at = vm.elapsed()
                     self.result["booted"] = True

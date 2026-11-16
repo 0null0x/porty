@@ -184,8 +184,8 @@ jobs:
           find "out/image/$dir" -name '*.bin' | sort | xargs cat > "$work/disk.$fmt"
           if [[ "$fmt" == qcow2 ]]; then
             qemu-img convert -f qcow2 -O raw "$work/disk.qcow2" "$work/system.img"
-            debugfs -R "ls -l /lib/modules" "$work/system.img" 2>/dev/null | head -8
-            ver="$(debugfs -R "ls /lib/modules" "$work/system.img" 2>/dev/null | tr -s ' ' '\n' | grep -m1 '^[0-9]')"
+            debugfs -R "ls -p /lib/modules" "$work/system.img" 2>/dev/null | head -8
+            ver="$(debugfs -R "ls -p /lib/modules" "$work/system.img" 2>/dev/null | cut -d/ -f6 | grep -m1 '^[0-9]')"
             echo "modules: $ver"
             for m in ttm/ttm bochs/bochs-drm; do
               debugfs -R "dump /lib/modules/$ver/kernel/drivers/gpu/drm/$m.ko $work/$(basename "$m").ko" "$work/system.img" 2>/dev/null
@@ -263,29 +263,15 @@ jobs:
           - name: base
             query: ''
             boots: 4
-            observe: 200
-            provoke: debuggerd
-            expect: panic
-            device: ''
-          - name: base-anr
-            query: ''
-            boots: 3
-            observe: 20
+            observe: 150
             provoke: anr,debuggerd
             expect: panic
             device: ''
-          - name: props
-            query: '&props=dalvik.vm.stack-trace-dir='
-            boots: 4
-            observe: 200
-            provoke: anr
-            expect: clean
-            device: ''
-          - name: props-debuggerd
-            query: '&props=dalvik.vm.stack-trace-dir='
-            boots: 1
-            observe: 20
-            provoke: debuggerd
+          - name: nopanic
+            query: ''
+            boots: 2
+            observe: 10
+            provoke: nopanic
             expect: info
             device: ''
           - name: vesa
@@ -295,27 +281,20 @@ jobs:
             provoke: anr,debuggerd
             expect: clean
             device: ''
-          - name: nopanic
-            query: ''
-            boots: 1
-            observe: 20
-            provoke: nopanic
-            expect: info
-            device: ''
-          - name: bochs-display
-            query: ''
-            boots: 1
-            observe: 20
-            provoke: debuggerd
-            expect: info
-            device: bochs-display
           - name: bochs-display-vesa
             query: '&gfx=vesa'
-            boots: 1
-            observe: 60
+            boots: 3
+            observe: 120
             provoke: anr,debuggerd
             expect: info
             device: bochs-display-vesa
+          - name: virtio-vga
+            query: '&append=HWACCEL=0'
+            boots: 2
+            observe: 120
+            provoke: anr,debuggerd
+            expect: info
+            device: virtio-vga
     env:
       NAME: ${{ matrix.name }}
       QUERY_EXTRA: ${{ matrix.query }}
@@ -396,12 +375,17 @@ jobs:
           args = open(src, encoding="utf-8").read().split("\n")
           args = [a for a in args if a != ""]
           if device:
-              rom = "" if device == "bochs-display" else "/usr/share/seabios/vgabios-bochs-display.bin"
+              # No option ROM for virtio-vga: the build ships only the VGA
+              # BIOS of "-vga std", and a KMS driver does not need one.
+              spec = {"bochs-display": "bochs-display,xres=480,yres=800,romfile=",
+                      "bochs-display-vesa": "bochs-display,xres=480,yres=800,"
+                                            "romfile=/usr/share/seabios/vgabios-bochs-display.bin",
+                      "virtio-vga": "virtio-vga,xres=480,yres=800,romfile="}[device]
               out = []
               i = 0
               while i < len(args):
                   if args[i] == "-vga" and args[i + 1] == "std":
-                      out += ["-vga", "none", "-device", f"bochs-display,xres=480,yres=800,romfile={rom}"]
+                      out += ["-vga", "none", "-device", spec]
                       i += 2
                   elif args[i] == "-global" and args[i + 1].startswith("VGA."):
                       i += 2
