@@ -265,8 +265,30 @@ jobs:
         working-directory: web
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      # A booted Android saved by snapshot.yml from this image with these
+      # QEMU patches, for the page to resume instead of booting.  If there is
+      # none, or assemble-site.sh finds it was made with something else, the
+      # site is published without it and the page boots as before.
+      - name: Restore the resume snapshot
+        id: snapshot-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/artifact/snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}
+
       - name: Assemble the site
-        run: scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$GITHUB_SHA"
+        env:
+          HAVE_SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+        run: |
+          extra=()
+          if [[ "$HAVE_SNAPSHOT" == true ]]; then
+            extra=(--snapshot out/artifact/snapshot)
+            du -sb out/artifact/snapshot
+          else
+            echo "no resume snapshot for this image and these patches"
+          fi
+          scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$GITHUB_SHA" "${extra[@]}"
+          du -sb dist
 
       - name: Configure Pages
         if: ${{ github.event_name == 'push' || inputs.deploy }}
