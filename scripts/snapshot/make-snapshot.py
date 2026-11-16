@@ -388,6 +388,23 @@ def machine_info(vm):
     return out
 
 
+# Compiled ahead of time before the save (--compile): what is always
+# running (SystemUI, the launcher, the keyboard) and the apps a visitor is
+# likely to open first.  A package the image does not have just fails.
+COMPILE_PACKAGES = (
+    "com.android.systemui",
+    "com.android.launcher3",
+    "com.android.inputmethod.latin",
+    "com.android.settings",
+    "com.android.gallery3d",
+    "com.android.calculator2",
+    "com.android.deskclock",
+    "com.android.documentsui",
+    "com.android.dialer",
+    "com.android.contacts",
+)
+
+
 def do_save(opts, argv):
     work = opts.work
     result = {"mode": "save", "booted": False, "saved": False, "runstate": opts.runstate,
@@ -570,6 +587,42 @@ def do_save(opts, argv):
                     if busy:
                         result["error"] = f"guest still busy after settling (load {guest.get('loadavg', '?').strip()})"
                         return result
+
+                # Ahead-of-time compile the apps a visitor meets first.  The
+                # boot diet leaves every app as extracted dex (no compiled
+                # code, see web/js/boot-diet.js), so ART interprets them, and
+                # in the browser opening Gallery took over ten minutes.  Here
+                # natively dex2oat is fast; the code lands in /data (tmpfs)
+                # and so in the saved RAM.  Running apps keep the code they
+                # started with, so SystemUI and the launcher start again.
+                packages = [p for p in opts.compile.split(",") if p]
+                if packages:
+                    t_compile = time.monotonic()
+                    compiled = []
+                    for pkg in packages:
+                        if not re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+", pkg):
+                            raise SystemExit(f"bad package name to compile: {pkg!r}")
+                        status, text = run(f"compile_{pkg}", f"cmd package compile -m {opts.compile_filter} -f {pkg} 2>&1 | tail -2",
+                                           opts.compile_timeout)
+                        if status == 0 and "Success" in text:
+                            compiled.append(pkg)
+                    guest["compiled"] = compiled
+                    guest["compile_seconds"] = round(time.monotonic() - t_compile)
+                    log(f"compiled {len(compiled)} of {len(packages)} packages in {guest['compile_seconds']} s")
+                    run("restart_ui", "am force-stop com.android.launcher3; kill $(pidof com.android.systemui); echo restarted", 120)
+                    end = time.monotonic() + 60
+                    while time.monotonic() < end and vm.alive():
+                        vm.pump(2.0)
+                    run("home_again", "am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>&1 | tail -1", 180)
+                    for _ in range(10):
+                        end = time.monotonic() + 30
+                        while time.monotonic() < end and vm.alive():
+                            vm.pump(2.0)
+                        status, text = vm.sh("cat /proc/loadavg", 30)
+                        guest["loadavg_after_compile"] = text
+                        if status == 0 and text.split() and float(text.split()[0]) < opts.max_load:
+                            break
+                    run("dalvik_cache_mb", "du -sm /data/dalvik-cache 2>/dev/null | cut -f1", 120)
 
                 # An "isn't responding" dialog would be saved with the
                 # machine, and natively SystemUI often stops responding in the
@@ -819,6 +872,11 @@ def main():
     ap.add_argument("--guest-command", action="append", default=[],
                     help="extra shell command to run in the guest before the save (repeatable)")
     ap.add_argument("--zero-reserve", type=int, default=96, help="MiB of free memory to leave alone")
+    ap.add_argument("--compile", default=",".join(COMPILE_PACKAGES),
+                    help="comma-separated packages to compile ahead of time before saving ('' for none)")
+    ap.add_argument("--compile-filter", default="speed", choices=("speed", "speed-profile", "quicken", "verify"),
+                    help="dex2oat compiler filter for --compile")
+    ap.add_argument("--compile-timeout", type=float, default=1500, help="seconds per package for --compile")
     ap.add_argument("--require-ready", type=int, default=1,
                     help="1: save only an idle guest on its home screen (launcher focused, no 'not responding'"
                          " dialog, screen lit); otherwise fail so that the caller can boot again")
