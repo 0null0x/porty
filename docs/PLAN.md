@@ -215,6 +215,51 @@ messages arrive there. `web/js/serial.js` takes the place of the terminal:
 it always keeps the text (boot progress line, error reports) and only
 creates an xterm.js terminal when the console panel is opened.
 
+### 2.8 System image: slimmed ext4 in a compressed qcow2
+
+Sections 2.3 and 2.4 describe the first layout, the ISO's `system.sfs`
+served as it is. It is still available (`PORTY_DISK_FORMAT=sfs`), but the
+default is now this:
+
+- `system.sfs` is a gzip squashfs (128 KiB blocks) holding one file,
+  `system.img`: ext4, 2,537,553,920 bytes, no journal, 2205 MiB of files.
+  With it as the disk, the *emulated* CPU inflated every block Android read,
+  and the guest cached the same data as squashfs pages, loop-device pages
+  and ext4 pages.
+- `scripts/prepare-image.sh` takes `system.img` out (`unsquashfs`, no root),
+  `scripts/slim-system.py` removes the paths in `build/slim-remove.list`
+  with `debugfs -w`, zeroes the freed blocks and checks the result with
+  `e2fsck`, and `qemu-img convert -c` turns it into a compressed qcow2
+  (64 KiB clusters, see `build/versions.env`), which is then chunked for
+  `block/porty.c` as before. `manifest.json` (format 2) says
+  `disk.format: "qcow2"` and lists what was removed; the chunk directory is
+  named after the hash of the published file.
+- The page opens it with `-drive format=qcow2,read-only=on,file.driver=porty,...`
+  (`web/js/qemu-args.js`). QEMU's qcow2 driver inflates compressed clusters
+  in its thread pool at WebAssembly speed; clusters that do not compress
+  (most APK data) are stored and read as they are. `block/qcow2.c` and zlib
+  are part of every QEMU build, also with `--without-default-features`
+  *(source: `block/meson.build`, `meson.build` in the pinned tree)*; zstd is
+  not in the toolchain image, so the image must stay zlib (checked).
+- The guest sees a plain ext4 disk. Android-x86's initrd accepts that: its
+  `check_root()` mounts each candidate read-only on `/mnt` and, after
+  `system.sfs`, `system.img` and `system/build.prop`, takes
+  `[ -z "$SRC" -a -s /mnt/build.prop ]` and bind-mounts `/mnt` as `system`
+  *(source: `init` inside the 9.0-r2 `initrd.img`, printed by the build;
+  it is how Android-x86's own `qemu-android` script boots a `system.img`)*.
+  `prepare-image.sh` refuses to build if the initrd lacks that line. The
+  kernel command line is unchanged (`SRC=` must stay empty).
+- What is removed and what is deliberately kept is in
+  `build/slim-remove.list`. Google's packages were 426 MiB of the image.
+- Cost: qcow2 compresses with a 4 KiB deflate window, about 15% worse than
+  the squashfs did on the same data; the removal more than pays for it.
+
+Checked without a browser: `tests/site-smoke.sh` (the pipeline on a
+miniature ISO, both formats), `tests/native-disk.sh` (a native `qemu-img`
+from the patched tree reads the disk back through qcow2 over porty and
+compares it with the manifest; the branch check runs it) and
+`tests/native-e2e.sh` (boots that disk).
+
 ## 3. Build
 
 `.github/workflows/build-and-deploy.yml`:

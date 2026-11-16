@@ -1,0 +1,50 @@
+# Paths removed from Android-x86's system image before it is published
+# (scripts/prepare-image.sh, scripts/slim-system.py).  One absolute path
+# inside the image per line; directories go with everything in them.  A path
+# the image does not have is skipped.  The branch check prints the whole
+# inventory of the image with sizes, before and after.
+#
+# --- Google's apps (the ISO inherits vendor/google/products/gms.mk) --------
+# None of them is needed to boot, the guest has no network, and they are the
+# expensive part of a first boot: Play services and its companions start
+# early and stay, and Chrome has no precompiled code, so the first boot (and
+# with /data on tmpfs every boot is one) would run dex2oat over it.
+# Sizes are those in android-x86_64-9.0-r2.iso.
+/priv-app/GmsCore                    # 107.2 MiB  Play services
+/priv-app/GmsCoreSetup               #   8.2 MiB
+/priv-app/Phonesky                   #  33.4 MiB  Play Store
+/priv-app/Velvet                     #  84.7 MiB  Google app (search, assistant)
+/priv-app/GoogleServicesFramework    #   4.2 MiB
+/priv-app/GoogleLoginService         #   9.4 MiB
+/priv-app/GoogleRestore              #   6.1 MiB
+/priv-app/GooglePartnerSetup         #   2.1 MiB
+/priv-app/GoogleFeedback             #   0.8 MiB
+/priv-app/GoogleOneTimeInitializer   #   0.6 MiB
+/priv-app/GoogleBackupTransport
+/app/Chrome                          # 146.8 MiB
+/app/Gmail2                          #  27.6 MiB
+/app/GoogleContactsSyncAdapter       #   4.1 MiB
+/app/GoogleCalendarSyncAdapter       #   3.0 MiB
+#
+# Kept on purpose, although Google's:
+#   /app/WebViewGoogle                the only WebView provider once Chrome
+#                                     is gone (144.7 MiB; read when used)
+#   /priv-app/GooglePackageInstaller  PackageManagerService refuses to start
+#   /priv-app/GoogleExtServices       without exactly one installer and the
+#   /app/GoogleExtShared              two "ext" packages; there are no AOSP
+#                                     ones in this image
+#   /priv-app/SetupWizard             the image has no Provision app; with
+#                                     ro.setupwizard.mode=DISABLED the wizard
+#                                     only marks the device as provisioned
+#   /app/GooglePrintRecommendationService   0.1 MiB
+# Their configuration under /etc (privapp-permissions-google.xml,
+# sysconfig/google*.xml) stays as well: entries for packages that are not
+# installed are ignored.
+#
+# --- Other apps -------------------------------------------------------------
+# The three remaining packages without precompiled code (no odex/vdex in the
+# image), which the first boot would also have to run dex2oat over.  Nothing
+# refers to them.
+/app/TermOnePlus                     #   2.4 MiB  terminal emulator
+/app/NotePad                         #   0.1 MiB
+/app/RSSReader

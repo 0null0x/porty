@@ -35,6 +35,12 @@ for f in out.js qemu-system-x86_64.wasm qemu-system-x86_64.worker.js build-info.
     [[ -s "$qemu/$f" ]] || die "missing $qemu/$f"
 done
 [[ -s "$image/manifest.json" ]] || die "missing $image/manifest.json"
+# A qcow2 system disk needs QEMU's qcow2 driver in the WebAssembly build
+# (block/qcow2.c is always built; the string is one of its error messages).
+if grep -q '"format": "qcow2"' "$image/manifest.json" \
+   && ! grep -a -q -F "Image is not in qcow2 format" "$qemu/qemu-system-x86_64.wasm"; then
+    die "the system disk is a qcow2 image, but this QEMU build has no qcow2 driver"
+fi
 nm="$repo/web/node_modules"
 for f in xterm/lib/xterm.js xterm/css/xterm.css xterm-pty/index.js; do
     [[ -s "$nm/$f" ]] || die "missing web/node_modules/$f (run: npm ci --ignore-scripts in web/)"

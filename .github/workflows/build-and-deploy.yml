@@ -55,7 +55,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools
+          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools e2fsprogs qemu-utils cpio
 
       - name: Shell scripts
         run: shellcheck -x build/*.sh scripts/*.sh tests/*.sh tests/ui/*.sh
@@ -95,7 +95,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso squashfs-tools
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
           (cd web && npm ci --ignore-scripts --no-audit --no-fund)
           (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
 
@@ -223,12 +223,12 @@ jobs:
           path: out/iso
           key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
 
-      - name: Extract kernel, ramdisks and chunk system.sfs
+      - name: Extract kernel, ramdisks and the system disk
         env:
           ISO_NAME: ${{ steps.versions.outputs.iso_name }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
           scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
           rm -rf out/iso
           df -h /

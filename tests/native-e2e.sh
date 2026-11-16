@@ -5,11 +5,15 @@
 #   1. builds a miniature ISO with the same layout as the Android-x86 ISO
 #      (kernel, initrd.img, ramdisk.img, system.sfs, isolinux/isolinux.cfg),
 #      using a stock Linux kernel and a busybox initrd as the "guest OS";
-#   2. runs scripts/prepare-image.sh on it (the real image pipeline);
+#   2. runs scripts/prepare-image.sh on it (the real image pipeline: the
+#      ext4 system.img inside system.sfs is slimmed and published as a
+#      compressed qcow2; DISK_FORMAT=sfs publishes the squashfs instead);
 #   3. boots it with the argv produced by web/js/qemu-args.js;
 #   4. checks, from the guest's serial output and from a framebuffer dump:
-#        - block/porty.c returns bit-exact data (whole-device and file
-#          hashes, with several readers in parallel),
+#        - block/qcow2.c on top of block/porty.c returns bit-exact data
+#          (whole-device and file hashes, with several readers in
+#          parallel), and the guest finds build.prop at the root of the
+#          disk, as Android-x86's initrd requires, and not the removed file,
 #        - ramdisk.img is readable from the second drive,
 #        - ui/wasmfb.c publishes the guest framebuffer at the requested
 #          resolution and sees guest drawing,
@@ -43,12 +47,14 @@ extra_query="${EXTRA_QUERY:-}"
 W="${W:-480}"; H="${H:-800}"
 REQ_W=480; REQ_H=800
 
-for tool in xorriso mksquashfs cpio gzip zstd node md5sum; do
+disk_format="${DISK_FORMAT:-qcow2}"
+PATH="$PATH:/usr/sbin:/sbin"   # e2fsprogs
+for tool in xorriso mksquashfs mke2fs cpio gzip zstd node md5sum sha256sum; do
     command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 2; }
 done
 mkdir -p "$work"
 [[ -z "$(ls -A "$work")" ]] || { echo "$work must be empty" >&2; exit 2; }
-mkdir -p "$work"/{iso/isolinux,sfs,initrd/{bin,proc,sys,dev,mnt,lib/modules},ramdisk}
+mkdir -p "$work"/{iso/isolinux,sfs,sys/app/Gone,initrd/{bin,proc,sys,dev,mnt,lib/modules},ramdisk}
 
 # --- guest modules: resolve dependencies on the host, insmod in order ------
 want="bochs usbhid hid-generic"
@@ -73,13 +79,19 @@ for m in $want; do resolve "$m"; done | awk '!seen[$0]++' | while read -r path; 
     echo "$base" >> "$work/initrd/lib/modules/order"
 done
 
-# --- "system.sfs": squashfs with a blob spanning many chunks --------------
-head -c $((23 * 1024 * 1024 + 4321)) /dev/urandom > "$work/sfs/blob.bin"
-echo "porty-test-system" > "$work/sfs/build.prop"
-mksquashfs "$work/sfs" "$work/iso/system.sfs" -noappend -comp gzip -noI -noD -noF -noX -quiet >/dev/null
-blob_md5="$(md5sum "$work/sfs/blob.bin" | cut -d' ' -f1)"
-sfs_md5="$(md5sum "$work/iso/system.sfs" | cut -d' ' -f1)"
-sfs_size="$(stat -c %s "$work/iso/system.sfs")"
+# --- "system.sfs": a squashfs holding system.img, as in the Android-x86 ISO.
+# system.img is ext4 with build.prop at its root, a blob spanning many
+# chunks (random, so stored uncompressed in the qcow2), a compressible file
+# (stored as compressed clusters) and a file the slim list removes.
+head -c $((23 * 1024 * 1024 + 4321)) /dev/urandom > "$work/sys/blob.bin"
+head -c $((5 * 1024 * 1024 + 123)) /dev/zero | tr '\0' 'p' > "$work/sys/text.bin"
+head -c 300000 /dev/urandom > "$work/sys/app/Gone/Gone.apk"
+echo "porty-test-system" > "$work/sys/build.prop"
+mke2fs -q -t ext4 -O ^has_journal -d "$work/sys" "$work/sfs/system.img" 48M >/dev/null
+mksquashfs "$work/sfs" "$work/iso/system.sfs" -noappend -comp gzip -quiet >/dev/null
+echo "/app/Gone" > "$work/slim.list"
+blob_md5="$(md5sum "$work/sys/blob.bin" | cut -d' ' -f1)"
+text_md5="$(md5sum "$work/sys/text.bin" | cut -d' ' -f1)"
 
 # --- "ramdisk.img": gzip cpio with a marker ---------------------------------
 echo "porty-ramdisk-marker" > "$work/ramdisk/marker.txt"
@@ -107,15 +119,30 @@ done
 say "diet \$(grep -v '^\$' default.prop | tr '\n' ' ')"
 cd /
 
-# block driver: whole device, twice in parallel with a file read
-mount -t squashfs -o ro /dev/$sys /mnt || say "mount failed"
-( head -c $sfs_size /dev/$sys | md5sum | cut -d' ' -f1 > /tmp-a ) &
-( md5sum /mnt/blob.bin | cut -d' ' -f1 > /tmp-b ) &
+# block driver: whole device, twice in parallel with a file read.  The
+# disk is what Android-x86's initrd would see: with the qcow2 image, a
+# filesystem with build.prop at its root (its check_root() then does
+# "[ -s /mnt/build.prop ] && mount --bind /mnt system"); with DISK_FORMAT=sfs
+# a squashfs holding system.img.
+size=\$(( \$(cat /sys/block/$sys/size) * 512 ))
+mount -o ro,noatime /dev/$sys /mnt || say "mount failed"
+say "disk-fs \$(grep " /mnt " /proc/mounts | cut -d' ' -f3,4 | cut -d, -f1)"
+if [ -e /mnt/system.img ]; then
+    mkdir /sysimg; mount -o loop,ro /mnt/system.img /sysimg; sysroot=/sysimg
+else
+    sysroot=/mnt
+fi
+[ -s \$sysroot/build.prop ] && say "build-prop \$(cat \$sysroot/build.prop)"
+[ -e \$sysroot/app/Gone ] && say "removed-path still-there" || say "removed-path gone"
+( head -c \$size /dev/$sys | sha256sum | cut -d' ' -f1 > /tmp-a ) &
+( md5sum \$sysroot/blob.bin | cut -d' ' -f1 > /tmp-b ) &
 ( dd if=/dev/$sys bs=1M skip=3 count=9 2>/dev/null | md5sum | cut -d' ' -f1 > /tmp-c ) &
+( md5sum \$sysroot/text.bin | cut -d' ' -f1 > /tmp-d ) &
 wait
-say "disk-md5 \$(cat /tmp-a)"
+say "disk-sha256 \$(cat /tmp-a)"
 say "blob-md5 \$(cat /tmp-b)"
-say "disk-md5-again \$(head -c $sfs_size /dev/$sys | md5sum | cut -d' ' -f1)"
+say "text-md5 \$(cat /tmp-d)"
+say "disk-sha256-again \$(head -c \$size /dev/$sys | sha256sum | cut -d' ' -f1)"
 say "disk-sectors \$(cat /sys/block/$sys/size)"
 say "ramdisk \$(zcat /dev/$rd 2>/dev/null | cpio -t 2>/dev/null | head -1)"
 
@@ -159,7 +186,19 @@ CFG
 xorriso -as mkisofs -quiet -V PORTYTEST -J -r -o "$work/test.iso" "$work/iso" 2>/dev/null
 
 # --- the real pipeline ---------------------------------------------------------
-"$repo/scripts/prepare-image.sh" "$work/test.iso" "$work/image" 1048576 > "$work/prepare.log"
+PORTY_DISK_FORMAT="$disk_format" PORTY_SLIM_LIST="$work/slim.list" \
+    "$repo/scripts/prepare-image.sh" "$work/test.iso" "$work/image" 1048576 > "$work/prepare.log"
+# What the guest must see on the disk, from the manifest: the ext4 image
+# inside the qcow2, or the squashfs itself.
+read -r disk_sha disk_bytes disk_fs gone < <(python3 -I - "$work/image/manifest.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))["disk"]
+if d["format"] == "qcow2":
+    print(d["content_sha256"], d["virtual_size"], "ext4", "gone")
+else:
+    print(d["sha256"], d["size"], "squashfs", "still-there")
+PY
+)
 
 if [[ "$bus" == ide ]]; then
     # CD-ROM sectors are 2048 bytes; the page pads ramdisk.img the same way.
@@ -200,10 +239,14 @@ check() { # <description> <grep pattern>
 echo "qemu exit status: $rc"
 check "guest booted with the ISO's base command line" "PORTY-TEST: cmdline root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug console=ttyS0 androidboot.console=ttyS0 RAMDISK=$rd"
 check "framebuffer is ${W}x${H}"                    "PORTY-TEST: fb .* size ${W},${H}"
-check "whole-device hash matches (parallel readers)" "PORTY-TEST: disk-md5 $sfs_md5"
-check "whole-device hash matches (cached re-read)"   "PORTY-TEST: disk-md5-again $sfs_md5"
-check "file inside squashfs matches"                 "PORTY-TEST: blob-md5 $blob_md5"
-check "device size is the image size"                "PORTY-TEST: disk-sectors $(( (sfs_size + 511) / 512 ))"
+check "the disk holds a $disk_fs filesystem, mounted read-only" "PORTY-TEST: disk-fs $disk_fs ro"
+check "build.prop is where the initrd looks for it"  "PORTY-TEST: build-prop porty-test-system"
+check "the path on the slim list is $gone"           "PORTY-TEST: removed-path $gone"
+check "whole-device hash matches (parallel readers)" "PORTY-TEST: disk-sha256 $disk_sha"
+check "whole-device hash matches (cached re-read)"   "PORTY-TEST: disk-sha256-again $disk_sha"
+check "random file on the disk matches"              "PORTY-TEST: blob-md5 $blob_md5"
+check "compressible file on the disk matches"        "PORTY-TEST: text-md5 $text_md5"
+check "device size is the image size"                "PORTY-TEST: disk-sectors $(( (disk_bytes + 511) / 512 ))"
 check "ramdisk.img readable from second drive"       "PORTY-TEST: ramdisk marker.txt"
 check "USB tablet received events"                   "PORTY-TEST: tablet-bytes [1-9]"
 check "keyboard received events"                     "PORTY-TEST: kbd-bytes [1-9]"

@@ -24,8 +24,11 @@ there.
      first run; the result is cached and reused until the patches or the
      build script change);
    - downloads `android-x86_64-9.0-r2.iso` from SourceForge, verifies the
-     SHA-1 published by Android-x86, extracts the kernel and ramdisks and
-     splits `system.sfs` into 2 MiB chunks (the ISO is cached as well);
+     SHA-1 published by Android-x86, extracts the kernel and ramdisks,
+     takes the ext4 system image out of `system.sfs`, removes Google's apps
+     from it (`build/slim-remove.list`) and publishes it as a compressed
+     qcow2 in 2 MiB chunks (the ISO is cached as well; see
+     [PLAN.md, section 2.8](PLAN.md#28-system-image-slimmed-ext4-in-a-compressed-qcow2));
    - assembles the site, checks its size against the GitHub Pages limit and
      deploys it.
 3. Open the site's address.
@@ -107,6 +110,7 @@ Run locally, without the WebAssembly build:
 | --- | --- |
 | The patches apply to the pinned QEMU-Wasm commit and compile natively with `-Werror` (gcc; clang syntax check including the Emscripten-only branches) | see [PLAN.md, section 5](PLAN.md#5-what-was-validated-without-the-webassembly-build) |
 | Display, input and block driver work in a native QEMU built from the patched tree, booting a Linux guest through the real image pipeline with the page's own QEMU arguments | `tests/native-e2e.sh` |
+| The published system disk reads back bit for bit through qcow2 over the block driver, in a native `qemu-img` built from the patched tree | `tests/native-disk.sh` (the branch check builds the tool and runs it) |
 | Page logic | `node tests/unit.test.mjs`, `node tests/wasm-patch.test.mjs` |
 | Image and site pipeline on a miniature ISO | `tests/site-smoke.sh /tmp/smoke` |
 | The page in headless Chrome with a fake QEMU module: service-worker isolation, start-up, canvas, input, console | `tests/ui/run.sh /tmp/ui` |

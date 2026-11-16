@@ -7,7 +7,7 @@
 # The run itself never fails, because every failed run emails the repository
 # owner.  The outcome of each part is a commit status on the branch's commit
 # ("porty/check lint", "porty/check ui", "porty/check qemu", "porty/check
-# site") plus the job summary; read them with
+# site", "porty/check disk") plus the job summary; read them with
 #   gh api repos/<owner>/<repo>/commits/<sha>/statuses
 name: Branch check
 
@@ -47,7 +47,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools
+          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools e2fsprogs qemu-utils cpio
 
       - name: Shell scripts
         id: shellcheck
@@ -112,7 +112,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso squashfs-tools
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
           (cd web && npm ci --ignore-scripts --no-audit --no-fund)
           (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
 
@@ -136,6 +136,66 @@ jobs:
             echo "outcome=success|browser test passed (both URLs)" >> "$GITHUB_OUTPUT"
           else
             echo "outcome=failure|browser test failed, see the log" >> "$GITHUB_OUTPUT"
+          fi
+
+  # block/qcow2.c on top of block/porty.c, as the page's -drive stacks them,
+  # in a native qemu-img built from the patched tree: every byte of a
+  # miniature system disk must read back as its manifest says.
+  disk:
+    name: Disk drivers (native qemu-img)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      outcome: ${{ steps.summary.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev python3-venv
+
+      - name: Build qemu-img from the patched QEMU-Wasm tree
+        id: build
+        continue-on-error: true
+        run: |
+          build/apply-patches.sh "$RUNNER_TEMP/qemu-wasm"
+          mkdir "$RUNNER_TEMP/qemu-native"
+          cd "$RUNNER_TEMP/qemu-native"
+          "$RUNNER_TEMP/qemu-wasm/configure" --without-default-features --enable-tools \
+            --disable-system --disable-user --disable-docs --disable-werror \
+            --with-coroutine=ucontext
+          ninja qemu-img
+
+      - name: Read a miniature system disk back through qcow2 and porty
+        id: read
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          tests/site-smoke.sh "$RUNNER_TEMP/smoke" >/dev/null
+          tests/native-disk.sh "$RUNNER_TEMP/qemu-native/qemu-img" "$RUNNER_TEMP/smoke/image"
+          tests/native-disk.sh "$RUNNER_TEMP/qemu-native/qemu-img" "$RUNNER_TEMP/smoke/image-sfs"
+
+      - name: Summary
+        id: summary
+        env:
+          BUILD: ${{ steps.build.outcome }}
+          READ: ${{ steps.read.outcome }}
+        run: |
+          if [[ "$READ" == success ]]; then
+            echo "outcome=success|qcow2 and raw disks read back bit for bit through block/porty.c" >> "$GITHUB_OUTPUT"
+          elif [[ "$BUILD" != success ]]; then
+            echo "outcome=failure|native qemu-img did not build, see the log" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure|disk read-back failed, see the log" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -264,7 +324,7 @@ jobs:
           ISO_NAME: ${{ steps.versions.outputs.iso_name }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
           scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
           rm -rf out/iso
           du -sb out/image out/image/* | sort -k2
@@ -322,7 +382,7 @@ jobs:
 
   report:
     name: Report as commit statuses
-    needs: [checks, ui-test, build]
+    needs: [checks, ui-test, disk, build]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -337,6 +397,7 @@ jobs:
           UI: ${{ needs.ui-test.outputs.outcome }}
           QEMU: ${{ needs.build.outputs.qemu }}
           SITE: ${{ needs.build.outputs.site }}
+          DISK: ${{ needs.disk.outputs.outcome }}
         run: |
           post() { # <context> <state|description>
             local state="${2%%|*}" desc="${2#*|}"
@@ -349,3 +410,4 @@ jobs:
           post ui "$UI"
           post qemu "$QEMU"
           post site "$SITE"
+          post disk "$DISK"

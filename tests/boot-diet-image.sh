@@ -12,8 +12,9 @@
 # It also prints the facts a reader needs to judge the property set: the
 # lines of default.prop for the keys the diet sets, the zygote .rc files in
 # the ramdisk and, with --system, the matching lines of /system/build.prop
-# and whether /system/etc/prop.default exists (needs unsquashfs and debugfs,
-# and room for the unpacked system image).
+# and whether /system/etc/prop.default exists (needs debugfs, qemu-img or
+# unsquashfs depending on the disk format, and room for the unpacked system
+# image).
 #
 # usage: tests/boot-diet-image.sh <image-dir> <empty-work-dir> [--system]
 set -euo pipefail
@@ -123,11 +124,22 @@ done
 
 # --- /system (optional, slow) -------------------------------------------------------
 if [[ "$with_system" == --system ]]; then
-    if command -v unsquashfs >/dev/null && command -v debugfs >/dev/null; then
-        find "$image/system" -name '*.bin' -print0 | sort -z | xargs -0 cat > "$work/system.sfs"
-        unsquashfs -n -d "$work/sfs" "$work/system.sfs" >/dev/null
-        rm -f "$work/system.sfs"
-        find "$work/sfs" -maxdepth 1 -type f -printf '    system.sfs holds %f, %s bytes\n'
+    PATH="$PATH:/usr/sbin:/sbin"   # e2fsprogs
+    # The disk is either the ISO's system.sfs or a qcow2 of the ext4 system
+    # image (image/manifest.json, disk.format).
+    disk_dir="$(grep -o '"dir": "[^"]*' "$image/manifest.json" | cut -d'"' -f4)"
+    if grep -q '"format": "qcow2"' "$image/manifest.json"; then reader=qemu-img; else reader=unsquashfs; fi
+    if command -v "$reader" >/dev/null && command -v debugfs >/dev/null; then
+        mkdir "$work/sfs"
+        find "$image/$disk_dir" -name '*.bin' -print0 | sort -z | xargs -0 cat > "$work/system.disk"
+        if [[ "$reader" == qemu-img ]]; then
+            qemu-img convert -f qcow2 -O raw "$work/system.disk" "$work/sfs/system.img"
+            echo "    the system disk is a qcow2 image of system.img, $(stat -c %s "$work/sfs/system.img") bytes"
+        else
+            unsquashfs -n -f -d "$work/sfs" "$work/system.disk" >/dev/null
+            find "$work/sfs" -maxdepth 1 -type f -printf '    system.sfs holds %f, %s bytes\n'
+        fi
+        rm -f "$work/system.disk"
         if [[ -f "$work/sfs/system.img" ]]; then
             echo "    /system/etc/prop.default: $(debugfs -R 'stat /etc/prop.default' "$work/sfs/system.img" 2>&1 | grep -E 'Type:|not found' | head -1)"
             echo "    /system/build.prop, the lines for keys the diet touches:"
@@ -138,7 +150,7 @@ if [[ "$with_system" == --system ]]; then
         fi
         rm -rf "$work/sfs"
     else
-        echo "SKIP  /system inspection: needs unsquashfs and debugfs"
+        echo "SKIP  /system inspection: needs $reader and debugfs"
     fi
 fi
 
