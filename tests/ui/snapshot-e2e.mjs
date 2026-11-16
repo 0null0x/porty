@@ -58,8 +58,22 @@ try {
     await page.click('#start');
     log('Start pressed');
 
-    const state = () => page.evaluate(() => {
+    // The serial text is taken from the console's whole backlog: bytes
+    // arrive one at a time, and SerialConsole.tail() only looks at the
+    // last few dozen writes.
+    const state = (withSerial = false) => page.evaluate((wantSerial) => {
         const e = globalThis.__porty;
+        let serial = '';
+        if (wantSerial && e && e.serial) {
+            const parts = e.serial.backlog.slice(-60000);
+            const bytes = new Uint8Array(parts.reduce((n, b) => n + b.length, 0));
+            let at = 0;
+            for (const b of parts) {
+                bytes.set(b, at);
+                at += b.length;
+            }
+            serial = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+        }
         const stats = e && e.module ? e.snapshotStats() : null;
         return {
             app: document.getElementById('app').dataset.state,
@@ -71,10 +85,10 @@ try {
             resumed: Boolean(e && e.resumed),
             stats,
             heap: e && e.module ? e.heapStats() : null,
-            serial: e && e.serial ? e.serial.tail(60) : '',
+            serial,
             failure: document.getElementById('failure').hidden ? '' : document.getElementById('failure').innerText,
         };
-    }).catch((e) => ({ app: 'navigating', error: String(e), args: [], serial: '' }));
+    }, withSerial).catch((e) => ({ app: 'navigating', error: String(e), args: [], serial: '' }));
 
     // 1. The page resumes: QEMU is started with -incoming and loads the stream.
     let s;
@@ -132,7 +146,7 @@ try {
         const loaded = Date.now();
         let rounds = [];
         for (;;) {
-            s = await state();
+            s = await state(true);
             if (navigations > before || s.app === 'failed') {
                 failed = `the page stopped after the resume: ${s.failure || 'reloaded'}`;
                 break;
@@ -160,6 +174,7 @@ try {
         }
     }
     if (failed) {
+        s = { ...s, ...(await state(true)) };
         log(`serial console:\n${(s.serial || '').split('\n').slice(-25).join('\n')}`);
     }
 } finally {

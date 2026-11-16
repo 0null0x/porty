@@ -214,16 +214,6 @@ export class Emulator {
             }
         }
 
-        // Boot diet: one more script for Android-x86's initrd (boot-diet.js).
-        const props = dietProps(this.cfg);
-        blobs.initrd = applyBootDiet(blobs.initrd, props);
-        this.notes.push(props.length
-            ? `Android properties set at boot: ${props.map((p) => p.join('=')).join(', ')}.`
-            : 'No Android properties set at boot (diet=0).');
-        if (this.cfg.propsRejected) {
-            this.notes.push(`${this.cfg.propsRejected} entries of ?props= were ignored (not key=value of letters, digits, . _ -).`);
-        }
-
         // --- WebAssembly memory --------------------------------------------------
         this.status('Reserving memory');
         const imported = findMemoryImport(blobs.wasm);
@@ -280,6 +270,18 @@ export class Emulator {
         this.patched = wasmBytes !== blobs.wasm;
         blobs.wasm = null;
 
+        // Boot diet: one more script for Android-x86's initrd (boot-diet.js).
+        // (After the memory is settled: a resume uses the snapshot's settings,
+        // so that the initrd is the one the saved machine was started with.)
+        const props = dietProps(this.cfg);
+        blobs.initrd = applyBootDiet(blobs.initrd, props);
+        this.notes.push(props.length
+            ? `Android properties set at boot: ${props.map((p) => p.join('=')).join(', ')}.`
+            : 'No Android properties set at boot (diet=0).');
+        if (this.cfg.propsRejected) {
+            this.notes.push(`${this.cfg.propsRejected} entries of ?props= were ignored (not key=value of letters, digits, . _ -).`);
+        }
+
         // --- QEMU ---------------------------------------------------------------
         const ramdiskPath = `${IMAGE_DIR}/${manifest.ramdisk.file}`;
         const paths = {
@@ -293,6 +295,15 @@ export class Emulator {
         // this page's paths, plus the stream to load (QEMU patch 0012).
         const args = plan ? snapshotArgs(plan.snap, paths, SNAPSHOT_INDEX)
             : buildQemuArgs(this.cfg, manifest, paths);
+        if (plan) {
+            // Its query should describe the same machine: page-side settings
+            // (boot diet, time dilation) are taken from it.
+            const own = buildQemuArgs(this.cfg, manifest, paths);
+            if (JSON.stringify(own) !== JSON.stringify(args.slice(0, -2))) {
+                this.notes.push('The snapshot\'s QEMU arguments differ from what its settings ' +
+                    `(${plan.snap.query}) give on this page; the snapshot's arguments are used.`);
+            }
+        }
         const snapshotIndexText = plan ? snapshotIndex(plan.snap, `${base}${SNAPSHOT_DIR}`, true) : null;
         this.args = args;
         this.cmdline = plan ? (args[args.indexOf('-append') + 1] || '') : buildKernelCmdline(this.cfg, manifest);

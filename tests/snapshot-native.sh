@@ -4,8 +4,11 @@
 # QEMU-Wasm tree (no browser, no Emscripten):
 #
 #   1. builds a miniature ISO like tests/native-e2e.sh (stock Linux kernel,
-#      busybox initrd) and runs scripts/prepare-image.sh on it;
-#   2. boots it with the argv of web/js/qemu-args.js, lets the guest write a
+#      busybox initrd, an ext4 system.img inside system.sfs) and runs
+#      scripts/prepare-image.sh on it, so the disk is a compressed qcow2 in
+#      chunks, as published;
+#   2. boots it as the page would (the argv of web/js/qemu-args.js, the
+#      initrd with the boot-diet archive appended), lets the guest write a
 #      random token into its RAM, and saves the machine with the monitor
 #      command "migrate file:<path>", as the snapshot producer does;
 #   3. packs the stream into zlib chunks with a manifest in the published
@@ -14,7 +17,7 @@
 #   4. starts a second QEMU with the same argv plus
 #      "-incoming porty:<index>" and checks that the guest carries on where
 #      it was: same token, counter continuing, no second boot, and the
-#      chunked disk (block/porty.c) still readable;
+#      chunked disk (block/qcow2.c over block/porty.c) still readable;
 #   5. checks that damaged snapshots fail the start with a message that
 #      names the chunk: wrong hash, corrupt data, missing file, short
 #      stream, and an index that does not cover the stream.
@@ -35,13 +38,14 @@ busybox="$(command -v busybox)"
 # shellcheck source-path=SCRIPTDIR source=../build/versions.env
 source "$repo/build/versions.env"
 
-for tool in xorriso mksquashfs cpio gzip node md5sum python3; do
+PATH="$PATH:/usr/sbin:/sbin"   # e2fsprogs
+for tool in xorriso mksquashfs mke2fs cpio gzip node md5sum python3; do
     command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 2; }
 done
 mkdir -p "$work"
 [[ -z "$(ls -A "$work")" ]] || { echo "$work must be empty" >&2; exit 2; }
 work="$(cd "$work" && pwd)"
-mkdir -p "$work"/{iso/isolinux,sfs,initrd/{bin,proc,sys,dev,mnt,tmp},ramdisk}
+mkdir -p "$work"/{iso/isolinux,sfs,sys/app/Gone,initrd/{bin,proc,sys,dev,mnt,tmp},ramdisk,run}
 
 fail=0
 pass() { echo "PASS  $*"; }
@@ -50,9 +54,14 @@ bad() { echo "FAIL  $*"; fail=1; }
 check() { if grep -a -q -- "$2" "$3"; then pass "$1"; else bad "$1"; fi; }
 
 # --- the guest ---------------------------------------------------------------
-head -c $((3 * 1024 * 1024 + 123)) /dev/urandom > "$work/sfs/blob.bin"
-blob_md5="$(md5sum "$work/sfs/blob.bin" | cut -d' ' -f1)"
-mksquashfs "$work/sfs" "$work/iso/system.sfs" -noappend -comp gzip -noI -noD -noF -noX -quiet >/dev/null
+# "system.sfs" holds system.img (ext4), as in the Android-x86 ISO.
+head -c $((3 * 1024 * 1024 + 123)) /dev/urandom > "$work/sys/blob.bin"
+head -c 100000 /dev/urandom > "$work/sys/app/Gone/Gone.apk"
+echo "porty-test-system" > "$work/sys/build.prop"
+blob_md5="$(md5sum "$work/sys/blob.bin" | cut -d' ' -f1)"
+mke2fs -q -t ext4 -O ^has_journal -d "$work/sys" "$work/sfs/system.img" 16M >/dev/null
+mksquashfs "$work/sfs" "$work/iso/system.sfs" -noappend -comp gzip -quiet >/dev/null
+echo "/app/Gone" > "$work/slim.list"
 echo marker > "$work/ramdisk/marker.txt"
 ( cd "$work/ramdisk" && echo marker.txt | cpio -o -H newc 2>/dev/null | gzip -9 ) > "$work/iso/ramdisk.img"
 
@@ -62,7 +71,9 @@ cat > "$work/initrd/init" <<'INIT'
 /bin/busybox --install -s /bin
 export PATH=/bin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
-mount -t squashfs -o ro /dev/vda /mnt || echo "PORTY-SNAP: mount failed"
+mount -o ro,noatime /dev/vda /mnt || echo "PORTY-SNAP: mount failed"
+# (scripts/prepare-image.sh wants an init that takes a bare system disk.)
+[ -s /mnt/build.prop ] || echo "PORTY-SNAP: no build.prop on the disk"
 # The token exists only in this machine's RAM (the root is a ramfs).
 token="$(head -c 16 /dev/urandom | md5sum | cut -c1-32)"
 echo "$token" > /token
@@ -87,7 +98,8 @@ label livem
 	append initrd=/initrd.img root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug quiet SRC= DATA=
 CFG
 xorriso -as mkisofs -quiet -V PORTYSNAP -J -r -o "$work/test.iso" "$work/iso" 2>/dev/null
-"$repo/scripts/prepare-image.sh" "$work/test.iso" "$work/image" 1048576 > "$work/prepare.log"
+PORTY_SLIM_LIST="$work/slim.list" \
+    "$repo/scripts/prepare-image.sh" "$work/test.iso" "$work/image" 1048576 > "$work/prepare.log"
 
 mkdir "$work/bios"
 while read -r rom; do
@@ -95,7 +107,12 @@ while read -r rom; do
 done < "$repo/build/pc-bios.list"
 
 query='mem=512&tb=64&cache=4&append=panic=-1'
-node "$repo/tests/print-qemu-args.mjs" "$work/image/manifest.json" "$work/image" "$work/bios" "?$query" > "$work/argv.txt"
+# The page appends the boot-diet archive to initrd.img in memory before
+# QEMU starts; the saved machine must have been started with the same.
+node "$repo/tests/apply-boot-diet.mjs" "$work/image/initrd.img" "$work/run/initrd.img" "?$query" > /dev/null
+node "$repo/tests/print-qemu-args.mjs" "$work/image/manifest.json" "$work/image" "$work/bios" "?$query" \
+    | sed "s|^$work/image/initrd.img\$|$work/run/initrd.img|" > "$work/argv.txt"
+grep -q -x "$work/run/initrd.img" "$work/argv.txt" || { echo "argv does not name the initrd" >&2; exit 2; }
 mapfile -t args < "$work/argv.txt"
 
 # --- running QEMU with its monitor on a pipe ------------------------------------

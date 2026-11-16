@@ -102,7 +102,7 @@ try {
         assert.ok(p.args[p.args.indexOf('-accel') + 1].includes('tb-size=128'));
         assert.equal(p.args[p.args.indexOf('-L') + 1], '/pc-bios');
         assert.equal(p.args[p.args.indexOf('-kernel') + 1], '/img/kernel');
-        assert.ok(p.args.some((a) => a.includes(`file.url=${url}image/system,`) && a.includes('file.cache-chunks=16')));
+        assert.ok(p.args.some((a) => a.includes(`file.url=${url}image/system`) && a.includes('file.cache-chunks=16')));
         assert.equal(p.args[p.args.indexOf('-append') + 1], manifest.argv[manifest.argv.indexOf('-append') + 1]);
         assert.deepEqual(p.cfg, { mem: 768, tb: 128, cache: 16, mobile: false });
         assert.equal(p.memoryBytes, p.wasmMemoryMb * 1048576);

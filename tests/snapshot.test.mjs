@@ -143,6 +143,20 @@ const snapshot = () => ({
     odd.query = 'mem=640';
     assert.equal(snapshotConfig(odd, user, env).cfg.mem, 768);
 
+    // Settings that shape what the page hands QEMU (the initrd's boot-diet
+    // archive, time dilation) are the snapshot's, never the visitor's.
+    const dilated = snapshot();
+    dilated.query = `${QUERY}&diet=0&timescale=4`;
+    dilated.argv = buildQemuArgs(parseConfig(`?${dilated.query}`, {}), imageManifest, savedPaths);
+    const visitor = parseConfig('?diet=2&timescale=2&props=a.b=c', env);
+    const kept = snapshotConfig(dilated, visitor, env).cfg;
+    assert.deepEqual([kept.diet, kept.timescale, kept.props], [0, 4, []]);
+    const rtc = snapshotArgs(dilated, pagePaths, '/i');
+    assert.equal(rtc[rtc.indexOf('-rtc') + 1], 'base=utc,clock=vm', 'the saved -rtc is passed on');
+    assert.deepEqual(rtc.slice(0, -2), buildQemuArgs(kept, imageManifest, pagePaths));
+    assert.match(resumeVeto({ search: '?timescale=2' }), /sets timescale=/);
+    assert.match(resumeVeto({ search: '?diet=0' }), /sets diet=/);
+
     // A desktop-sized snapshot is not for phones.
     const big = snapshot();
     big.query = 'mem=1024&tb=384&cache=64';
