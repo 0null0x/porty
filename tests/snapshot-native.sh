@@ -25,6 +25,8 @@
 # code the browser build runs.
 #
 # usage: tests/snapshot-native.sh <qemu-system-x86_64> <pc-bios-dir> <vmlinuz> <work-dir>
+#   Leaves <work-dir>/image (the prepared image), <work-dir>/snapshot (the
+#   packed snapshot) and <work-dir>/guest.env (what the guest must show).
 set -euo pipefail
 
 qemu="${1:?qemu binary}"; bios="${2:?pc-bios dir}"; vmlinuz="${3:?vmlinuz}"; work="${4:?work dir}"
@@ -157,6 +159,8 @@ python3 -I "$repo/tests/pack-snapshot.py" "$work/vm.state" "$work/snapshot" \
     --patches-sha256 "$patches_sha" --image-manifest "$work/image/manifest.json" --booted-seconds "$saved_at"
 node "$repo/tests/print-snapshot-index.mjs" "$work/snapshot/manifest.json" > "$work/snapshot/index.txt"
 chunks="$(grep -c '^chunk ' "$work/snapshot/index.txt")"
+# For tests/snapshot-browser.sh, which resumes this guest in QEMU-Wasm.
+printf 'token=%s\nsaved_at=%s\nblob_md5=%s\n' "$token" "$saved_at" "$blob_md5" > "$work/guest.env"
 (( chunks >= 3 )) || bad "the stream has only $chunks chunks: too small to test the hand-over between buffers"
 last="$(printf '%06d' $(( chunks - 1 )))"
 
