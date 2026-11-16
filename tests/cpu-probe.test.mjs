@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { PCPU_FUNCTION, THREAD_PROCS, cpuDelta, describeCpu, parseCpuLine } from './boot/cpu-probe.mjs';
 
 // --- parser -------------------------------------------------------------------
@@ -81,8 +81,10 @@ if (existsSync('/proc/self/stat') && existsSync('/proc/stat')) {
         let out;
         try {
             // pid 1 stands in for surfaceflinger, to exercise the thread loop.
-            const fn = PCPU_FUNCTION.replace(`for n in ${THREAD_PROCS[0]} `, `for n in $(cat /proc/1/comm) `);
-            out = execFileSync(shell, ['-c', `${fn}\npcpu t1 threads`], { encoding: 'utf8' });
+            const comm = readFileSync('/proc/1/comm', 'utf8').trim();
+            assert.ok(PCPU_FUNCTION.includes(`case $c in ${THREAD_PROCS.join('|')})`));
+            const fn = PCPU_FUNCTION.replace(`case $c in ${THREAD_PROCS[0]}|`, `case $c in ${comm}|`);
+            out = execFileSync(shell, ['-c', `${fn}\npcpu t1 threads frames`], { encoding: 'utf8' });
         } catch (e) {
             console.log(`cpu-probe: ${shell} not usable here (${e.message.split('\n')[0]}), skipped`);
             continue;

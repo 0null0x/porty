@@ -15,20 +15,27 @@
 // (dilated) time.  mksh (Android's /system/bin/sh), also bash and dash.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-export const THREAD_PROCS = ['surfaceflinger', 'system_server', 'com.android.systemui',
-    'com.android.launcher3', 'com.android.gallery3d'];
+// The processes whose threads are listed, by their /proc comm (the last 15
+// characters of an app's process name).
+export const THREAD_PROCS = ['surfaceflinger', 'system_server', 'ndroid.systemui',
+    'droid.launcher3', 'droid.gallery3d'];
 
-const STAT_LOOP = (line) => 'read -r l < $f || continue; c=${l#*\\(}; c=${c%%\\)*}; set -- ${l##*\\) }; ' + line;
+const STAT = 'read -r l < $f || continue; c=${l#*\\(}; c=${c%%\\)*}; set -- ${l##*\\) }; ';
 
+// No pidof (toybox reads every /proc/<pid>/cmdline, which waits for the
+// mmap lock of each process) and no binder call unless asked for
+// ("frames": surfaceflinger's transaction 1013, which checks a permission
+// with system_server; during a launch in the browser that held the shell
+// for minutes).
 export const PCPU_FUNCTION = [
-    'pcpu() { t=$1; w=$2; ',
+    'pcpu() { t=$1; w=$2; q=$3; n=; ',
     'echo "CPS|$t|$(cut -d\' \' -f1 /proc/uptime)|$(head -1 /proc/stat)|',
-    '$(service call SurfaceFlinger 1013 2>/dev/null | cut -d\' \' -f3 | head -1)"; ',
-    'for f in /proc/[0-9]*/stat; do ', STAT_LOOP('echo "CP|$t|${l%% *}|$c|$((${12}+${13}))"; '), 'done 2>/dev/null; ',
-    `if [ "$w" = threads ]; then for n in ${THREAD_PROCS.join(' ')}; do for p in $(pidof $n); do `,
-    'for f in /proc/$p/task/[0-9]*/stat; do ',
-    STAT_LOOP('echo "CT|$t|$p|${l%% *}|$c|$((${12}+${13}))|${17}|${39}"; '),
-    'done; done; done 2>/dev/null; fi; ',
+    '$([ "$q" = frames ] && timeout 10 service call SurfaceFlinger 1013 2>/dev/null | sed -n \'s/.*Parcel(\\([0-9a-f]*\\).*/\\1/p\' | head -1)"; ',
+    'for f in /proc/[0-9]*/stat; do ', STAT, 'echo "CP|$t|${l%% *}|$c|$((${12}+${13}))"; ',
+    `case $c in ${THREAD_PROCS.join('|')}) n="$n \${l%% *}";; esac; `,
+    'done 2>/dev/null; ',
+    'if [ "$w" = threads ]; then for p in $n; do for f in /proc/$p/task/[0-9]*/stat; do ', STAT,
+    'echo "CT|$t|$p|${l%% *}|$c|$((${12}+${13}))|${17}|${39}"; done; done 2>/dev/null; fi; ',
     'echo "CPE|$t|$((1+1))"; }',
 ].join('');
 

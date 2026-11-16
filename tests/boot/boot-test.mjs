@@ -463,6 +463,9 @@ async function inputProbe() {
         for (const line of lines) {
             // The CPU lines are many; they are reported, not echoed.
             if (parseCpuLine(line.replace(/\r$/, ''), marks.cpu)) {
+                if (/^CP[SE]\|/.test(line)) {
+                    log(`INPUT PROBE: cpu snapshot ${line.replace(/\r$/, '').slice(0, 120)}`);
+                }
                 continue;
             }
             if (line.trim()) {
@@ -621,6 +624,7 @@ async function inputProbe() {
         const stats = document.getElementById('stats');
         return {
             diff,
+            frames: e && e.display && e.display.guestFrames !== undefined ? e.display.guestFrames : -1,
             fps: Number((/^(\d+) fps/.exec(stats ? stats.textContent : '') || [])[1] || -1),
             disk: e && e.diskStats ? e.diskStats() : null,
             heap: e && e.heapStats ? e.heapStats() : null,
@@ -706,6 +710,7 @@ async function inputProbe() {
             return null;
         }
         const t = Date.now();
+        marks.cpu.set(tag, { tag, at: t, procs: new Map(), threads: new Map(), done: false });
         await send(`pcpu ${tag}${threads ? ' threads' : ''}\r`);
         while (!(marks.cpu.get(tag) || {}).done && Date.now() - t < ms) {
             await sleep(2000);
@@ -746,13 +751,18 @@ async function inputProbe() {
     const timeline = [];
     let lastDiff = 0;
     while (Date.now() - tapAt < probeWaitMs) {
-        if (guestEveryMs && Date.now() >= nextGuest) {
+        // Nothing new is typed while a CPU snapshot is still printing: the
+        // terminal's echo of typed text lands in the middle of its lines.
+        const lastCpu = cpuTags.length ? marks.cpu.get(cpuTags[cpuTags.length - 1]) : null;
+        const cpuBusy = lastCpu && !lastCpu.done && Date.now() - lastCpu.at < 300000;
+        if (guestEveryMs && Date.now() >= nextGuest && !cpuBusy) {
             nextGuest = Date.now() + guestEveryMs;
             const round = guestRound++;
             // Every PROBE_CPU_EVERY-th round a CPU snapshot instead of top.
             const cpuTag = cpuBefore && round % probeCpuEvery === probeCpuEvery - 1 ? `t${since()}` : '';
             if (cpuTag) {
                 cpuTags.push(cpuTag);
+                marks.cpu.set(cpuTag, { tag: cpuTag, at: Date.now(), procs: new Map(), threads: new Map(), done: false });
             }
             await send(`${guestSample}${cpuTag ? `; pcpu ${cpuTag}` : (round % 2 === 1 ? `; ${guestTop}` : '')}\r`);
         }
@@ -857,9 +867,12 @@ async function inputProbe() {
         for (let i = 1; i < done.length; i++) {
             log(`INPUT PROBE: cpu ${done[i - 1].tag} -> ${done[i].tag}: ${describeCpu(cpuDelta(done[i - 1], done[i]), 6)}`);
         }
+        const shown = await pageSample(false).catch(() => null);
+        const displayUpdates = shown && shown.frames >= 0 && before.frames >= 0 ? shown.frames - before.frames : -1;
+        log(`INPUT PROBE: QEMU's display was updated ${displayUpdates} times from the tap to the end`);
         result.cpu = {
             busy: whole.busy, total: whole.total, user: whole.user, system: whole.system, guestSeconds: whole.guestSeconds,
-            sfFrames: whole.frames, uncounted: whole.uncounted,
+            sfFrames: whole.frames, displayUpdates, uncounted: whole.uncounted,
             top: whole.procs.slice(0, 10).map((p) => [p.comm, p.ticks]),
             threads: whole.threads.slice(0, 12).map((t) => [`${t.proc}/${t.comm}`, t.ticks]),
         };

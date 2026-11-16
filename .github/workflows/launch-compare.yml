@@ -146,7 +146,7 @@ jobs:
         continue-on-error: true
         env:
           PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
-          QUERIES: ${{ inputs.queries }}
+          QUERIES: ${{ inputs.queries || 'wasmmem=1280&jitcap=15000' }}
           SHELLS: ${{ inputs.shells }}
           ROUNDS: ${{ inputs.rounds || 1 }}
           PROBE_WAIT_S: ${{ inputs.probe_wait || 420 }}

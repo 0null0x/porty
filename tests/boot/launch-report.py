@@ -40,7 +40,7 @@ def main(args):
     print(f"ok: {len(measured)} of {len(rows)} launches measured" if measured else f"failed: none of {len(rows)} launches measured")
     print()
     print("| visit | host CPU | screen changed s | screen timeline | drawn (event log) s | Android's launch time s | focused at end "
-          "| guest busy ticks | sf frames | top processes (ticks) | top threads | JIT compiled |")
+          "| guest busy ticks | display updates | top processes (ticks) | top threads | JIT compiled |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for label, r, cpu in rows:
         if not r:
@@ -52,7 +52,7 @@ def main(args):
         jit = r.get("jit") or {}
         print(f"| {label} | {r.get('hostCpu', cpu)} | {r.get('screenChangedS')} | {r.get('screenTimeline', '')} "
               f"| {r.get('firstFrameS')} | {r.get('launchTimeWallS')} | {r.get('focusedAtEnd')} "
-              f"| {c.get('busy', '')} | {c.get('sfFrames', '')} | {top} | {threads} | {jit.get('compiled', '')} |")
+              f"| {c.get('busy', '')} | {c.get('displayUpdates', '')} | {top} | {threads} | {jit.get('compiled', '')} |")
     return 0
 
 

@@ -35,6 +35,7 @@ export class Display {
         this.height = 0;
         this.lastFull = 0;
         this.frames = 0;
+        this.guestFrames = 0;
         this.heartbeat = 0;
         this.running = true;
         this.onResize = null;
@@ -49,6 +50,9 @@ export class Display {
         }
         this.heartbeat = info[F.REFRESHES];
         this.running = info[F.RUNNING] !== 0;
+        // QEMU's count of display updates (one or more per frame the guest
+        // writes to video memory): the boot test counts frames with it.
+        this.guestFrames = info[F.FRAME];
 
         const data = info[F.DATA];
         const width = info[F.WIDTH];
