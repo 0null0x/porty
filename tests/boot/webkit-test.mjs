@@ -28,6 +28,9 @@
 //   COI             sw (the page's service worker), route (the test adds
 //                   COOP/COEP to the responses itself) or auto (default:
 //                   sw, then route if the page does not become isolated)
+//   TABLE_GROW      experiment: QEMU's function table grows by this many
+//                   entries at a time instead of one per compiled block
+//                   (the test rewrites qemu/out.js on its way to the browser)
 //   PLAYWRIGHT_DIR  directory that has node_modules/playwright-core
 //   CHROME          Chrome binary for BROWSER=chrome (default: Playwright's
 //                   "chrome" channel, the installed Google Chrome)
@@ -60,12 +63,13 @@ const probeSeconds = Math.max(30, Math.min(3600, Number(process.env.PROBE_SECOND
 const benchMode = (process.env.BENCH || '1').toLowerCase();
 const benchModules = Math.max(500, Math.min(15000, Number(process.env.BENCH_MODULES) || 8000));
 const coiMode = (process.env.COI || 'auto').toLowerCase();
+const tableGrow = Math.max(0, Math.min(65536, Number(process.env.TABLE_GROW) || 0));
 const queryText = (process.env.QUERY || '').trim().replace(/^\?/, '');
 const params = new URLSearchParams(queryText);
 params.set('serial', '1');
 const url = `${siteUrl}?${params}`;
 const statusContext = `${process.env.STATUS_CONTEXT ||
-    (browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome')} ${queryText || 'defaults'}`.slice(0, 100);
+    (browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome')} ${queryText || 'defaults'}${tableGrow ? ` tablegrow=${tableGrow}` : ''}`.slice(0, 100);
 
 const t0 = Date.now();
 const elapsed = () => {
@@ -81,7 +85,7 @@ const secs = (ms) => Math.round(ms / 100) / 10;
 // Everything worth comparing between runs ends up here ("RESULT" line).
 const result = {
     browser: browserName, device, query: queryText, version: '', coi: '', features: null, bench: null,
-    boot: {}, probe: {}, jit: [], memory: [], crashed: false, errors: [],
+    tableGrow, boot: {}, probe: {}, jit: [], memory: [], crashed: false, errors: [],
 };
 const note = (msg) => {
     result.errors.push(msg.slice(0, 300));
@@ -135,7 +139,8 @@ function browserProcesses() {
 
 /** Is this the process that runs the page (WebKit: web process, Chrome: renderer)? */
 function isContentProcess(p) {
-    return /WebProcess/.test(p.name) || p.cmd.some((a) => /WebProcess$/.test(a)) || p.cmd.includes('--type=renderer');
+    // (Chrome rewrites its command line: one string with spaces.)
+    return /WebProcess/.test(p.name) || /WebProcess( |$)|--type=renderer/.test(p.cmd.join(' '));
 }
 
 /** Resident kB inside mappings of 1 GiB or more: the WebAssembly memory. */
@@ -434,11 +439,12 @@ function startJitModel() {
     const section = (id, body) => [id, ...leb(body.length), ...body];
     const HEAD = [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
     let pages = 256, shared = true, memory, table, run, registry, collected = 0, made = 0;
+    let ops = 24, growTable = false, helper = { 0: (x) => x };
     // One "translation block": loads, a few dozen ALU operations, a store,
     // a helper call that is never taken.  k makes every module different.
     function block(k) {
         const body = [1, 1, 0x7f, 0x20, 0, 0x28, 2, 0, 0x21, 1];
-        for (let j = 0; j < 24; j++) {
+        for (let j = 0; j < ops; j++) {
             body.push(0x20, 1, 0x41, ...sleb((k * 31 + j) | 0), 0x6a, 0x20, 1, 0x41, 3, 0x74, 0x73, 0x21, 1);
         }
         body.push(0x20, 0, 0x20, 1, 0x36, 2, 4);
@@ -474,14 +480,31 @@ function startJitModel() {
             ...section(7, [1, ...str('run'), 0, 0]),
             ...section(10, [1, ...leb(body.length), ...body])]);
     }
-    const helper = { 0: (x) => x };
+    // (func (param i32) (result i32) local.get 0), exported as "id": a
+    // helper that is a WebAssembly function, as QEMU's helpers are.
+    function identity() {
+        return new Uint8Array([...HEAD,
+            ...section(1, [1, 0x60, 1, 0x7f, 1, 0x7f]),
+            ...section(3, [1, 0]),
+            ...section(7, [1, ...str('id'), 0, 0]),
+            ...section(10, [1, 4, 0, 0x20, 0, 0x0b])]);
+    }
     const commands = {
+        // a.size: table entries at the start; a.grow: the table grows by one
+        // entry per module, as Emscripten's addFunction() does; a.pages: the
+        // memory; a.ops: operations per block; a.wasmHelper: see identity().
         init(a) {
+            pages = a.pages || 256;
+            ops = a.ops || 24;
+            growTable = !!a.grow;
             try {
                 memory = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
             } catch (e) {
                 shared = false;
                 memory = new WebAssembly.Memory({ initial: pages, maximum: pages });
+            }
+            if (a.wasmHelper) {
+                helper = { 0: new WebAssembly.Instance(new WebAssembly.Module(identity()), {}).exports.id };
             }
             table = new WebAssembly.Table({ element: 'anyfunc', initial: a.size });
             run = new WebAssembly.Instance(new WebAssembly.Module(dispatcher()), { env: { table } }).exports.run;
@@ -498,9 +521,14 @@ function startJitModel() {
                 bytes = wasm.length;
                 const inst = new WebAssembly.Instance(new WebAssembly.Module(wasm), { env: { buffer: memory }, helper });
                 registry.register(inst, 'instance');
-                table.set(i, inst.exports.start);
+                if (growTable) {
+                    table.grow(1);
+                    table.set(table.length - 1, inst.exports.start);
+                } else {
+                    table.set(i, inst.exports.start);
+                }
             }
-            return { ms: performance.now() - t, bytes };
+            return { ms: performance.now() - t, bytes, tableLength: table.length };
         },
         // Only the part of make() that is not the engine's: building the bytes.
         generate(a) {
@@ -535,6 +563,9 @@ function startJitModel() {
         }
         self.postMessage({ id: ev.data.id, ...answer });
     };`;
+    if (globalThis.__jitModelStop) {
+        globalThis.__jitModelStop();
+    }
     const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
     const waiting = new Map();
     let next = 1;
@@ -659,6 +690,145 @@ async function jitBench() {
     const after = memorySample();
     bench.memory.push({ modules: 0, stopped: true, ...after });
     log(`JIT MODEL: memory after stopping the worker: ${describeMemory(after)}`);
+
+    // What a module costs when one thing is more like QEMU-Wasm: each in a
+    // fresh worker, 2000 modules, never called.
+    bench.variants = [];
+    const n = 2000;
+    for (const [name, options] of [
+        ['base (table sized once, 16 MiB memory, JS helper, 463-byte modules)', { size: n + 16 }],
+        ['table of 16384 growing by one per module', { size: 16384, grow: true }],
+        ['table of 65536 growing by one per module', { size: 65536, grow: true }],
+        ['helper is a WebAssembly function', { size: n + 16, wasmHelper: true }],
+        ['1280 MiB shared memory', { size: n + 16, pages: 1280 * 16 }],
+        ['modules of about 6 kB', { size: n + 16, ops: 400 }],
+    ]) {
+        try {
+            await page.evaluate(startJitModel);
+            await call({ cmd: 'init', ...options });
+            await sleep(1500);
+            const m0 = memorySample();
+            const r = await call({ cmd: 'make', lo: 0, hi: n });
+            await sleep(1500);
+            const m1 = memorySample();
+            await page.evaluate(() => globalThis.__jitModelStop());
+            await sleep(2500);
+            const m2 = memorySample();
+            const v = {
+                name, bytes: r.bytes, msPerModule: Math.round((r.ms / n) * 1000) / 1000,
+                kbPerModule: Math.round(((m1.content - m0.content) * 1024 / n) * 10) / 10,
+                before: m0.content, after: m1.content, stopped: m2.content,
+            };
+            bench.variants.push(v);
+            log(`JIT MODEL VARIANT ${name}: ${v.kbPerModule} kB and ${v.msPerModule} ms per module ` +
+                `(${r.bytes} bytes each; content processes ${m0.content} -> ${m1.content} MiB, ${m2.content} after stopping)`);
+        } catch (e) {
+            log(`JIT MODEL VARIANT ${name} failed: ${String(e.message || e).split('\n')[0]}`);
+        }
+    }
+}
+
+/**
+ * Runs in the page, after Android ran for a while: the translation blocks
+ * QEMU-Wasm compiled are WebAssembly binaries in its code buffer, each
+ * preceded by its size.  Returns how many, how big, and two of them.
+ */
+function scanBlocks() {
+    const e = globalThis.__porty;
+    const b = new Uint8Array(e.memory.buffer);
+    const view = new DataView(e.memory.buffer);
+    const sizes = [];
+    const at = [];
+    const end = b.length - 16;
+    for (let i = 4; i < end; i++) {
+        if (b[i + 1] === 0x61 && b[i] === 0 && b[i + 2] === 0x73 && b[i + 3] === 0x6d &&
+            b[i + 4] === 1 && b[i + 5] === 0 && b[i + 6] === 0 && b[i + 7] === 0) {
+            const size = view.getInt32(i - 4, true);
+            if (size > 16 && size < 4000000) {
+                sizes.push(size);
+                at.push(i);
+                i += size - 1;
+                if (sizes.length >= 60000) {
+                    break;
+                }
+            }
+        }
+    }
+    const order = sizes.map((v, i) => i).sort((x, y) => sizes[x] - sizes[y]);
+    const pick = (q) => order[Math.min(order.length - 1, Math.floor(order.length * q))];
+    const b64 = (i) => {
+        let text = '';
+        const bytes = b.slice(at[i], at[i] + sizes[i]);
+        for (let j = 0; j < bytes.length; j += 3000) {
+            text += String.fromCharCode(...bytes.subarray(j, j + 3000));
+        }
+        return btoa(text);
+    };
+    const total = sizes.reduce((x, y) => x + y, 0);
+    return order.length ? {
+        count: sizes.length, total, mean: Math.round(total / sizes.length),
+        min: sizes[pick(0)], median: sizes[pick(0.5)], p90: sizes[pick(0.9)], p99: sizes[pick(0.99)],
+        max: sizes[order[order.length - 1]],
+        samples: [{ size: sizes[pick(0.5)], b64: b64(pick(0.5)) }, { size: sizes[pick(0.9)], b64: b64(pick(0.9)) }],
+    } : { count: 0 };
+}
+
+/** Runs in the page: the table of QEMU's module and Emscripten's code that grows it. */
+async function qemuTableInfo() {
+    const base = new URL('.', location.href).href;
+    const out = {};
+    try {
+        const js = await (await fetch(`${base}qemu/out.js`)).text();
+        out.jsBytes = js.length;
+        const i = js.indexOf('wasmTable.grow(');
+        out.grow = i < 0 ? 'no wasmTable.grow( in out.js' : js.slice(Math.max(0, i - 160), i + 200);
+        const j = js.search(/removeFunction\s*=|function removeFunction/);
+        out.remove = j < 0 ? '' : js.slice(j, j + 260);
+    } catch (err) {
+        out.jsError = String(err);
+    }
+    try {
+        const bytes = new Uint8Array(await (await fetch(`${base}qemu/qemu-system-x86_64.wasm`)).arrayBuffer());
+        out.wasmBytes = bytes.length;
+        const leb = (pos) => {
+            let result = 0;
+            let shift = 0;
+            for (;;) {
+                const byte = bytes[pos++];
+                result += (byte & 0x7f) * 2 ** shift;
+                shift += 7;
+                if (!(byte & 0x80)) {
+                    return [result, pos];
+                }
+            }
+        };
+        let pos = 8;
+        while (pos < bytes.length) {
+            const id = bytes[pos++];
+            let size;
+            [size, pos] = leb(pos);
+            if (id === 4) {
+                // table section: count, then reftype, limits
+                let p = pos;
+                let count;
+                [count, p] = leb(p);
+                const flags = bytes[p + 1];
+                let min;
+                [min, p] = leb(p + 2);
+                out.table = { count, min, flags };
+            }
+            if (id === 9) {
+                out.elementSectionBytes = size;
+            }
+            if (id >= 10) {
+                break;
+            }
+            pos += size;
+        }
+    } catch (err) {
+        out.wasmError = String(err);
+    }
+    return out;
 }
 
 // ------------------------------------------------------- part 3: Android ---
@@ -699,6 +869,9 @@ async function pageState() {
         const text = (id) => ($(id) ? $(id).textContent.replace(/\s+/g, ' ').trim() : '');
         const e = globalThis.__porty;
         let lit = -1;
+        // Share of pixels brighter than Gallery's dark grey: the launcher's
+        // wallpaper is, Gallery's window and a black screen are not.
+        let bright = -1;
         const c = $('screen');
         try {
             if (c && c.width) {
@@ -709,10 +882,13 @@ async function pageState() {
                 g.drawImage(c, 0, 0, 48, 80);
                 const px = g.getImageData(0, 0, 48, 80).data;
                 let on = 0;
+                let light = 0;
                 for (let i = 0; i < px.length; i += 4) {
                     on += px[i] + px[i + 1] + px[i + 2] > 30 ? 1 : 0;
+                    light += px[i] + px[i + 1] + px[i + 2] > 150 ? 1 : 0;
                 }
                 lit = Math.round((100 * on) / (48 * 80));
+                bright = Math.round((100 * light) / (48 * 80));
             }
         } catch (err) {
             lit = -1;
@@ -735,6 +911,7 @@ async function pageState() {
             failLog: $('app').dataset.state === 'failed' ? $('fail-log').textContent : '',
             overlayHidden: $('overlay') ? $('overlay').hidden : false,
             lit,
+            bright,
             screen: c ? `${c.width}x${c.height}` : '',
             heap,
             disk,
@@ -780,7 +957,7 @@ async function sample(label, every = 10000) {
         ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest } : {}),
     };
     result.jit.push(row);
-    log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% jit=${h.jitAlive}/${h.jitCompiled} ` +
+    log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}" | ${describeMemory(m)}`);
     return s;
 }
@@ -964,43 +1141,67 @@ async function inputProbe() {
     log(`INPUT PROBE: the page saw ${JSON.stringify(events)} (${p.how})`);
     await sample('tap', 0);
 
-    // Ask what has the focus every 20 s until it is Gallery.
-    let lastFocus = '';
+    // Watch the screen: the launcher's wallpaper goes (a black starting
+    // window), then Gallery's dark window is drawn.  The shell is left
+    // alone meanwhile: "dumpsys window" does not return while the app
+    // starts, and a queue of them only loads the guest.
     const deadline = Math.min(tTap + probeSeconds * 1000, t0 + minutes * 60000);
     let shots = 0;
+    let nextPost = 0;
     while (Date.now() < deadline && !result.crashed) {
-        serialAll = '';
-        await send('echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END\r');
-        const tAsk = Date.now();
-        let got = null;
-        while (Date.now() - tAsk < 20000 && !result.crashed) {
-            await sleep(1000);
-            await drainSerial();
-            const m = /FOCUS:\s*(mCurrentFocus[^\n]*):END/.exec(serialAll);
-            if (m && !got) {
-                got = m[1];
-                lastFocus = got;
-                if (/gallery/i.test(got)) {
-                    break;
-                }
-            }
-            await sample('probe', 10000);
+        await sleep(2000);
+        await drainSerial();
+        let s;
+        try {
+            s = await pageState();
+        } catch (e) {
+            continue;
         }
-        if (got && /gallery/i.test(got)) {
-            p.gallery = secs(Date.now() - tTap);
-            log(`INPUT PROBE: Gallery in front after ${p.gallery} s: ${got}`);
+        if (s.state === 'failed' || s.exited) {
+            result.boot.failed = s.failure || 'QEMU exited';
+            note(`PAGE FAILED during the probe: ${result.boot.failed}`);
             break;
         }
-        if (Date.now() - tTap > 60000 * (shots + 1) && shots < 3) {
+        if (p.launcherGone === undefined && s.bright >= 0 && s.bright < 30) {
+            p.launcherGone = secs(Date.now() - tTap);
+            log(`INPUT PROBE: the launcher left the screen after ${p.launcherGone} s (lit=${s.lit}% bright=${s.bright}%)`);
+            await sample('launcher-gone', 0);
+        }
+        if (p.launcherGone !== undefined && s.lit >= 50 && s.bright < 30) {
+            p.gallery = secs(Date.now() - tTap);
+            log(`INPUT PROBE: Gallery drawn after ${p.gallery} s (lit=${s.lit}% bright=${s.bright}%)`);
+            break;
+        }
+        await sample('probe', 10000);
+        if (Date.now() - tTap > 90000 * (shots + 1) && shots < 3) {
             shots++;
             await shot(`probe-${shots}`);
         }
-        await postStatus('pending', `${elapsed()} tap sent ${Math.round((Date.now() - tTap) / 1000)} s ago; focus ${lastFocus.slice(0, 60)}`);
+        if (Date.now() >= nextPost) {
+            nextPost = Date.now() + 60000;
+            const h = s.heap || {};
+            await postStatus('pending', `${elapsed()} tap ${Math.round((Date.now() - tTap) / 1000)} s ago; ` +
+                `lit ${s.lit}% bright ${s.bright}% jit ${h.jitAlive}/${h.jitCompiled} rss ${(memorySample() || {}).rss} MiB`);
+        }
     }
-    p.lastFocus = lastFocus;
     if (p.gallery === undefined) {
         p.gallery = null;
-        log(`INPUT PROBE: Gallery not in front within ${Math.round((Date.now() - tTap) / 1000)} s (last focus: ${lastFocus || 'no answer'})`);
+        log(`INPUT PROBE: Gallery not drawn within ${Math.round((Date.now() - tTap) / 1000)} s`);
+    } else {
+        // One question to Android, to confirm what the screen showed.
+        serialAll = '';
+        await send('echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END\r');
+        const tAsk = Date.now();
+        while (Date.now() - tAsk < 90000 && !result.crashed && p.focus === undefined) {
+            await sleep(1000);
+            await drainSerial();
+            const m = /FOCUS:\s*(mCurrentFocus[^\n]*):END/.exec(serialAll);
+            if (m) {
+                p.focus = m[1];
+            }
+            await sample('focus', 10000);
+        }
+        log(`INPUT PROBE: focus ${p.focus || 'not answered within 90 s'}`);
     }
     await sample('after-probe', 0);
     await shot('after-probe');
@@ -1009,6 +1210,20 @@ async function inputProbe() {
         await sleep(10000);
         await drainSerial();
         await sample('settle', 0);
+    }
+    // What QEMU-Wasm compiled: the modules in its code buffer.
+    try {
+        const blocks = await page.evaluate(scanBlocks);
+        for (const sm of blocks.samples || []) {
+            console.log(`-----BEGIN PORTY WASM ${sm.size}-----`);
+            console.log(sm.b64);
+            console.log('-----END PORTY WASM-----');
+        }
+        delete blocks.samples;
+        result.blocks = blocks;
+        log(`BLOCKS: ${JSON.stringify(blocks)}`);
+    } catch (e) {
+        log(`block scan failed: ${String(e.message).split('\n')[0]}`);
     }
 }
 
@@ -1038,7 +1253,7 @@ function summarize() {
         parts.push(`loop ${b.loops.join('/')}s`);
     }
     if (p.gallery !== undefined) {
-        parts.push(p.gallery === null ? 'Gallery: no' : `Gallery ${p.gallery}s`);
+        parts.push(p.gallery === null ? 'Gallery: no' : `Gallery ${p.gallery}s (launcher gone ${p.launcherGone}s)`);
     }
     if (last.compiled !== undefined) {
         parts.push(`jit ${last.alive}/${last.compiled}`);
@@ -1050,6 +1265,27 @@ function summarize() {
 }
 
 try {
+    if (tableGrow > 0) {
+        // Experiment: Emscripten's addFunction() grows QEMU's table by one
+        // entry for every compiled block.  Grow it in steps instead and
+        // hand out the spare entries.  (QEMU's JavaScript is rewritten on
+        // its way to the browser; nothing on the site changes.)
+        const patch = `wasmTable.grow(${tableGrow});for(var portyI=wasmTable.length-${tableGrow};` +
+            'portyI<wasmTable.length-1;portyI++)freeTableIndexes.push(portyI)';
+        await page.context().route(/\/qemu\/out\.js/, async (route) => {
+            try {
+                const response = await route.fetch();
+                const text = await response.text();
+                const hits = text.split('wasmTable.grow(1)').length - 1;
+                result.tableGrowHits = (result.tableGrowHits || 0) + hits;
+                result.tableGrowLoads = (result.tableGrowLoads || 0) + 1;
+                await route.fulfill({ response, body: text.split('wasmTable.grow(1)').join(patch) });
+            } catch (e) {
+                log(`table-grow patch failed: ${String(e.message).split('\n')[0]}`);
+                await route.continue().catch(() => {});
+            }
+        });
+    }
     log(`opening ${url}`);
     await page.goto(url, { waitUntil: 'load', timeout: 120000 });
     // --- cross-origin isolation ---------------------------------------------
@@ -1115,6 +1351,8 @@ try {
 
     result.features = await page.evaluate(featureProbe);
     log(`FEATURES: ${JSON.stringify(result.features)}`);
+    result.qemu = await page.evaluate(qemuTableInfo).catch((e) => ({ error: String(e.message).split('\n')[0] }));
+    log(`QEMU MODULE: ${JSON.stringify(result.qemu)}`);
     await postStatus('pending', `${elapsed()} isolated: ${result.coi || 'no'}; ` +
         `sync XHR ${result.features.worker && result.features.worker.syncXhr}`);
 
@@ -1159,6 +1397,9 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         `- URL: ${url}`,
         `- Isolation: ${result.coi || 'none'}; SharedArrayBuffer ${f.sharedArrayBuffer}; worker: ${JSON.stringify(f.worker || {})}`,
         `- Shared WebAssembly memory: ${JSON.stringify(f.memory || {})}`,
+        `- QEMU module: ${JSON.stringify(result.qemu || {}).slice(0, 900)}`,
+        ...(tableGrow ? [`- Experiment: table grows by ${tableGrow} (${result.tableGrowHits || 0} places rewritten in ${result.tableGrowLoads || 0} loads of out.js)`] : []),
+        `- Compiled blocks in the code buffer: ${JSON.stringify(result.blocks || {})}`,
         `- Boot: ${JSON.stringify(result.boot)}`,
         `- Probe: ${JSON.stringify(result.probe)}`,
         ...(be.make ? [
@@ -1166,6 +1407,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
             `kB per module ${be.kbPerModuleFresh} fresh, ${be.kbPerModuleWarm} after the calls; hot call ${be.hotNs} ns`,
             `- JIT model, ns per call by round: ${be.calls.map((c) => `${c.from}-${c.to}: ${c.ns}`).join(', ')}`,
             `- JIT model, collection: ${JSON.stringify(be.collect)}`,
+            ...(be.variants || []).map((v) => `- JIT model variant, ${v.name}: ${v.kbPerModule} kB, ${v.msPerModule} ms per module`),
         ] : []),
         ...(result.errors.length ? ['- Errors:', ...result.errors.map((e) => `  - \`${e.replace(/`/g, "'").split('\n')[0]}\``)] : []),
         '',
