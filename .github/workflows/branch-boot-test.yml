@@ -62,6 +62,10 @@ on:
         description: More environment for the boot test, NAME=value separated by spaces (e.g. INPUT_PROBE=0 PROBE_WAIT=600)
         type: string
         default: ''
+      shell_init:
+        description: A command line typed into Android's root shell once, when its prompt appears (SHELL_INIT of the boot test; may hold spaces)
+        type: string
+        default: ''
   push:
     branches: ['swarm/**']
     paths:
@@ -211,6 +215,7 @@ jobs:
           NET_MBPS: ${{ inputs.net_mbps || 0 }}
           PAGES_LIKE: ${{ inputs.pages_like }}
           EXTRA_ENV: ${{ inputs.env }}
+          SHELL_INIT: ${{ inputs.shell_init }}
         run: |
           CHROME="$(command -v google-chrome || command -v chromium)"
           export CHROME SITE_URL="http://127.0.0.1:8080/"

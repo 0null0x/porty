@@ -251,10 +251,10 @@ check "ramdisk.img readable from second drive"       "PORTY-TEST: ramdisk marker
 check "USB tablet received events"                   "PORTY-TEST: tablet-bytes [1-9]"
 check "keyboard received events"                     "PORTY-TEST: kbd-bytes [1-9]"
 check "KEY_BACK (158 = 0x9e) arrived"                "PORTY-TEST: kbd-hex .*01009e00"
-check "kernel unpacked the appended boot-diet archive" "porty: boot diet, 3 properties in default.prop"
+check "kernel unpacked the appended boot-diet archive" "porty: boot diet, 5 properties in default.prop"
 check "the module fix leaves a guest without ttm.ko alone" "porty: no ttm.ko, nothing to fix"
 check "provisioning leaves a guest without init.rc alone" "porty: no init.rc, device not provisioned"
-check "the script rewrote default.prop"              "PORTY-TEST: diet ro.zygote=zygote64_32 ro.debuggable=1 debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract"
+check "the script rewrote default.prop"              "PORTY-TEST: diet ro.zygote=zygote64_32 ro.debuggable=1 debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract ro.lmk.medium=1001 ro.lmk.critical=200"
 check "guest finished"                               "PORTY-TEST: done"
 
 if [[ -f "$work/fb.ppm" ]]; then
