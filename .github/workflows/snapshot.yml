@@ -1,0 +1,360 @@
+# Snapshot producer: boots Android-x86 in a NATIVE QEMU (TCG, one vCPU) built
+# from the same patched QEMU-Wasm tree as the site, waits for the home
+# screen, and saves the running machine with QEMU's migration
+# ("migrate file:..."), the flow QEMU-Wasm documents in
+# examples/migration/README.md.  The browser build resumes that stream with
+# the same arguments plus "-incoming", instead of booting for hours.
+#
+# Output: the workflow artifact "android-snapshot" (kept a few days, never
+# committed):
+#   snapshot/manifest.json, snapshot/000000.zz ...   see scripts/snapshot/pack-snapshot.py
+#   logs/                                            serial log, screenshots,
+#                                                    QEMU's view of the machine
+#
+# The run itself never fails, because every failed run emails the repository
+# owner.  The verdict is the commit status "porty/snapshot" and the job
+# summary; read the status with
+#   gh api repos/<owner>/<repo>/commits/<sha>/statuses
+name: Snapshot
+
+on:
+  push:
+    branches: [swarm/snapshot-producer]
+    paths:
+      - .github/workflows/snapshot.yml
+      - scripts/snapshot/**
+      - build/build-native-qemu.sh
+      - build/apply-patches.sh
+      - build/versions.env
+      - build/pc-bios.list
+      - patches/qemu-wasm/**
+      - scripts/prepare-image.sh
+      - tests/print-qemu-args.mjs
+      - web/js/qemu-args.js
+      - web/js/config.js
+  workflow_dispatch:
+    inputs:
+      query:
+        description: Page parameters the snapshot is made for (must set mem, tb and cache)
+        default: mem=768&tb=128&cache=16
+      runstate:
+        description: '"running": the resumed guest starts by itself; "paused": it waits for cont'
+        default: running
+      boot_timeout_min:
+        description: Minutes to wait for sys.boot_completed
+        default: '180'
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
+  RUNSTATE: ${{ inputs.runstate || 'running' }}
+  BOOT_TIMEOUT_MIN: ${{ inputs.boot_timeout_min || '180' }}
+
+jobs:
+  snapshot:
+    name: Boot Android natively and save it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+          nproc; free -m; df -h "$PWD" | tail -1
+          grep -m1 'model name' /proc/cpuinfo
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso ninja-build pkg-config \
+            libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
+
+      # --- native QEMU from the patched QEMU-Wasm tree ---------------------
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          tail -40 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Save the native QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          # The display, devices and drivers the page's argv needs.
+          out/native-qemu/qemu-system-x86_64 -display help > "$RUNNER_TEMP/displays.txt"
+          out/native-qemu/qemu-system-x86_64 -device help > "$RUNNER_TEMP/devices.txt"
+          out/native-qemu/qemu-system-x86_64 -accel help > "$RUNNER_TEMP/accels.txt"
+          cat "$RUNNER_TEMP/displays.txt" "$RUNNER_TEMP/accels.txt"
+          grep -q wasmfb "$RUNNER_TEMP/displays.txt"
+          grep -q '"usb-tablet"' "$RUNNER_TEMP/devices.txt"
+          grep -q '"virtio-blk-pci"' "$RUNNER_TEMP/devices.txt"
+          grep -q '"VGA"' "$RUNNER_TEMP/devices.txt"
+          # TCG only: the browser resumes into TCG, and a KVM guest would see
+          # the build machine's CPU.  (The argv asks for "-accel tcg"; the
+          # snapshot script refuses anything else.)
+          if grep -qx kvm "$RUNNER_TEMP/accels.txt"; then
+            echo "note: this binary also has KVM; it is not used"
+          fi
+
+      # --- the same image the site serves -----------------------------------
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: image
+        if: steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          tail -1 "$RUNNER_TEMP/prepare.log"
+          rm -rf out/iso
+          sha256sum out/image/manifest.json
+
+      # --- the page's own arguments -------------------------------------------
+      - name: Build the QEMU arguments
+        id: argv
+        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p out/snap out/artifact/logs
+          case "$QUERY" in
+            *mem=*tb=*cache=*|*mem=*cache=*tb=*|*tb=*mem=*cache=*|*tb=*cache=*mem=*|*cache=*mem=*tb=*|*cache=*tb=*mem=*) ;;
+            *) echo "::warning::query '$QUERY' does not set mem, tb and cache; print-qemu-args.mjs would use the desktop defaults" ;;
+          esac
+          # Natively: local paths.
+          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+            "$PWD/out/native-qemu/pc-bios" "?$QUERY" > out/snap/argv-native.txt
+          # For the manifest: the paths web/js/emulator.js uses.  The disk URL
+          # depends on where the site is served; emulator.js builds it as
+          # `${base}image/<disk dir>`, and that text stands in for it here.
+          # shellcheck disable=SC2016
+          node tests/print-qemu-args.mjs out/image/manifest.json /img /pc-bios "?$QUERY" \
+            | sed 's|file\.url=/img/|file.url=${base}image/|' > out/snap/argv-page.txt
+          # shellcheck disable=SC2016
+          grep -q 'file\.url=\${base}image/' out/snap/argv-page.txt
+          grep -qx -- '-accel' out/snap/argv-native.txt
+          if grep -q kvm out/snap/argv-native.txt; then
+            echo "::warning::the argv mentions kvm"; exit 1
+          fi
+          cp out/snap/argv-native.txt out/snap/argv-page.txt out/artifact/logs/
+          cat out/snap/argv-page.txt
+
+      # --- boot and save ----------------------------------------------------------
+      - name: Boot Android and save the machine
+        id: save
+        if: steps.argv.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 300
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # GitHub shows a job's log only when it ends: report progress as a
+          # pending commit status meanwhile.
+          (
+            while sleep 240; do
+              [[ -f out/snap/save/progress.txt ]] || continue
+              gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context=porty/snapshot \
+                -f description="$(head -c 140 out/snap/save/progress.txt)" -f target_url="$RUN_URL" >/dev/null 2>&1 || true
+            done
+          ) &
+          reporter=$!
+          trap 'kill "$reporter" 2>/dev/null || true' EXIT
+          python3 -I scripts/snapshot/make-snapshot.py save \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/snap/argv-native.txt \
+            --work out/snap/save \
+            --state "$RUNNER_TEMP/vm.state" \
+            --runstate "$RUNSTATE" \
+            --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))"
+
+      - name: Cut the stream into compressed chunks
+        id: pack
+        if: steps.save.outcome == 'success'
+        continue-on-error: true
+        env:
+          QEMU_COMMIT: ${{ steps.versions.outputs.qemu_commit }}
+        run: |
+          booted="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["booted_seconds"])' out/snap/save/result.json)"
+          python3 -I scripts/snapshot/pack-snapshot.py pack \
+            --state "$RUNNER_TEMP/vm.state" \
+            --out out/artifact/snapshot \
+            --argv-file out/snap/argv-page.txt \
+            --query "$QUERY" \
+            --image-manifest out/image/manifest.json \
+            --patches-dir patches/qemu-wasm \
+            --qemu-commit "$QEMU_COMMIT" \
+            --booted-seconds "$booted" \
+            --runstate "$RUNSTATE" \
+            --rom-dir out/native-qemu/pc-bios | tee out/snap/pack.txt
+          sha256sum "$RUNNER_TEMP/vm.state"
+          rm -f "$RUNNER_TEMP/vm.state"
+
+      # The published chunks are put back together and loaded into a fresh
+      # native QEMU: checks the files and that the stream is loadable at all.
+      - name: Restore check (native)
+        id: restore
+        if: steps.pack.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          python3 -I scripts/snapshot/pack-snapshot.py unpack \
+            --dir out/artifact/snapshot --state "$RUNNER_TEMP/vm-check.state"
+          python3 -I scripts/snapshot/make-snapshot.py restore \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/snap/argv-native.txt \
+            --work out/snap/restore \
+            --state "$RUNNER_TEMP/vm-check.state"
+
+      - name: Collect logs
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          mkdir -p out/artifact/logs
+          rm -f "$RUNNER_TEMP"/vm*.state
+          for dir in save restore; do
+            [[ -d "out/snap/$dir" ]] || continue
+            mkdir -p "out/artifact/logs/$dir"
+            for f in result.json serial.log qemu.log machine-info.txt; do
+              [[ -f "out/snap/$dir/$f" ]] && cp "out/snap/$dir/$f" "out/artifact/logs/$dir/"
+            done
+            cp "out/snap/$dir"/*.png "out/artifact/logs/$dir/" 2>/dev/null || true
+          done
+          cp out/native-qemu/build-info.txt out/snap/pack.txt out/image/manifest.json out/artifact/logs/ 2>/dev/null || true
+          [[ -f out/artifact/logs/manifest.json ]] && mv out/artifact/logs/manifest.json out/artifact/logs/image-manifest.json
+          du -sb out/artifact/* || true
+          echo "--- last serial lines ---"
+          tail -c 3000 out/snap/save/serial.log 2>/dev/null | tr -d '\r' | tail -40 || true
+
+      - name: Upload the snapshot
+        id: upload
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-snapshot
+          path: out/artifact
+          retention-days: 5
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TOOLS: ${{ steps.tools.outcome }}
+          PATCHES: ${{ steps.patches.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          QEMU: ${{ steps.qemu.outcome }}
+          ISO: ${{ steps.iso.outcome }}
+          IMAGE: ${{ steps.image.outcome }}
+          ARGV: ${{ steps.argv.outcome }}
+          SAVE: ${{ steps.save.outcome }}
+          PACK: ${{ steps.pack.outcome }}
+          RESTORE: ${{ steps.restore.outcome }}
+          UPLOAD: ${{ steps.upload.outcome }}
+        run: |
+          set +e
+          python3 -I scripts/snapshot/report.py out/snap out/artifact/snapshot > "$RUNNER_TEMP/report.txt" 2> "$RUNNER_TEMP/report.err"
+          cat "$RUNNER_TEMP/report.err"
+          details="$(sed -n '1p' "$RUNNER_TEMP/report.txt")"
+          state=failure
+          if [[ "$PATCHES" == failure ]]; then desc="patches do not apply"
+          elif [[ "$COMPILE" == failure ]]; then desc="native QEMU did not build"
+          elif [[ "$QEMU" != success ]]; then desc="native QEMU is missing or incomplete (tools: $TOOLS)"
+          elif [[ "$ISO" != success ]]; then desc="ISO download failed"
+          elif [[ "$IMAGE" != success ]]; then desc="prepare-image.sh failed"
+          elif [[ "$ARGV" != success ]]; then desc="could not build the QEMU arguments"
+          elif [[ "$SAVE" != success ]]; then desc="no snapshot: ${details:-see the log}"
+          elif [[ "$PACK" != success ]]; then desc="saved but not packed: $details"
+          elif [[ "$UPLOAD" != success ]]; then desc="packed but not uploaded: $details"
+          else
+            state=success
+            desc="$details"
+          fi
+          echo "$state: $desc"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context=porty/snapshot \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## Snapshot"
+            echo
+            echo "**$state**: $desc"
+            echo
+            echo "Query \`$QUERY\`, run state \`$RUNSTATE\`. Steps: tools $TOOLS, patches $PATCHES, compile $COMPILE, qemu $QEMU, iso $ISO, image $IMAGE, argv $ARGV, save $SAVE, pack $PACK, restore check $RESTORE, upload $UPLOAD."
+            echo
+            sed -n '2,$p' "$RUNNER_TEMP/report.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
