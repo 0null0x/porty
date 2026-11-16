@@ -14,11 +14,15 @@
 #   * -g2 instead of -g: keep function names and unminified JS glue, but no
 #     DWARF, which would blow the GitHub Pages size budget;
 #   * the linear memory size comes from build/versions.env;
-#   * no -sMALLOC=mimalloc, so Emscripten's default allocator: QEMU-Wasm's
+#   * -sMALLOC=dlmalloc at the end: QEMU-Wasm's toolchain image puts
+#     -sMALLOC=mimalloc into its CFLAGS environment (Dockerfile ENV), which
+#     QEMU's configure passes to the link, and the last -sMALLOC wins. Its
 #     author dropped mimalloc "to prevent runtime error" on the fixmalloc
-#     branch (commit 3948df46, 2025-05-01), but master's README still has
-#     it, and with it the Android kernel died at random points in every
-#     boot test.
+#     branch (3948df46, 2025-05-01); dlmalloc also provides mallinfo() for
+#     porty_heap_stats(). (Removing the flag from the README's command line
+#     alone, as an earlier version of this script did, changed nothing.)
+# (A build with 2 MiB stacks, STACK_OVERFLOW_CHECK=2 and ASSERTIONS=1 found no
+# stack overflow; see docs/DEVELOPING.md and docs/PLAN.md, "Findings".)
 set -euo pipefail
 
 : "${WASM_MEMORY_MB:?WASM_MEMORY_MB is not set}"
@@ -29,7 +33,7 @@ emcc --version
 
 cd /build
 
-EXTRA_CFLAGS="-O3 -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=${WASM_MEMORY_MB}MB -sWASM_BIGINT --js-library=/build/node_modules/xterm-pty/emscripten-pty.js -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
+EXTRA_CFLAGS="-O3 -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=${WASM_MEMORY_MB}MB -sWASM_BIGINT --js-library=/build/node_modules/xterm-pty/emscripten-pty.js -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js -sMALLOC=dlmalloc"
 
 emconfigure /qemu/configure --static --target-list=x86_64-softmmu --cpu=wasm32 --cross-prefix= \
     --without-default-features --enable-system --with-coroutine=fiber --enable-virtfs \

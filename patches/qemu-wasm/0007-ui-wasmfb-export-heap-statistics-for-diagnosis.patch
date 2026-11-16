@@ -2,46 +2,52 @@ From: Claude <noreply@anthropic.com>
 Date: Mon, 16 Nov 2026 01:05:00 +0000
 Subject: [PATCH] ui/wasmfb: export heap statistics for diagnosis
 
-porty_heap_stats() returns the program break and dlmalloc's arena, in-use
-and free byte counts, so the page and the boot test can see how much of
-the WebAssembly memory QEMU really uses.  Boots with 1.25 to 1.5 GiB in
-total ran out of memory when the guest first read its virtio disk, while
-the same guest booted with 2.25 GiB; this is to find out why.
+porty_heap_stats() returns the program break and, with dlmalloc, its
+arena, in-use and free byte counts, so the page and the boot test can see
+how much of the WebAssembly memory QEMU really uses.  Boots with 1.25 to
+1.5 GiB in total ran out of memory when the guest first read its virtio
+disk, while the same guest booted with 2.25 GiB; this is to find out why.
+mallinfo() is referenced weakly because mimalloc builds do not have it.
 ---
 diff --git a/ui/wasmfb.c b/ui/wasmfb.c
-index bbdce33..4469e5d 100644
+index bbdce33..6857a7b 100644
 --- a/ui/wasmfb.c
 +++ b/ui/wasmfb.c
-@@ -40,6 +40,7 @@
+@@ -40,6 +40,9 @@
  
  #ifdef __EMSCRIPTEN__
  #include <emscripten.h>
 +#include <malloc.h>
++/* Weak: mimalloc builds have no mallinfo(); the reference is then null. */
++extern struct mallinfo mallinfo(void) __attribute__((weak));
  #define PORTY_EXPORT EMSCRIPTEN_KEEPALIVE
  #else
  #define PORTY_EXPORT __attribute__((used, visibility("default")))
-@@ -187,6 +188,28 @@ int porty_abi_version(void)
+@@ -187,6 +190,31 @@ int porty_abi_version(void)
      return 1;
  }
  
 +/*
-+ * Heap statistics for the page (diagnostics): the address of the current
-+ * program break and dlmalloc's arena, in-use and free byte counts.  Guest
-+ * RAM and the TCG buffer are allocated through malloc too, so "in use"
-+ * covers everything QEMU holds.  Takes the malloc lock; call it rarely.
-+ * Zeros outside Emscripten.
++ * Heap statistics for the page (diagnostics): the program break (the top
++ * of the memory the allocator has taken from the WebAssembly memory), and,
++ * when the allocator is dlmalloc, its arena, in-use and free byte counts
++ * (zeros otherwise).  Guest RAM and the TCG buffer come from the same
++ * allocator.  May take the malloc lock; call it rarely.  Zeros outside
++ * Emscripten.
 + */
 +PORTY_EXPORT uint32_t *porty_heap_stats(void);
 +uint32_t *porty_heap_stats(void)
 +{
 +    static uint32_t out[4];
 +#ifdef __EMSCRIPTEN__
-+    struct mallinfo mi = mallinfo();
-+
 +    out[0] = (uint32_t)(uintptr_t)sbrk(0);
-+    out[1] = (uint32_t)mi.arena;
-+    out[2] = (uint32_t)mi.uordblks;
-+    out[3] = (uint32_t)mi.fordblks;
++    if (mallinfo) {
++        struct mallinfo mi = mallinfo();
++
++        out[1] = (uint32_t)mi.arena;
++        out[2] = (uint32_t)mi.uordblks;
++        out[3] = (uint32_t)mi.fordblks;
++    }
 +#endif
 +    return out;
 +}
