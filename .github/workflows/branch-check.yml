@@ -534,7 +534,8 @@ jobs:
         continue-on-error: true
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso squashfs-tools busybox-static cpio zstd
+          # libfdt1 and libpixman: what the native QEMU of the job before links to
+          sudo apt-get install -y -qq xorriso squashfs-tools busybox-static cpio zstd libfdt1 libpixman-1-0
           (cd web && npm ci --ignore-scripts --no-audit --no-fund)
           (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
 

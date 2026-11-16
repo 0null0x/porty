@@ -137,7 +137,7 @@ start_qemu "$work/boot.log"
 if wait_for 300 'PORTY-SNAP: alive [0-9a-f]* 3 ' "$work/boot.log"; then
     pass "the guest booted (run 1)"
 else
-    bad "the guest did not boot within 300 s"
+    bad "the guest did not boot (QEMU stopped, or 300 s passed)"
     tail -30 "$work/boot.log" | sed 's/^/    /'
     exit 1
 fi
