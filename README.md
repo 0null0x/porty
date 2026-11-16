@@ -173,7 +173,7 @@ and say how far it got, with that message.
 | `dpi` | from `res` | Android screen density |
 | `gfx` | `auto` | `vesa` adds `nomodeset vga=...` (no kernel mode setting; standard VESA modes only, so portrait sizes become 800x600 or 1024x768) |
 | `disk` | `virtio` | `ide` presents the images as IDE CD-ROMs instead |
-| `setup` | off | `1` keeps Android's first-run setup wizard |
+| `setup` | off | `1` keeps Android's first-run setup wizard, which stops at once in this image (it needs Google's services). By default the page hides the wizard, Android-x86's analytics service and the second launcher (Taskbar) from Android at boot and marks the device as set up once it has booted, so the boot ends on the home screen |
 | `serial` | off | `1` opens the serial console at start |
 | `cache`, `parallel` | 64 (phones: 16), 4 | 2 MiB disk chunks kept in RAM, concurrent chunk downloads |
 | `fps` | 30 | Canvas refresh cap |

@@ -42,18 +42,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: i0
-            context: porty/check provisioning i0
-            experiment: z1
-            args: --idle 240 --qemu-arg=-icount --qemu-arg=shift=0
-          - name: i1
-            context: porty/check provisioning i1
-            experiment: z3
-            args: --idle 240 --qemu-arg=-icount --qemu-arg=shift=0
-          - name: r0
-            context: porty/check provisioning r0
-            experiment: z1
-            args: --idle 420
+          # The page's own initrd (web/js/boot-diet.js, PROVISION), no
+          # experiment script: what every visitor boots.
+          - name: p0
+            context: porty/check provisioning p0
+            experiment: ''
+            args: ''
+          - name: p1
+            context: porty/check provisioning p1
+            experiment: ''
+            args: ''
+          - name: p2
+            context: porty/check provisioning p2
+            experiment: ''
+            args: --idle 240
     env:
       QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
       STATUS_CONTEXT: ${{ matrix.context }}
