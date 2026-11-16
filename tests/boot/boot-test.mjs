@@ -263,6 +263,7 @@ try {
     let carry = '';
     let recent = '';
     let probeAt = t0 + 8 * 60000;
+    let appsListed = false;
     let bootedAt = 0;
     let lastStatusLine = '';
     let lastStatusTime = 0;
@@ -398,6 +399,14 @@ try {
         // Ask the serial shell (if Android-x86 runs one) whether boot finished.
         if (!booted && snap.state === 'running' && Date.now() >= probeAt) {
             probeAt = Date.now() + 120000;
+            if (!appsListed && Date.now() - t0 > 12 * 60000) {
+                // Once: which Google packages the system image ships (the
+                // README says none; the boot log mentions Play services).
+                appsListed = true;
+                await page.evaluate(() => globalThis.__porty.serial.send(
+                    '\rls /system/priv-app /system/app 2>/dev/null | grep -i -E "gms|google|vending|phonesky|gsf" | tr "\\n" " "; echo\r'));
+                await sleep(3000);
+            }
             // Progress first (informational), then the line the regex below reads.
             await page.evaluate(() => globalThis.__porty.serial.send(
                 '\rgetprop init.svc.zygote; getprop init.svc.surfaceflinger; getprop init.svc.bootanim\r'));
