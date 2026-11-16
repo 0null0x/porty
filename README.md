@@ -13,10 +13,11 @@ iPhone**, with no jailbreak, no sideloading and no cloud streaming.
 
 **Try it: [0null0x.github.io/porty](https://0null0x.github.io/porty/)**
 
-Porty is experimental. In desktop Chrome, Android 9 currently boots as far
-as its boot animation, after about 25 to 30 minutes. Nobody has seen the
-home screen yet. The first try on an iPhone ended in a forced restart while
-Porty was loading, most likely for using more memory than iOS allows a tab;
+Porty is experimental. In headless desktop Chrome, Android 9 now finishes
+booting after about 26 minutes and draws its status and navigation bars,
+but a "keeps stopping" message from the setup wizard still covers the home
+screen. The first try on an iPhone ended in a forced restart while Porty
+was loading, most likely for using more memory than iOS allows a tab;
 phones now get a smaller setting. See [Status](#status).
 
 ## Status
@@ -28,8 +29,16 @@ test), the Linux kernel boots, Android's init starts its services, zygote
 and SurfaceFlinger run, and the boot animation is drawn on the canvas
 after about 25 to 30 minutes (`gfx=vesa`, 800x600, above). Getting there
 took three fixes to QEMU-Wasm itself (patches 0005 and 0006) and one to the
-page; see [docs/PLAN.md](docs/PLAN.md), "Findings". Nobody has yet seen
-the home screen.
+page; see [docs/PLAN.md](docs/PLAN.md), "Findings".
+
+Later that day, with a smaller system image (Google's apps removed), no
+boot animation and guest time running 8 times slower than real time
+(`timescale`, now the default), Android reached `sys.boot_completed` for
+the first time in a browser: after 26 minutes on the desktop setting,
+20 minutes as a 64-bit-only Android (`diet=2`) and 43 minutes on the
+phone setting, which stayed within 1064 MiB of WebAssembly heap. The
+screen then shows Android's status and navigation bars and "Android Setup
+keeps stopping"; the home screen behind it is next.
 
 The first try in iPhone Safari (2026-11-16) ended in a forced restart while
 Porty was loading. iOS may kill a Safari tab that uses much more than about
@@ -42,7 +51,7 @@ last start got, and starts with less memory.
 
 - [x] **M1** CI build is green and the site deploys
 - [x] **M2** desktop browser: kernel boot log appears on the serial console
-- [ ] **M3** desktop browser: Android UI is visible on the canvas (boot animation: yes; home screen: not yet)
+- [ ] **M3** desktop browser: Android UI is visible on the canvas (boot animation: yes; status and navigation bars: yes; home screen: not yet)
 - [ ] **M4** touch, navigation buttons and keyboard work
 - [ ] **M5** boots in Safari on an iPhone (iOS 26 or later)
 - [ ] **M6** performance tuning
@@ -157,7 +166,7 @@ and say how far it got, with that message.
 | `usb` | on | `0` leaves out the USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
 | `jitcap` | 15000 (phones: 4000) | Compiled code blocks kept at once (256 to 15000). Each is a module in the browser's own memory |
-| `timescale` | 1 | Guest time runs this many times slower than real time (1 to 16), so that Android's fixed timeouts (the 60 s system_server Watchdog) allow for a slow emulator. Needs QEMU patch 0011 |
+| `timescale` | 8 | Guest time runs this many times slower than real time (1 to 16; `1` is real time), so that Android's fixed timeouts (the 60 s system_server Watchdog, "not responding" after 5 to 10 s) allow for a slow emulator. Android's clock falls behind by the same factor. Needs QEMU patch 0011 |
 | `jitgc` | on | `0`: dropped compiled blocks stop counting against `jitcap` at once instead of after garbage collection (experiment) |
 | `cpu` | `Nehalem` | QEMU CPU model (SSE4.2 and POPCNT, which Android's x86_64 ABI requires; no AVX) |
 | `res` | `480x800` | Guest resolution |
@@ -170,6 +179,7 @@ and say how far it got, with that message.
 | `fps` | 30 | Canvas refresh cap |
 | `diet` | 1 | Android properties set at boot to shorten it: `1` no boot animation (the screen stays black until the launcher) and first-boot app preparation without verification; `0` none; `2` also a 64-bit-only Android without the 32-bit zygote (experiment) |
 | `props` | | More Android properties, `key=value,key=value` (letters, digits, `.`, `_`, `-`); they override `diet`, for example `props=debug.sf.nobootanimation=0` |
+| `ttmfix` | 1 | `0` leaves the kernel module `ttm.ko` as shipped. By default the page replaces it at boot with a copy in which 2 bytes differ, because this kernel panics on a warning in `ttm_bo_vm_open` whenever Android collects stack traces (after every "not responding" app); see [docs/PLAN.md](docs/PLAN.md) |
 | `resume` | auto | A site that publishes a snapshot resumes the saved, already booted Android instead of booting. `0` always boots; `1` resumes even when the address sets machine parameters (the snapshot's own settings then apply) |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |
 | `cmdline` | | Replace the whole kernel command line |

@@ -50,7 +50,7 @@ export const PARAM_HELP = [
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
-    ['timescale', 'guest time runs this many times slower than real time (1-16, default 1), so Android\'s timeouts allow for a slow emulator.'],
+    ['timescale', 'guest time runs this many times slower than real time (1-16, default 8; 1 = real time), so Android\'s timeouts allow for a slow emulator. The guest\'s clock then falls behind.'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
     ['dpi', 'Android screen density (default derived from res).'],
@@ -148,7 +148,11 @@ export function parseConfig(search, env = {}) {
         jitgc: boolParam(params, 'jitgc', true),
         // Patch 0011's time dilation: the guest's clocks (and with them
         // Android's 60 s Watchdog) run this many times slower. 1: off.
-        timescale: intParam(params, 'timescale', 1, 1, 16),
+        // Default 8: the first boots to sys.boot_completed in a browser
+        // (2026-11-16, docs/PLAN.md, eighth round) all had it; without it
+        // the Watchdog and the stack dumps after every ANR never let the
+        // boot finish.
+        timescale: intParam(params, 'timescale', 8, 1, 16),
         cpu: /^[A-Za-z0-9_,+=.-]+$/.test(cpu) ? cpu : 'Nehalem',
         width,
         height,
