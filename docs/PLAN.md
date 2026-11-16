@@ -797,15 +797,55 @@ by polling what has the focus.
   nothing caught it (43867762831). The boot test now logs V8's call
   frames for such exceptions.
 
+**Eleventh round: the swarm (2026-11-16 afternoon).** On the iPhone with
+`?jitcap=15000` the ring showed and Android's arrow followed the finger,
+but Gallery did not open. Four agents worked on it until the account's
+usage limit stopped them.
+
+- Disk cache (merge 0564d5c): the page's service worker keeps the image's
+  and the snapshot's chunks in Cache Storage, so QEMU's synchronous XHRs
+  from its workers are answered from the device; versions are the
+  content-addressed directories, a 1536 MB cap, `?diskcache=0` turns it
+  off. It works in Chrome, Firefox and Playwright's WebKit (sync XHR from
+  URL, blob and nested workers goes through the service worker). At
+  10 Mbit/s without an HTTP cache the second visit resumed in 24 s
+  instead of 193 s (runs 43910535033, 43910547931). The branch boot test
+  (`.github/workflows/branch-boot-test.yml`) runs a ref's own site on the
+  runner, with visits in one profile, CPU and network limits.
+- Memory in the guest (b0aa714, `lowmem=`): no zram (CONFIG_ZSMALLOC is
+  not set). Android 9's lmkd killed every app left for another within
+  seconds, because MemFree is always low here; with `ro.lmk.medium=1001`
+  and `ro.lmk.critical=200` four apps stayed alive and the second round
+  of starts took 24-29 s natively instead of 53-56 s.
+  `ro.config.low_ram` and smaller Dalvik heaps were no faster.
+- The launch (merge 43bb787): during a Gallery start the guest's one CPU
+  had about ten runnable threads, and surfaceflinger used about 10000 of
+  the 9400 ticks of the twelve minutes after the tap, Gallery about 400
+  (run 43909266297). Window, transition and animator animations are now
+  off (cc77cfa), but on the runner Gallery still took 180 to 210 s (runs
+  43921603859, 43921500744). Limiting real-time threads to 30% made no
+  clear difference. `dumpsys` and logcat do not answer during a launch;
+  the probe samples /proc and watches the screen.
+- Runners differ by more than 2x in guest speed by CPU model (Intel Xeon
+  6975P-C / 8573C, AMD EPYC 9V45 fast; AMD EPYC 7763 slow): compare runs
+  on one model only. Tests now log it.
+- WebKit (branch `swarm/webkit`, `tests/boot/webkit-test.mjs`):
+  Playwright's WebKit runs the site, resumes, and opens Gallery about as
+  fast as Chrome on the same CPU. But its content process reaches 5 to
+  7 GB resident on the phone budget (Chrome 1.8 to 2.0 GB): about 1 GB is
+  the WebAssembly memory, a few tens of MB JIT code, and the rest malloc
+  heaps that grow while the guest runs. Without QEMU's JIT it is as high;
+  with JavaScriptCore's JIT off it stays at 2.4 GB. Not yet explained;
+  probably what makes the iPhone slow (or would get the tab killed).
+
 **Next steps:**
 
-1. `jitcap` on phones: 15000 if an iPhone keeps the tab alive with it.
-2. Native snapshot boots that stay busy after settling: run the
-   "isn't responding" rounds before giving up, or dilate time natively too.
+1. WebKit's memory: which JavaScriptCore allocations grow (wasm tiers,
+   per-worker copies, GC lag), and settings or changes that bound them.
+2. `jitcap` on phones: 15000 if an iPhone keeps the tab alive with it.
 3. A real touchscreen instead of the pointer (QEMU's
    `virtio-multitouch-pci`), so that taps and swipes behave like touch.
 4. The uncaught longjmp after a tap.
-5. The full boot on the phone setting with the provisioning.
 
 ## 8. Open questions for the first real run
 
