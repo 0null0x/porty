@@ -648,16 +648,75 @@ the unfixed module, so it must be made again. Any other WARN in this kernel
 is still an oops (the `smp=1` one in the table above looks like the same
 defect).
 
-**Next steps, in order of cost:**
+**Eighth round: Android finishes booting (2026-11-16).** Boot tests in
+headless Chrome on 4-vCPU runners, one run each. Since 06:23 the site
+publishes the slim image (2.8), with the boot diet on by default.
 
-1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly
-   `-sSAFE_HEAP=1`), deployed beside the normal one and selected with a page
-   parameter, so the runtime reports what goes wrong instead of exiting.
-2. Try ktock's newer branches (`sync-upstream`, `dev-wasm-j`) or the
-   upstream QEMU series for 64-bit guests, which may already fix this.
-3. Reproduce with QEMU-Wasm's own Alpine x86_64 image and settings to tell
-   "QEMU-Wasm is unstable with any x86_64 guest under load" from "this
-   kernel hits a specific bug".
+| Run | Setting | `sys.boot_completed` | Kernel starts | Heap used / arena |
+| --- | --- | --- | --- | --- |
+| 43820828925 | desktop defaults then (no time dilation, no ttm fix), 100 min | not reached | 4 (reboots at about 29, 59 and 85 min) | 1657 / 1677 MB |
+| 43816513977 | desktop, `timescale=8` | 26:07 | 1 | 1652 / 1670 MB |
+| 43816517688 | desktop, `diet=2&timescale=8` | 19:41 | 1 | 1656 / 1671 MB |
+| 43816521209 | phone (`mem=768&tb=128&cache=16&wasmmem=1280&jitcap=4000`), `timescale=8` | 42:43 | 1 | 1041 / 1064 MB |
+| 43833368852 | desktop defaults since 399a1fd (`timescale=8`, ttm fix) | 25:09 | 1 | 1656 / 1670 MB |
+
+- The reboots without time dilation are the ttm_bo_vm_open panic (above):
+  every app that does not respond makes ActivityManager collect stack
+  traces, debuggerd forks surfaceflinger, the kernel dies. Natively the
+  snapshot boot with the fix (run 43833155801) reached `sys.boot_completed`
+  in 109 s with no reboot; the one before the fix (43819973532) rebooted
+  six times in ten minutes and gave up.
+- With `timescale=8` neither the Watchdog nor a reboot happened in any run.
+  Guest time ran 8 times slower (the status bar said 6:28 at 06:52 UTC).
+  It is now the default; `timescale=1` turns it off.
+- The slim disk is what Android uses: `/dev/block/vda on /system type ext4
+  (ro,seclabel,noatime)`, no squashfs mount, and of Google's apps only
+  WebViewGoogle, GooglePackageInstaller, GoogleExtServices, GoogleExtShared
+  and GooglePrintRecommendationService remain.
+- At `sys.boot_completed` the desktop run 43816513977 showed Android's
+  status bar, navigation bar and "Android Setup keeps stopping" on black:
+  the setup wizard crashes on the slim image, and a device that is not
+  provisioned never starts a launcher. The other runs ended a minute or two
+  later on a black screen. Natively the snapshot run found no launcher
+  among the HOME activities (only `TSCalibrationStartup`) and two "No
+  region space mem map" crashes (ART could not reserve its heap) with
+  768 MiB of guest RAM.
+- The phone setting stayed within 1064 MiB of heap for 43 minutes but read
+  2.9 GB of disk chunks (16 chunks of 2 MiB in RAM; the browser's HTTP cache
+  served the repeats), against 1.4 GB with the desktop's 64 chunks.
+- Against native QEMU on the same runners (83 to 109 s to
+  `sys.boot_completed`), the browser takes about 14 times as long on the
+  desktop setting and 24 times on the phone setting.
+- `diet=2` stays an experiment: one run, 6.4 minutes faster, but without
+  the 32-bit zygote no 32-bit app can start, and its screen stayed black.
+- Resume: the first snapshot (run 43833155801; 696 MB of machine state,
+  220 MB compressed in 167 chunks, restored natively as a check) is
+  published since 09:13. The site is 1,024,207,084 bytes, over GitHub's
+  documented 1 GB, and deployed without complaint. In the browser (runs
+  43837777109, desktop, and 43837820680, `wasmmem=1280&jitcap=4000`) the
+  saved machine comes back within two minutes (480x800 at once, heap
+  1008/1033 MB on both) and runs, but the screen stays black and the shell
+  barely answers: the machine was saved busy. Natively, 20 minutes after
+  boot and after `device_provisioned` was forced to 1, the load average
+  was 11 to 13, surfaceflinger used 95% of the CPU (10:56 of CPU time in
+  1242 s), broadcasts timed out and the Watchdog had dumped stacks. A
+  snapshot is only useful once the guest it saves is idle.
+
+**Next steps:**
+
+1. A home screen: the setup wizard and the missing launcher on the slim
+   image (in progress).
+2. surfaceflinger's CPU: it leads every boot in the browser too
+   (43816513977: 398 against system_server's 379, %CPU summed over the
+   probes). Find the composition path and cut it (in progress).
+3. A snapshot that shows the home screen, saved idle. Its cache key must
+   then also cover the page code that shapes the guest (`boot-diet.js`,
+   `qemu-args.js`, `config.js`, `initramfs.js`), or a stale snapshot keeps
+   being published.
+4. The site back under 1 GB, for example without the kernel firmware and
+   modules a QEMU guest never loads.
+5. The iPhone: about 9 times slower than the runner in the first try;
+   measure again with the resume.
 
 ## 8. Open questions for the first real run
 
