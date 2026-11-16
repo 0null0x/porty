@@ -1,0 +1,340 @@
+# Checks a work branch (swarm/**) without deploying anything: lint and unit
+# tests, the browser test with the fake QEMU, the QEMU-Wasm build with the
+# branch's patches, and the image and site pipeline on the real Android-x86
+# ISO.  Only main deploys (build-and-deploy.yml); boot tests need the
+# deployed site, so they happen after a branch is merged.
+#
+# The run itself never fails, because every failed run emails the repository
+# owner.  The outcome of each part is a commit status on the branch's commit
+# ("porty/check lint", "porty/check ui", "porty/check qemu", "porty/check
+# site") plus the job summary; read them with
+#   gh api repos/<owner>/<repo>/commits/<sha>/statuses
+name: Branch check
+
+on:
+  push:
+    branches: ['swarm/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: branch-check-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  checks:
+    name: Lint and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      outcome: ${{ steps.summary.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools
+
+      - name: Shell scripts
+        id: shellcheck
+        continue-on-error: true
+        run: shellcheck -x build/*.sh scripts/*.sh tests/*.sh tests/ui/*.sh
+
+      - name: JavaScript syntax
+        id: syntax
+        continue-on-error: true
+        run: |
+          for f in web/js/*.js tests/*.mjs tests/ui/*.js tests/ui/*.mjs tests/boot/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: Unit tests
+        id: unit
+        continue-on-error: true
+        run: |
+          node tests/wasm-patch.test.mjs
+          node tests/unit.test.mjs
+
+      - name: Image and site pipeline on a miniature ISO
+        id: smoke
+        continue-on-error: true
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          tests/site-smoke.sh "$RUNNER_TEMP/smoke"
+
+      - name: Summary
+        id: summary
+        env:
+          SHELLCHECK: ${{ steps.shellcheck.outcome }}
+          SYNTAX: ${{ steps.syntax.outcome }}
+          UNIT: ${{ steps.unit.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        run: |
+          failed=""
+          for pair in "shellcheck:$SHELLCHECK" "syntax:$SYNTAX" "unit:$UNIT" "site-smoke:$SMOKE"; do
+            [[ "${pair#*:}" == success ]] || failed+="${pair%%:*} "
+          done
+          if [[ -z "$failed" ]]; then
+            echo "outcome=success|shellcheck, syntax, unit tests and site smoke test passed" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure|failed: ${failed% }" >> "$GITHUB_OUTPUT"
+          fi
+
+  ui-test:
+    name: Browser test (fake QEMU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      outcome: ${{ steps.summary.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
+
+      - name: Run the page in headless Chrome
+        id: ui
+        continue-on-error: true
+        env:
+          PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium || command -v chromium-browser)"
+          export CHROME
+          tests/ui/run.sh "$RUNNER_TEMP/ui"
+          tests/ui/run.sh "$RUNNER_TEMP/ui-small" '?wasmmem=1024&mem=512&disk=ide'
+
+      - name: Summary
+        id: summary
+        env:
+          UI: ${{ steps.ui.outcome }}
+        run: |
+          if [[ "$UI" == success ]]; then
+            echo "outcome=success|browser test passed (both URLs)" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure|browser test failed, see the log" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build QEMU-Wasm and the site (no deploy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    outputs:
+      qemu: ${{ steps.summary.outputs.qemu }}
+      site: ${{ steps.summary.outputs.site }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      # The same cache key as build-and-deploy.yml, so a branch whose patches
+      # are unchanged reuses main's build.  (Caches a branch saves are not
+      # visible to main; main rebuilds after a merge.)
+      - name: Restore cached QEMU-Wasm build
+        id: qemu-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-wasm"
+
+      - name: Set up Docker Buildx
+        id: buildx
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Prepare an empty Docker build context
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        run: mkdir -p "$RUNNER_TEMP/empty-context"
+
+      # Reads main's toolchain layer cache; branches do not write it.
+      - name: Build the toolchain image
+        id: toolchain
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ runner.temp }}/empty-context
+          file: ${{ runner.temp }}/qemu-wasm/Dockerfile
+          tags: porty-qemu-build:local
+          load: true
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=qemu-wasm-toolchain
+
+      - name: Compile qemu-system-x86_64 to WebAssembly
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.toolchain.outcome == 'success'
+        continue-on-error: true
+        env:
+          WASM_MEMORY_MB: ${{ steps.versions.outputs.wasm_memory_mb }}
+        run: |
+          mkdir -p out/qemu
+          docker run --rm \
+            -e WASM_MEMORY_MB \
+            -v "$RUNNER_TEMP/qemu-wasm:/qemu" \
+            -v "$PWD:/porty:ro" \
+            -v "$PWD/out/qemu:/out" \
+            porty-qemu-build:local \
+            bash /porty/build/build-qemu.sh
+          sudo chown -R "$(id -u):$(id -g)" out/qemu
+          ls -l out/qemu
+
+      - name: Save the QEMU-Wasm build
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Free disk space
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          docker system prune --all --force >/dev/null || true
+          sudo rm -rf "$RUNNER_TEMP/qemu-wasm"
+
+      - name: Verify the QEMU-Wasm build
+        id: verify
+        continue-on-error: true
+        env:
+          WASM_MEMORY_MB: ${{ steps.versions.outputs.wasm_memory_mb }}
+        run: |
+          python3 scripts/wasm-info.py out/qemu/qemu-system-x86_64.wasm --expect-memory-mb "$WASM_MEMORY_MB"
+          test -s out/qemu/out.js
+          test -s out/qemu/qemu-system-x86_64.worker.js
+          test -s out/qemu/build-info.json
+
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: image
+        if: steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
+          rm -rf out/iso
+          du -sb out/image out/image/* | sort -k2
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Assemble the site
+        id: site
+        if: steps.verify.outcome == 'success' && steps.image.outcome == 'success'
+        continue-on-error: true
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$GITHUB_SHA"
+          du -sb dist
+
+      - name: Summary
+        id: summary
+        env:
+          CACHE_HIT: ${{ steps.qemu-cache.outputs.cache-hit }}
+          PATCHES: ${{ steps.patches.outcome }}
+          TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          VERIFY: ${{ steps.verify.outcome }}
+          ISO: ${{ steps.iso.outcome }}
+          IMAGE: ${{ steps.image.outcome }}
+          SITE: ${{ steps.site.outcome }}
+        run: |
+          if [[ "$VERIFY" == success ]]; then
+            if [[ "$CACHE_HIT" == true ]]; then qemu="success|cached build (patches unchanged)"; else qemu="success|QEMU-Wasm built and verified"; fi
+          elif [[ "$PATCHES" == failure ]]; then qemu="failure|patches do not apply"
+          elif [[ "$TOOLCHAIN" == failure ]]; then qemu="failure|toolchain image did not build"
+          elif [[ "$COMPILE" == failure ]]; then qemu="failure|compile failed, see the log"
+          else qemu="failure|build not verified, see the log"; fi
+          if [[ "$SITE" == success ]]; then
+            size="$(du -sb dist | cut -f1)"
+            site="success|site $(( size / 1000000 )) MB (Pages soft limit 1000 MB)"
+          elif [[ "$IMAGE" == failure ]]; then site="failure|prepare-image.sh failed"
+          elif [[ "$ISO" == failure ]]; then site="failure|ISO download failed"
+          else site="failure|site not assembled (QEMU build or image missing)"; fi
+          { echo "qemu=$qemu"; echo "site=$site"; } >> "$GITHUB_OUTPUT"
+          { echo "## Branch check"; echo; echo "- QEMU-Wasm: ${qemu/|/: }"; echo "- Site: ${site/|/: }"; } >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    name: Report as commit statuses
+    needs: [checks, ui-test, build]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Post statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LINT: ${{ needs.checks.outputs.outcome }}
+          UI: ${{ needs.ui-test.outputs.outcome }}
+          QEMU: ${{ needs.build.outputs.qemu }}
+          SITE: ${{ needs.build.outputs.site }}
+        run: |
+          post() { # <context> <state|description>
+            local state="${2%%|*}" desc="${2#*|}"
+            [[ -n "$2" ]] || { state=error; desc="job did not finish"; }
+            gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="porty/check $1" \
+              -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+            echo "$1: $state - $desc"
+          }
+          post lint "$LINT"
+          post ui "$UI"
+          post qemu "$QEMU"
+          post site "$SITE"
