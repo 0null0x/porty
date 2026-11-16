@@ -92,6 +92,13 @@ page.on('workercreated', (worker) => {
     const name = worker.url().split('/').pop().split('?')[0];
     worker.client.on('Runtime.exceptionThrown', ({ exceptionDetails: d }) => {
         log(`worker exception (${name}): ${(d.exception && d.exception.description) || d.text}`);
+        // A thrown value without a stack (Emscripten's longjmp throws
+        // Infinity): where it was thrown from, as far as V8 knows.
+        const frames = (d.stackTrace && d.stackTrace.callFrames) || [];
+        if (frames.length) {
+            log(`worker exception stack: ${frames.slice(0, 40).map((f) =>
+                `${f.functionName || '?'}@${(f.url || '').split('/').pop().split('?')[0]}:${f.lineNumber}:${f.columnNumber}`).join(' < ')}`);
+        }
     });
 });
 
