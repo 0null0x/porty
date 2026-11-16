@@ -1,0 +1,24 @@
+{
+  "comment": "Variants for .github/workflows/guest-memory.yml. query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only; what is kept moves into web/js/boot-diet.js).",
+  "base": "mem=768&tb=128&cache=16",
+  "run": ["base", "zram", "lowram", "zram-lowram"],
+  "boots": 2,
+  "apps": [
+    "com.android.gallery3d/.app.GalleryActivity",
+    "com.android.settings",
+    "com.android.calculator2",
+    "com.android.deskclock"
+  ],
+  "variants": {
+    "base": {"query": ""},
+    "zram": {
+      "query": "",
+      "setup": ["Z=/sys/block/zram0; [ -e $Z ] || modprobe zram; echo lz4 > $Z/comp_algorithm; echo 384M > $Z/disksize && mkswap /dev/block/zram0 && swapon /dev/block/zram0; echo 100 > /proc/sys/vm/swappiness; cat /proc/swaps $Z/comp_algorithm"]
+    },
+    "lowram": {"query": "props=ro.config.low_ram=true"},
+    "zram-lowram": {
+      "query": "props=ro.config.low_ram=true",
+      "setup": ["Z=/sys/block/zram0; [ -e $Z ] || modprobe zram; echo lz4 > $Z/comp_algorithm; echo 384M > $Z/disksize && mkswap /dev/block/zram0 && swapon /dev/block/zram0; echo 100 > /proc/sys/vm/swappiness; cat /proc/swaps $Z/comp_algorithm"]
+    }
+  }
+}

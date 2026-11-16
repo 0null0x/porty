@@ -1,0 +1,266 @@
+# Guest memory experiments: boots the image the site publishes in a NATIVE
+# QEMU (TCG, one vCPU) with the phone's arguments (mem=768) and the page's
+# initrd, then starts a list of apps twice round and records how long each
+# start takes and what the memory pressure costs (tests/guest-memory-native.py).
+# The variants (page parameters, commands typed into the guest) are in
+# tests/guest-memory-variants.json; every variant boots "boots" times.
+#
+# The run never fails, because every failed run emails the repository owner.
+# Each boot posts the commit status "porty/check guest-memory <variant>-<n>",
+# prints one line "PORTY_RESULT <json>" and adds a table to the job summary.
+name: Guest memory
+
+on:
+  push:
+    branches: [swarm/guest-memory]
+    paths:
+      - .github/workflows/guest-memory.yml
+      - tests/guest-memory-native.py
+      - tests/guest-memory-variants.json
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: Variants to run, comma separated (default, the "run" list of the plan)
+        default: ''
+      boots:
+        description: Boots per variant (default, the plan's)
+        default: ''
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: guest-memory-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The variants to boot
+        id: plan
+        continue-on-error: true
+        env:
+          VARIANTS: ${{ inputs.variants }}
+          BOOTS: ${{ inputs.boots }}
+        run: |
+          python3 -I -c '
+          import json, os, re, sys
+          plan = json.load(open(sys.argv[1]))
+          names = [n for n in re.split(r"[,\s]+", os.environ.get("VARIANTS", "")) if n] or plan["run"]
+          names = [n for n in names if n in plan["variants"]]
+          boots = os.environ.get("BOOTS", "")
+          boots = max(1, min(4, int(boots))) if boots.isdigit() else plan["boots"]
+          include = [{"variant": n, "boot": b} for n in names for b in range(1, boots + 1)]
+          print("matrix=" + json.dumps({"include": include[:20]}))
+          ' tests/guest-memory-variants.json | tee -a "$GITHUB_OUTPUT"
+
+  measure:
+    name: ${{ matrix.variant }} ${{ matrix.boot }}
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VARIANT: ${{ matrix.variant }}
+      BOOT: ${{ matrix.boot }}
+      STATUS_CONTEXT: porty/check guest-memory ${{ matrix.variant }}-${{ matrix.boot }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
+
+      # --- native QEMU from the patched QEMU-Wasm tree (as in snapshot.yml) ---
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          tail -5 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Save the native QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          out/native-qemu/qemu-system-x86_64 -display help | grep -q wasmfb
+
+      # --- the image: the one the site publishes when this commit does not
+      # change it (build-and-deploy.yml caches it under this key), else one
+      # prepared here from the ISO --------------------------------------------
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: prepare
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          grep -e '^--- ' -e 'Google-named' "$RUNNER_TEMP/prepare.log" || true
+          rm -rf out/iso
+
+      - name: The image
+        id: image
+        continue-on-error: true
+        env:
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+        run: |
+          test -s out/image/manifest.json
+          echo "published image from the cache: ${CACHE_HIT:-false}"
+          python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); d=m["disk"]; print("disk:", {k: d.get(k) for k in ("format", "dir", "size", "sha256")}); print("removed:", [r.get("path") for r in d.get("removed", [])])' out/image/manifest.json
+
+      - name: Build the QEMU arguments
+        id: argv
+        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p out/gm
+          QUERY="$(python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])); q = p["variants"][sys.argv[2]].get("query", ""); print(p["base"] + ("&" + q if q else ""))' tests/guest-memory-variants.json "$VARIANT")"
+          echo "query: $QUERY"
+          echo "query=$QUERY" >> "$GITHUB_OUTPUT"
+          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/gm/initrd-page.img" "?$QUERY"
+          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+            "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
+            | awk -v initrd="$PWD/out/gm/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+            > out/gm/argv-native.txt
+          grep -qxF "$PWD/out/gm/initrd-page.img" out/gm/argv-native.txt
+          cat out/gm/argv-native.txt
+
+      - name: Boot Android and start the apps
+        id: boot
+        if: steps.argv.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 75
+        run: |
+          python3 -I tests/guest-memory-native.py \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/gm/argv-native.txt \
+            --work out/gm/boot \
+            --variants tests/guest-memory-variants.json --variant "$VARIANT" \
+            --facts "$(( BOOT == 1 ? 1 : 0 ))"
+
+      - name: Upload the logs
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest-memory-${{ matrix.variant }}-${{ matrix.boot }}
+          path: |
+            out/gm/boot/result.json
+            out/gm/boot/serial.log
+            out/gm/boot/*.png
+            out/gm/argv-native.txt
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          QUERY: ${{ steps.argv.outputs.query }}
+        run: |
+          set +e
+          details="$(python3 -I tests/guest-memory-report.py out/gm/boot/result.json 2>&1)"
+          first="$(sed -n 1p <<<"$details")"
+          state=success
+          grep -q '^ok' <<<"$first" || state=failure
+          echo "$state: $first"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${first:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## Guest memory: $VARIANT, boot $BOOT ($QUERY)"
+            echo
+            sed -n '1,$p' <<<"$details"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
