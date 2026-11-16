@@ -206,24 +206,40 @@ jobs:
           test -s out/qemu/build-info.json
 
       # ------------------------------------------------------- Android ---
+      # The prepared image is not byte-reproducible (debugfs and qemu-img
+      # write times and cluster order), and its chunk directory is named
+      # after its hash.  Reusing it until its inputs change keeps the disk
+      # URLs stable across deployments, so a deployment does not pull the
+      # disk out from under a running boot test, and a resume snapshot made
+      # against this image stays valid.
+      - name: Restore the prepared Android image
+        id: image-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
       - name: Restore cached Android-x86 ISO
         id: iso-cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/iso
           key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
 
       - name: Download and verify the Android-x86 ISO
+        if: steps.image-cache.outputs.cache-hit != 'true'
         run: scripts/fetch-android.sh out/iso
 
       - name: Save the Android-x86 ISO
-        if: steps.iso-cache.outputs.cache-hit != 'true'
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/iso
           key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
 
       - name: Extract kernel, ramdisks and the system disk
+        if: steps.image-cache.outputs.cache-hit != 'true'
         env:
           ISO_NAME: ${{ steps.versions.outputs.iso_name }}
         run: |
@@ -232,6 +248,13 @@ jobs:
           scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
           rm -rf out/iso
           df -h /
+
+      - name: Save the prepared Android image
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
 
       # ----------------------------------------------------------- site ---
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
