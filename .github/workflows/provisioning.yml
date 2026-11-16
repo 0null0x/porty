@@ -42,10 +42,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: z1
-            context: porty/check provisioning z1
+          - name: i0
+            context: porty/check provisioning i0
             experiment: z1
-            args: --idle 5
+            args: --idle 240 --qemu-arg=-icount --qemu-arg=shift=0
+          - name: i1
+            context: porty/check provisioning i1
+            experiment: z3
+            args: --idle 240 --qemu-arg=-icount --qemu-arg=shift=0
+          - name: r0
+            context: porty/check provisioning r0
+            experiment: z1
+            args: --idle 420
     env:
       QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
       STATUS_CONTEXT: ${{ matrix.context }}
@@ -217,7 +225,7 @@ jobs:
             --qemu out/native-qemu/qemu-system-x86_64 \
             --argv-file out/prov/argv-native.txt \
             --work out/prov/boot \
-            --boot-timeout 2400 --settle 50 "${extra[@]}"
+            --boot-timeout 2400 --settle 75 "${extra[@]}"
 
       - name: Upload the logs
         if: ${{ always() }}

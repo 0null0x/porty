@@ -160,7 +160,7 @@ def run_checks(vm, opts, result):
     check("no_wizard_crash", not wizard_lines and not wizard.startswith("[status None]")
           and not stopping.startswith("[status None]"),
           wizard_lines[0] if wizard_lines else "nothing about a setup wizard in the crash buffer, no crash dialog")
-    java_crashes = run("fatal_exceptions", "logcat -b crash -d | grep -c 'FATAL EXCEPTION'").strip()
+    java_crashes = run("fatal_exceptions", "logcat -b crash -d | grep -c 'FATAL EXCEPTION' || true").strip()
     check("no_app_crash", java_crashes == "0", f"{java_crashes} FATAL EXCEPTION line(s) in the crash buffer")
 
     for key, command in FACTS:
@@ -192,6 +192,8 @@ def main():
     ap.add_argument("--settle", type=float, default=60, help="seconds between sys.boot_completed=1 and the checks")
     ap.add_argument("--wake-lock", type=int, default=1,
                     help="1: take a kernel wake lock as soon as the shell answers, so the machine cannot suspend")
+    ap.add_argument("--qemu-arg", action="append", default=[],
+                    help="one more argument for QEMU, after the page's (repeatable)")
     ap.add_argument("--trace", type=int, default=0,
                     help="1: kernel messages and Android's crash and shutdown messages on the serial console")
     ap.add_argument("--idle", type=float, default=0,
@@ -208,7 +210,7 @@ def main():
 
     result = {"mode": "provisioning", "booted": False, "passed": False, "milestones": {}}
     result_path = os.path.join(opts.work, "result.json")
-    vm = snap.Machine(opts.qemu, argv, opts.work)
+    vm = snap.Machine(opts.qemu, argv, opts.work, extra=opts.qemu_arg)
     log("QEMU started: " + " ".join(vm.args))
     try:
         booted = boot(vm, opts, result)
