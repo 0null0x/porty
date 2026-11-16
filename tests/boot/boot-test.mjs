@@ -58,7 +58,9 @@ const browser = await puppeteer.launch({
     ],
 });
 const page = await browser.newPage();
-await page.setViewport({ width: 480, height: 900 });
+// hasTouch: the input probe taps like a finger (pointerType "touch", as on
+// a phone).  The page tells phones apart by their user agent, not by this.
+await page.setViewport({ width: 480, height: 900, hasTouch: true });
 page.on('pageerror', (e) => log(`pageerror: ${(e && e.stack) || e}`));
 // Error objects arrive as handles; turn them into their stacks.
 const describe = (handle) => handle.evaluate((v) => {
@@ -200,6 +202,79 @@ async function dumpFiles() {
             console.log(`file| ${line}`);
         }
     }
+}
+
+/**
+ * After the boot: does input reach Android (M4)?  Logs the kernel's input
+ * devices and how Android classified them, records the raw events with
+ * getevent while it taps the Gallery icon like a finger and then clicks
+ * the search bar with the mouse, and reports what the page saw, what has
+ * the focus, and screenshots after each.
+ */
+async function inputProbe() {
+    const send = (cmd) => page.evaluate((c) => globalThis.__porty.serial.send(c), cmd);
+    // Print the serial output as it comes, so that it lands between the
+    // probe's own lines (the main loop is not reading it meanwhile).
+    const sleep = async (ms) => {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+        const text = await page.evaluate(() => (globalThis.__cap ? globalThis.__cap.splice(0).join('') : ''));
+        for (const line of stripAnsi(text).split('\n')) {
+            if (line.trim()) {
+                console.log(`serial| ${line.replace(/\r$/, '')}`);
+            }
+        }
+    };
+    log('INPUT PROBE: input devices, the kernel\'s and Android\'s view');
+    await send('\rgrep -E "^(N|H|B: (EV|KEY|ABS|REL))" /proc/bus/input/devices\r');
+    await sleep(5000);
+    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Sources:|DeviceType|Mode:|Mapper" | head -48\r');
+    await sleep(30000);
+    await send('getevent -lt > /data/local/tmp/porty-ev.txt 2>&1 &\r');
+    await sleep(5000);
+    await page.evaluate(() => {
+        const c = document.getElementById('screen');
+        const seen = {};
+        globalThis.__portyProbe = seen;
+        for (const t of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchend', 'mousedown', 'mouseup']) {
+            c.addEventListener(t, (e) => {
+                const k = `${t}:${e.pointerType || '-'}`;
+                seen[k] = (seen[k] || 0) + 1;
+            }, { capture: true });
+        }
+    });
+    const r = await page.$eval('#screen', (e) => {
+        const b = e.getBoundingClientRect();
+        return { x: b.left, y: b.top, w: b.width, h: b.height, cw: e.width, ch: e.height };
+    });
+    // Android's coordinates on its own screen -> page coordinates.
+    const at = (ax, ay) => [r.x + (ax / (r.cw || 480)) * r.w, r.y + (ay / (r.ch || 800)) * r.h];
+    log(`INPUT PROBE: canvas ${JSON.stringify(r)}`);
+
+    const [gx, gy] = at(150, 565 * (r.ch || 800) / 800);
+    log(`INPUT PROBE: finger tap at ${gx.toFixed(0)},${gy.toFixed(0)} (the Gallery icon)`);
+    await page.touchscreen.tap(gx, gy);
+    await sleep(45000);
+    log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
+    await send('\rdumpsys window | grep -E "mCurrentFocus|mFocusedApp"\r');
+    await sleep(10000);
+    await shot('after-touch', true);
+
+    const [sx, sy] = at((r.cw || 480) / 2, 91 * (r.ch || 800) / 800);
+    log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the search bar)`);
+    await page.mouse.move(sx - 20, sy);
+    await page.mouse.move(sx, sy, { steps: 4 });
+    await page.mouse.down();
+    await sleep(150);
+    await page.mouse.up();
+    await sleep(45000);
+    log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
+    await send('\rdumpsys window | grep -E "mCurrentFocus|mFocusedApp"\r');
+    await sleep(10000);
+    await shot('after-mouse', true);
+
+    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); head -60 /data/local/tmp/porty-ev.txt\r');
+    await sleep(15000);
+    log('INPUT PROBE: done');
 }
 
 function emit(name, info, b64) {
@@ -450,6 +525,10 @@ try {
             bootedAt = Date.now();
             log('ANDROID BOOT COMPLETED (sys.boot_completed=1)');
             await shot('boot-completed', true);
+            if (process.env.INPUT_PROBE !== '0') {
+                await inputProbe();
+                bootedAt = Date.now();
+            }
         }
         if (booted && Date.now() - bootedAt > 90000) {
             break;
