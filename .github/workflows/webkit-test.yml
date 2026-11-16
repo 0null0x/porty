@@ -48,13 +48,17 @@ on:
         description: 'Cross-origin isolation: auto, sw (only the page''s service worker) or route (headers added by the test)'
         type: string
         default: auto
+      table_grow:
+        description: 'Experiment: QEMU''s function table grows by this many entries at a time (0: as built, one per compiled block)'
+        type: number
+        default: 0
 
 permissions:
   contents: read
   statuses: write  # the verdicts (tests/boot/webkit-test.mjs)
 
 concurrency:
-  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}
+  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}-${{ inputs.table_grow }}
   cancel-in-progress: true
 
 defaults:
@@ -145,6 +149,7 @@ jobs:
           PROBE_SECONDS: ${{ inputs.probe_seconds || 480 }}
           DEVICE: ${{ inputs.device || 'iphone' }}
           COI: ${{ inputs.coi || 'auto' }}
+          TABLE_GROW: ${{ inputs.table_grow || 0 }}
         run: |
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
