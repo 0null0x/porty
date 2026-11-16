@@ -4,6 +4,7 @@
 import { PARAM_HELP, PHONE_LEVELS, applyPhoneLevel, parseConfig, requiredWasmMemoryMb } from './config.js';
 import { RunLog, browserStorage, describeRun, nextLevel } from './crash-guard.js';
 import { Emulator, StartError, checkEnvironment } from './emulator.js';
+import { describeDiet } from './boot-diet.js';
 import { CONTROL, Input } from './input.js';
 import { SerialConsole } from './serial.js';
 
@@ -80,7 +81,7 @@ function explainLastRun() {
 
 function fillIntro() {
     explainLastRun();
-    $('cfgline').textContent = describeConfig();
+    $('cfgline').textContent = describeConfig() + describeDiet(cfg);
     $('memnote').textContent =
         `${cfg.mem} MB of RAM is reserved for the guest (about ${requiredWasmMemoryMb(cfg)} MB in total).`;
     const table = $('params');
@@ -192,7 +193,7 @@ function fail(error) {
     const notes = emulator ? emulator.notes : [];
     const heap = emulator && emulator.heapStats ? emulator.heapStats() : null;
     $('fail-log').textContent = [
-        `config: ${describeConfig()}`,
+        `config: ${describeConfig()}${describeDiet(cfg)}`,
         `browser: ${navigator.userAgent}`,
         `crossOriginIsolated: ${globalThis.crossOriginIsolated}`,
         ...(emulator && emulator.wasmMemoryMb ? [`wasm memory: ${emulator.wasmMemoryMb} MiB`] : []),

@@ -14,7 +14,10 @@
 #        - ui/wasmfb.c publishes the guest framebuffer at the requested
 #          resolution and sees guest drawing,
 #        - input pushed into the ring reaches the guest as USB tablet and
-#          keyboard events.
+#          keyboard events,
+#        - the kernel unpacks the boot-diet archive the page appends to
+#          initrd.img, and the script in it edits default.prop when sourced
+#          the way Android-x86's /init sources /scripts/*.
 #
 # usage: tests/native-e2e.sh <qemu-system-x86_64> <pc-bios-dir> <vmlinuz> <modules-dir> <work-dir> [virtio|ide]
 #   <modules-dir> is lib/modules/<version> of the same kernel (uncompressed
@@ -95,6 +98,15 @@ sleep 2
 say "cmdline \$(cat /proc/cmdline)"
 say "fb \$(cat /proc/fb) size \$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)"
 
+# boot diet: Android-x86's /init, in the directory holding the unpacked ramdisk
+mkdir /android; cd /android
+printf 'ro.zygote=zygote64_32\npm.dexopt.first-boot=quicken\nro.debuggable=1\n' > default.prop
+for s in \`ls /scripts/* /src/scripts/*\`; do
+	test -e "\$s" && source \$s
+done
+say "diet \$(grep -v '^\$' default.prop | tr '\n' ' ')"
+cd /
+
 # block driver: whole device, twice in parallel with a file read
 mount -t squashfs -o ro /dev/$sys /mnt || say "mount failed"
 ( head -c $sfs_size /dev/$sys | md5sum | cut -d' ' -f1 > /tmp-a ) &
@@ -161,8 +173,11 @@ while read -r rom; do
 done < "$repo/build/pc-bios.list"
 
 # --- boot with the page's own argv ---------------------------------------------
+query="?mem=512&tb=64&smp=2&res=${REQ_W}x${REQ_H}&cache=4&parallel=3&disk=$bus&append=panic=-1${extra_query}"
+# The page appends its boot-diet archive to initrd.img in memory; same code.
+node "$repo/tests/apply-boot-diet.mjs" "$work/image/initrd.img" "$work/image/initrd.img" "$query" > "$work/diet.log"
 mapfile -t args < <(node "$repo/tests/print-qemu-args.mjs" "$work/image/manifest.json" \
-    "$work/image" "$work/bios" "?mem=512&tb=64&smp=2&res=${REQ_W}x${REQ_H}&cache=4&parallel=3&disk=$bus&append=panic=-1${extra_query}")
+    "$work/image" "$work/bios" "$query")
 # Pointer sweep, left click, then the keys A (30) and BACK (158), repeated
 # so that at least one burst lands while the guest is listening.
 script=""
@@ -193,6 +208,8 @@ check "ramdisk.img readable from second drive"       "PORTY-TEST: ramdisk marker
 check "USB tablet received events"                   "PORTY-TEST: tablet-bytes [1-9]"
 check "keyboard received events"                     "PORTY-TEST: kbd-bytes [1-9]"
 check "KEY_BACK (158 = 0x9e) arrived"                "PORTY-TEST: kbd-hex .*01009e00"
+check "kernel unpacked the appended boot-diet archive" "porty: boot diet, 3 properties in default.prop"
+check "the script rewrote default.prop"              "PORTY-TEST: diet ro.zygote=zygote64_32 ro.debuggable=1 debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract"
 check "guest finished"                               "PORTY-TEST: done"
 
 if [[ -f "$work/fb.ppm" ]]; then

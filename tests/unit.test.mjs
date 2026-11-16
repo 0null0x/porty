@@ -301,3 +301,6 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
 }
 
 console.log('unit: all checks passed');
+
+// The boot diet (appended initramfs archive, ?diet= and ?props=) has its own file.
+await import('./boot-diet.test.mjs');

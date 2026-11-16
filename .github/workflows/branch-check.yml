@@ -269,6 +269,16 @@ jobs:
           rm -rf out/iso
           du -sb out/image out/image/* | sort -k2
 
+      # What the boot diet (web/js/boot-diet.js) assumes about the real
+      # initrd.img, ramdisk.img and /system; the log lists the facts.
+      - name: Check the boot diet against the real image
+        id: diet
+        if: steps.image.outcome == 'success'
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq squashfs-tools busybox-static cpio
+          tests/boot-diet-image.sh out/image "$RUNNER_TEMP/boot-diet" --system
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -293,6 +303,7 @@ jobs:
           ISO: ${{ steps.iso.outcome }}
           IMAGE: ${{ steps.image.outcome }}
           SITE: ${{ steps.site.outcome }}
+          DIET: ${{ steps.diet.outcome }}
         run: |
           if [[ "$VERIFY" == success ]]; then
             if [[ "$CACHE_HIT" == true ]]; then qemu="success|cached build (patches unchanged)"; else qemu="success|QEMU-Wasm built and verified"; fi
@@ -302,7 +313,7 @@ jobs:
           else qemu="failure|build not verified, see the log"; fi
           if [[ "$SITE" == success ]]; then
             size="$(du -sb dist | cut -f1)"
-            site="success|site $(( size / 1000000 )) MB (Pages soft limit 1000 MB)"
+            site="success|site $(( size / 1000000 )) MB (Pages soft limit 1000 MB); boot-diet image check: $DIET"
           elif [[ "$IMAGE" == failure ]]; then site="failure|prepare-image.sh failed"
           elif [[ "$ISO" == failure ]]; then site="failure|ISO download failed"
           else site="failure|site not assembled (QEMU build or image missing)"; fi

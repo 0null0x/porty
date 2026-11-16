@@ -2,6 +2,8 @@
 // Pure functions only (no DOM), so the same code runs under node for tests.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import { parseProps } from './boot-diet.js';
+
 export const MIB = 1024 * 1024;
 export const WASM_PAGE = 65536;
 
@@ -63,6 +65,8 @@ export const PARAM_HELP = [
     ['cmdline', 'replace the whole kernel command line.'],
     ['qemu', 'extra QEMU arguments (space separated).'],
     ['fps', 'canvas refresh cap (default 30).'],
+    ['diet', 'Android properties that shorten the boot: 1 (default) no boot animation and no first-boot app verification, 0 none, 2 also a 64-bit-only Android (experiment).'],
+    ['props', 'more Android properties, key=value,key=value (letters, digits, . _ -); they override diet.'],
 ];
 
 function intParam(params, name, fallback, min, max) {
@@ -158,6 +162,10 @@ export function parseConfig(search, env = {}) {
         append: safeWords(params.get('append')),
         cmdline: safeWords(params.get('cmdline')),
         qemu: safeWords(params.get('qemu')),
+        // Boot diet (boot-diet.js): property set 0-2, plus ?props=k=v,k=v.
+        diet: intParam(params, 'diet', 1, 0, 2),
+        props: parseProps(params.get('props')).props,
+        propsRejected: parseProps(params.get('props')).rejected,
     };
     return cfg;
 }

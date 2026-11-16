@@ -12,6 +12,9 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { parseConfig } from '../../web/js/config.js';
+import { DIET_SCRIPT, dietProps, dietScript } from '../../web/js/boot-diet.js';
+import { parseNewc } from '../../web/js/initramfs.js';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
 const puppeteer = require('puppeteer-core');
@@ -72,6 +75,35 @@ try {
         '/pc-bios/vgabios-stdvga.bin'].sort());
     assert.equal(p.memoryBytes, p.wasmMemoryMb * 1048576);
     ok(`QEMU gets its argv, BIOS/kernel files and a ${p.wasmMemoryMb} MiB shared memory (patched: ${p.patched})`);
+
+    // 2b. boot diet: the initrd QEMU loads is the published one plus one
+    // uncompressed cpio archive, on a 4-byte boundary, holding the script.
+    const wantProps = dietProps(parseConfig(query, {}));
+    assert.ok(wantProps.length >= 3);
+    assert.ok((await page.$eval('#cfgline', (e) => e.textContent)).includes(
+        ` props: ${wantProps.map((kv) => kv.join('=')).join(' ')}`));
+    const initrd = await page.evaluate(async () => {
+        const e = globalThis.__porty;
+        const published = new Uint8Array(await (await fetch(`image/${e.manifest.initrd.file}`)).arrayBuffer());
+        const loaded = e.module.__initrd;
+        return {
+            size: published.length,
+            manifestSize: e.manifest.initrd.size,
+            prefixSame: published.every((b, i) => loaded[i] === b),
+            tail: Array.from(loaded.subarray(published.length)),
+            notes: e.notes,
+        };
+    });
+    assert.equal(initrd.size, initrd.manifestSize);
+    assert.ok(initrd.prefixSame, 'the published initrd is the start of the loaded one');
+    const padding = (4 - (initrd.size % 4)) % 4;
+    assert.ok(initrd.tail.slice(0, padding).every((b) => b === 0));
+    const appended = parseNewc(new Uint8Array(initrd.tail), padding);
+    assert.equal(appended.end, initrd.tail.length, 'the archive ends the initrd');
+    assert.deepEqual(appended.entries.map((e) => e.name), ['scripts', DIET_SCRIPT]);
+    assert.equal(Buffer.from(appended.entries[1].data).toString('latin1'), dietScript(wantProps));
+    assert.ok(initrd.notes.some((n) => n.startsWith('Android properties set at boot: debug.sf.nobootanimation=1, ')));
+    ok(`initrd.img gets the boot-diet script appended (${wantProps.length} properties, ${initrd.tail.length} bytes)`);
 
     // 3. display: mode switch + pixel-exact conversion
     await page.waitForFunction(() => {

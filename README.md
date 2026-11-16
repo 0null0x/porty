@@ -167,6 +167,8 @@ and say how far it got, with that message.
 | `serial` | off | `1` opens the serial console at start |
 | `cache`, `parallel` | 64 (phones: 16), 4 | 2 MiB disk chunks kept in RAM, concurrent chunk downloads |
 | `fps` | 30 | Canvas refresh cap |
+| `diet` | 1 | Android properties set at boot to shorten it: `1` no boot animation (the screen stays black until the launcher) and first-boot app preparation without verification; `0` none; `2` also a 64-bit-only Android without the 32-bit zygote (experiment) |
+| `props` | | More Android properties, `key=value,key=value` (letters, digits, `.`, `_`, `-`); they override `diet`, for example `props=debug.sf.nobootanimation=0` |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |
 | `cmdline` | | Replace the whole kernel command line |
 | `qemu` | | Extra QEMU arguments |

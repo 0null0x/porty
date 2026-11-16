@@ -34,9 +34,15 @@ export default async function createFakeQemu(Module) {
     });
 
     const files = new Map();
+    let initrd = null; // a copy of what -initrd would load, for the test
     const FS = {
         mkdir() {},
-        writeFile(path, data) { files.set(path, data.length); },
+        writeFile(path, data) {
+            files.set(path, data.length);
+            if (path.endsWith('/initrd.img')) {
+                initrd = data.slice();
+            }
+        },
     };
     for (const hook of Module.preRun || []) {
         hook({ FS });
@@ -137,6 +143,7 @@ export default async function createFakeQemu(Module) {
         TTY: { stream_ops: { poll: () => 0 } },
         __events: events,
         __files: files,
+        __initrd: initrd,
         __args: args,
         __memoryBytes: memory.buffer.byteLength,
         _porty_abi_version: () => 1,

@@ -5,6 +5,7 @@ import { MIB, chooseWasmMemoryMb, fallbackLadder, requiredWasmMemoryMb } from '.
 import { buildKernelCmdline, buildQemuArgs } from './qemu-args.js';
 import { WASM_PAGE, findMemoryImport, setMemoryImportPages } from './wasm-patch.js';
 import { Display } from './display.js';
+import { applyBootDiet, dietProps } from './boot-diet.js';
 
 const BIOS_DIR = '/pc-bios';
 const IMAGE_DIR = '/img';
@@ -153,6 +154,16 @@ export class Emulator {
                     `(${blobs[part].length}, expected ${manifest[part].size}).`,
                     'A stale cache or an interrupted download. Reload the page.');
             }
+        }
+
+        // Boot diet: one more script for Android-x86's initrd (boot-diet.js).
+        const props = dietProps(this.cfg);
+        blobs.initrd = applyBootDiet(blobs.initrd, props);
+        this.notes.push(props.length
+            ? `Android properties set at boot: ${props.map((p) => p.join('=')).join(', ')}.`
+            : 'No Android properties set at boot (diet=0).');
+        if (this.cfg.propsRejected) {
+            this.notes.push(`${this.cfg.propsRejected} entries of ?props= were ignored (not key=value of letters, digits, . _ -).`);
         }
 
         // --- WebAssembly memory --------------------------------------------------
