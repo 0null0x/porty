@@ -112,11 +112,11 @@ for level in 1 2; do
         bad "diet=$level: default.prop not as expected"
     fi
     # Provisioning (boot-diet.js, PROVISION): one more action in the real init.rc.
-    if [[ "$said" == *"porty: provisioning at boot_completed (2 settings), hidden: nothing"* ]] \
+    if [[ "$said" == *"porty: provisioning at boot_completed (5 settings), hidden: nothing"* ]] \
         && [[ "$(grep -c '^# porty: provisioning' "$work/android/init.rc")" == 1 ]] \
         && [[ "$(tail -n 3 "$work/android/init.rc" | head -n 1)" == "# porty: provisioning (web/js/boot-diet.js)" ]] \
         && [[ "$(tail -n 2 "$work/android/init.rc" | head -n 1)" == "on property:sys.boot_completed=1" ]] \
-        && tail -n 1 "$work/android/init.rc" | grep -q -F 'exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; cmd settings put secure user_setup_complete 1"'; then
+        && tail -n 1 "$work/android/init.rc" | grep -q -F 'exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; cmd settings put secure user_setup_complete 1; cmd settings put global window_animation_scale 0; cmd settings put global transition_animation_scale 0; cmd settings put global animator_duration_scale 0"'; then
         pass "diet=$level: init.rc ends with the provisioning action ($(wc -l < "$work/ramdisk/init.rc") lines before)"
     else
         bad "diet=$level: init.rc not as expected: $(tail -n 3 "$work/android/init.rc")"
@@ -198,7 +198,7 @@ if [[ "$with_system" == --system ]]; then
                 bad "ttm fix: script output or the patched copy"
             fi
             if [[ "$(grep '^mount --bind porty-empty ' <<<"$said")"$'\n' == "$want_mounts" ]] \
-                && [[ "$said" == *"porty: provisioning at boot_completed (2 settings), hidden: SetupWizard AnalyticsService Taskbar"* ]] \
+                && [[ "$said" == *"porty: provisioning at boot_completed (5 settings), hidden: SetupWizard AnalyticsService Taskbar"* ]] \
                 && [[ -d "$work/android/porty-empty" && -z "$(ls -A "$work/android/porty-empty")" ]] \
                 && [[ "$(grep -c '^# porty: provisioning' "$work/android/init.rc")" == 1 ]]; then
                 pass "provisioning: the script binds an empty directory over the three packages; init.rc has the action once"

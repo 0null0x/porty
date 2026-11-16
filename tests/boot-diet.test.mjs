@@ -275,7 +275,9 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
     assert.equal(dietFixes(parseConfig('?setup=1', {})).provision, false);
     assert.deepEqual(PROVISION.hide,
         ['system/priv-app/SetupWizard', 'system/priv-app/AnalyticsService', 'system/priv-app/Taskbar']);
-    assert.deepEqual(PROVISION.settings, [['global', 'device_provisioned', '1'], ['secure', 'user_setup_complete', '1']]);
+    assert.deepEqual(PROVISION.settings, [['global', 'device_provisioned', '1'], ['secure', 'user_setup_complete', '1'],
+        ['global', 'window_animation_scale', '0'], ['global', 'transition_animation_scale', '0'],
+        ['global', 'animator_duration_scale', '0']]);
 
     // The script: after the properties and the module fix; alone, too.
     const props = dietProps(parseConfig('', {}));
@@ -285,7 +287,8 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
     assert.ok(script.startsWith(before.slice(0, -1)), 'provisioning is appended to the script');
     const action = '\n# porty: provisioning (web/js/boot-diet.js)\non property:sys.boot_completed=1\n' +
         '    exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; ' +
-        'cmd settings put secure user_setup_complete 1"\n';
+        'cmd settings put secure user_setup_complete 1; cmd settings put global window_animation_scale 0; ' +
+        'cmd settings put global transition_animation_scale 0; cmd settings put global animator_duration_scale 0"\n';
     assert.ok(script.includes(`<<'PORTY_EOF'\n${action}PORTY_EOF\n`));
     const alone = dietScript([], { provision: PROVISION });
     assert.ok(alone.includes('porty_provision') && !alone.includes('porty_diet') && !alone.includes('porty_module'));
@@ -325,7 +328,7 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         writeFileSync(path.join(dir, 'system/priv-app/AnalyticsService'), 'a file, not a package directory');
         out = run();
         assert.equal(out.status, 0, String(out.stderr));
-        assert.equal(String(out.stdout), 'porty: provisioning at boot_completed (2 settings), hidden: SetupWizard Taskbar\n');
+        assert.equal(String(out.stdout), 'porty: provisioning at boot_completed (5 settings), hidden: SetupWizard Taskbar\n');
         assert.equal(readFileSync(path.join(dir, 'mounts'), 'utf8'),
             'mount --bind porty-empty system/priv-app/SetupWizard\nmount --bind porty-empty system/priv-app/Taskbar\n');
         assert.deepEqual(readdirSync(path.join(dir, 'porty-empty')), []);
@@ -339,7 +342,7 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         rmSync(path.join(dir, 'system'), { recursive: true });
         writeFileSync(path.join(dir, 'init.rc'), rc);
         out = run();
-        assert.equal(String(out.stdout), 'porty: provisioning at boot_completed (2 settings), hidden: nothing\n');
+        assert.equal(String(out.stdout), 'porty: provisioning at boot_completed (5 settings), hidden: nothing\n');
         assert.equal(readFileSync(path.join(dir, 'init.rc'), 'utf8'), rc + action);
     } finally {
         rmSync(dir, { recursive: true, force: true });

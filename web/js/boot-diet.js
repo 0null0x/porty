@@ -133,7 +133,16 @@ export const TTM_FIX = {
 // .github/workflows/provisioning.yml.
 export const PROVISION = {
     hide: ['system/priv-app/SetupWizard', 'system/priv-app/AnalyticsService', 'system/priv-app/Taskbar'],
-    settings: [['global', 'device_provisioned', '1'], ['secure', 'user_setup_complete', '1']],
+    settings: [
+        ['global', 'device_provisioned', '1'], ['secure', 'user_setup_complete', '1'],
+        // No window, transition or animator animations: every frame of one
+        // is composed in software, and after a tap surfaceflinger took
+        // almost all of the guest's CPU while Gallery got about 4% (input
+        // probe, run 43909266297).  The developer options' "animation
+        // scale" settings; WindowManager follows them at once.
+        ['global', 'window_animation_scale', '0'], ['global', 'transition_animation_scale', '0'],
+        ['global', 'animator_duration_scale', '0'],
+    ],
 };
 
 const FIX_PATH = /^[A-Za-z0-9._/-]{1,200}$/;
