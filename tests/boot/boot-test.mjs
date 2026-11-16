@@ -215,6 +215,7 @@ async function inputProbe() {
     const send = (cmd) => page.evaluate((c) => globalThis.__porty.serial.send(c), cmd);
     // Print the serial output as it comes, so that it lands between the
     // probe's own lines (the main loop is not reading it meanwhile).
+    let lastFocus = '';
     const sleep = async (ms) => {
         await new Promise((resolve) => setTimeout(resolve, ms));
         const text = await page.evaluate(() => (globalThis.__cap ? globalThis.__cap.splice(0).join('') : ''));
@@ -222,20 +223,30 @@ async function inputProbe() {
             if (line.trim()) {
                 console.log(`serial| ${line.replace(/\r$/, '')}`);
             }
+            // The output of the marker command, not its echo.
+            const m = line.match(/FOCUS:(mCurrentFocus[^\r\n]*):END/);
+            if (m) {
+                lastFocus = m[1];
+            }
         }
     };
     log('INPUT PROBE: input devices, the kernel\'s and Android\'s view');
     await send('\rgrep -E "^(N|H|B: (EV|KEY|ABS|REL))" /proc/bus/input/devices\r');
     await sleep(5000);
-    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Sources:|DeviceType|Mode:|Mapper" | head -48\r');
-    await sleep(30000);
+    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Mode:" | head -24\r');
+    await sleep(20000);
+    // A dialog for an app that stopped responding, even one not on screen
+    // yet, means that app does not answer, and while SystemUI does not,
+    // touches are held back.
+    await send('echo ANRWIN:$(dumpsys window windows | grep -c "Application Not Responding"):END\r');
+    await sleep(10000);
     await send('getevent -lt > /data/local/tmp/porty-ev.txt 2>&1 &\r');
     await sleep(5000);
     await page.evaluate(() => {
         const c = document.getElementById('screen');
         const seen = {};
         globalThis.__portyProbe = seen;
-        for (const t of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchend', 'mousedown', 'mouseup']) {
+        for (const t of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchend']) {
             c.addEventListener(t, (e) => {
                 const k = `${t}:${e.pointerType || '-'}`;
                 seen[k] = (seen[k] || 0) + 1;
@@ -249,15 +260,33 @@ async function inputProbe() {
     // Android's coordinates on its own screen -> page coordinates.
     const at = (ax, ay) => [r.x + (ax / (r.cw || 480)) * r.w, r.y + (ay / (r.ch || 800)) * r.h];
     log(`INPUT PROBE: canvas ${JSON.stringify(r)}`);
-
+    // Poll the focus with a marker until `want` has it or `ms` pass.
+    const focusWait = async (label, want, ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms) {
+            await send('echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END\r');
+            await sleep(30000);
+            const got = lastFocus;
+            if (want.test(got)) {
+                log(`INPUT PROBE: ${label}: ${got} after ${Math.round((Date.now() - t) / 1000)} s`);
+                return true;
+            }
+        }
+        log(`INPUT PROBE: ${label}: not within ${Math.round(ms / 1000)} s`);
+        return false;
+    };
     const [gx, gy] = at(150, 565 * (r.ch || 800) / 800);
     log(`INPUT PROBE: finger tap at ${gx.toFixed(0)},${gy.toFixed(0)} (the Gallery icon)`);
     await page.touchscreen.tap(gx, gy);
-    await sleep(45000);
-    log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
-    await send('\rdumpsys window | grep -E "mCurrentFocus|mFocusedApp"\r');
-    await sleep(10000);
+    await sleep(15000);
     await shot('after-touch', true);
+    await focusWait('Gallery in front', /gallery/i, 240000);
+    log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
+    await shot('after-touch-wait', true);
+
+    log('INPUT PROBE: the page\'s Home button');
+    await page.click('#nav-home').catch((e) => log(`INPUT PROBE: no Home button (${e.message})`));
+    await focusWait('launcher in front', /launcher/i, 120000);
 
     const [sx, sy] = at((r.cw || 480) / 2, 91 * (r.ch || 800) / 800);
     log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the search bar)`);
@@ -266,14 +295,12 @@ async function inputProbe() {
     await page.mouse.down();
     await sleep(150);
     await page.mouse.up();
-    await sleep(45000);
+    await focusWait('search in front', /search|quicksearchbox|googlequicksearchbox/i, 180000);
     log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
-    await send('\rdumpsys window | grep -E "mCurrentFocus|mFocusedApp"\r');
-    await sleep(10000);
     await shot('after-mouse', true);
 
-    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); head -60 /data/local/tmp/porty-ev.txt\r');
-    await sleep(15000);
+    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); head -40 /data/local/tmp/porty-ev.txt\r');
+    await sleep(20000);
     log('INPUT PROBE: done');
 }
 

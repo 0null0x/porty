@@ -559,21 +559,35 @@ def do_save(opts, argv):
                 run("top", "top -b -n 1 -m 14 | head -22 | cut -c1-150", 240)
                 run("log_tail", "logcat -d -t 25 | cut -c1-200", 180)
 
-                # An "isn't responding" dialog would be saved on screen, and
-                # natively SystemUI often stops responding in the burst after
-                # the boot.  Once the guest has settled, end the process the
-                # dialog is for: Android dismisses the dialog with it and
-                # starts a persistent app such as SystemUI again.
-                for _ in range(3):
-                    status, focus = vm.sh("dumpsys window | grep mCurrentFocus", 120)
-                    anr = re.search(r"Application Not Responding: ([A-Za-z0-9_.]+)", focus if status == 0 else "")
-                    if not anr:
+                # An "isn't responding" dialog would be saved with the
+                # machine, and natively SystemUI often stops responding in the
+                # burst after the boot.  The dialog need not be on screen yet
+                # (snapshot 3 had one hidden, which showed after the first
+                # touch); and while SystemUI does not answer, InputDispatcher
+                # holds back every touch, since SystemUI's status bar watches
+                # touches outside it.  So look in every window, end the
+                # processes such dialogs are for (Android dismisses a dialog
+                # with its process and starts a persistent app such as
+                # SystemUI again), and let the guest settle once more.
+                for attempt in range(4):
+                    status, windows = vm.sh("dumpsys window windows | grep -o 'Application Not Responding: [A-Za-z0-9_.]*' | sort -u", 180)
+                    anrs = sorted(set(re.findall(r"Application Not Responding: ([A-Za-z0-9_.]+)", windows if status == 0 else "")))
+                    guest[f"anr_windows_{attempt}"] = anrs
+                    if not anrs:
                         break
-                    guest.setdefault("anr_dismissed", []).append(anr.group(1))
-                    run(f"anr_kill_{len(guest['anr_dismissed'])}", f"kill $(pidof {anr.group(1)}); echo killed", 120)
-                    end = time.monotonic() + 60
+                    guest.setdefault("anr_dismissed", []).extend(anrs)
+                    run(f"anr_kill_{attempt}", "; ".join(f"kill $(pidof {p})" for p in anrs) + "; echo killed", 120)
+                    end = time.monotonic() + 90
                     while time.monotonic() < end and vm.alive():
                         vm.pump(2.0)
+                    for _ in range(8):
+                        status, text = vm.sh("cat /proc/loadavg", 30)
+                        if status == 0 and text.split() and float(text.split()[0]) < opts.max_load:
+                            break
+                        end = time.monotonic() + 30
+                        while time.monotonic() < end and vm.alive():
+                            vm.pump(2.0)
+                    guest[f"loadavg_after_anr_{attempt}"] = text
                 run("focus_saved", "dumpsys window | grep -e mCurrentFocus -e mFocusedApp", 180)
 
                 run("wake", "input keyevent 224", 180)
