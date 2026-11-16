@@ -424,6 +424,30 @@ without the page bug first.
   shell appears on the serial console and the boot test can ask for
   `sys.boot_completed`; the automatic boot test runs for up to 100 minutes.
 
+**Fifth round: the boot animation.**
+
+- With 0005, Android's init died on every boot at the same two places in
+  SELinux (`ebitmap_read`, `context_struct_compute_av`). The interpreter
+  multiplies 32-bit casts for `mulu2_i32`/`muls2_i32`, but the generated Wasm
+  multiplied whole 64-bit registers whose upper halves are undefined for i32
+  values; compilers turn `x % 384` into exactly such a multiply. Patch 0006
+  extends the operands first. After it: no more crashes.
+- `-trace`-free diagnosis that worked: `append=ignore_loglevel printk.devkmsg=on`
+  shows Android init's own messages on the serial console.
+- Timeline of a boot (verbose run, 64-chunk cache): kernel to init about 40 s,
+  zygote at about 3 min, SurfaceFlinger at 11 min, the root console at 13 min,
+  and SurfaceFlinger starts `bootanim` at 23 min. In `gfx=vesa` mode the
+  animation is on screen at 30 and 40 minutes
+  ([screenshot](img/boot-animation-vesa-30min.jpg)), and by 43 minutes
+  system_server's package setup (`idmap`) is running. Each init step takes
+  about a second: roughly 10 to 50 times slower than real hardware.
+- A 16-chunk disk cache made the guest re-download 1.25 GB of a 943 MB image;
+  64 chunks fetch far less and reach each stage sooner. Default now 64 (32 on
+  phones).
+- The boot test posts live progress as a commit status (`porty/boot ...`,
+  including the share of lit pixels on the guest screen), because GitHub
+  shows job logs and annotations only when a run ends.
+
 **Next steps, in order of cost:**
 
 1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly

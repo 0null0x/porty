@@ -10,18 +10,21 @@ is why it can run in Safari on an iPhone.
 
 Expected address once deployed: **https://0null0x.github.io/porty/**
 
-## Status: builds and deploys; booting unverified
+## Status: Android 9 reaches its boot animation in desktop Chrome
 
-The first workflow run (2026-11-15) compiled QEMU to WebAssembly (a 12 MB
-module), downloaded and verified the ISO, and deployed a 966 MB site. Nobody
-has seen Android boot in a browser yet. What was checked before that is
-listed under [What has been tested](#what-has-been-tested). Treat every
-statement about booting Android as a plan until the milestones below are
-ticked off.
+![Android 9 x86_64 boot animation in headless Chrome, 30 minutes in](docs/img/boot-animation-vesa-30min.jpg)
+
+As of 2026-11-16, in headless Chrome on a 4-vCPU GitHub runner (the boot
+test), the Linux kernel boots, Android's init starts its services, zygote
+and SurfaceFlinger run, and the boot animation is drawn on the canvas
+after about 25 to 30 minutes (`gfx=vesa`, 800x600, above). Getting there
+took three fixes to QEMU-Wasm itself (patches 0005 and 0006) and one to the
+page; see [docs/PLAN.md](docs/PLAN.md), "Findings". Nobody has yet seen
+the home screen, and it has not been tried on an iPhone.
 
 - [x] **M1** CI build is green and the site deploys
-- [ ] **M2** desktop browser: kernel boot log appears on the serial console
-- [ ] **M3** desktop browser: Android UI is visible on the canvas
+- [x] **M2** desktop browser: kernel boot log appears on the serial console
+- [ ] **M3** desktop browser: Android UI is visible on the canvas (boot animation: yes; home screen: not yet)
 - [ ] **M4** touch, navigation buttons and keyboard work
 - [ ] **M5** boots in Safari on an iPhone (iOS 26 or later)
 - [ ] **M6** performance tuning
