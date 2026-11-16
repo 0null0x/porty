@@ -1,0 +1,297 @@
+# Provisioning check: boots the image the site publishes in a NATIVE QEMU
+# (TCG, one vCPU) built from the same patched QEMU-Wasm tree, with the
+# arguments and the initrd the page would use, and checks that a first boot
+# ends on Android's home screen by itself: device_provisioned and
+# user_setup_complete are 1, the launcher has the focus, no setup wizard
+# crashed and the screen is not black (tests/provision-native.py).
+#
+# The run itself never fails, because every failed run emails the repository
+# owner.  The verdict is the commit status "porty/check provisioning" and
+# the job summary (the log also has the screen as base64 PNG); read the
+# status with
+#   gh api repos/<owner>/<repo>/commits/<sha>/statuses
+name: Provisioning
+
+on:
+  push:
+    branches: [swarm/provisioning]
+  workflow_dispatch:
+    inputs:
+      query:
+        description: Page parameters to boot with
+        default: mem=768&tb=128&cache=16
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: provisioning-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  provisioning:
+    name: First boot ends on the home screen (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The page's own initrd (web/js/boot-diet.js, PROVISION), no
+          # experiment script: what every visitor boots.
+          - name: p0
+            context: porty/check provisioning p0
+            experiment: ''
+            args: ''
+          - name: p1
+            context: porty/check provisioning p1
+            experiment: ''
+            args: ''
+          - name: p2
+            context: porty/check provisioning p2
+            experiment: ''
+            args: --idle 240
+    env:
+      QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
+      STATUS_CONTEXT: ${{ matrix.context }}
+      EXPERIMENT: ${{ matrix.experiment }}
+      EXTRA_ARGS: ${{ matrix.args }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
+
+      # --- native QEMU from the patched QEMU-Wasm tree (as in snapshot.yml) ---
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          tail -5 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Save the native QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          out/native-qemu/qemu-system-x86_64 -display help | grep -q wasmfb
+
+      # --- the image: the one the site publishes when this commit does not
+      # change it (build-and-deploy.yml caches it under this key), else one
+      # prepared here from the ISO --------------------------------------------
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: prepare
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          grep -e '^--- ' -e 'Google-named' "$RUNNER_TEMP/prepare.log" || true
+          rm -rf out/iso
+
+      - name: The image
+        id: image
+        continue-on-error: true
+        env:
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+        run: |
+          test -s out/image/manifest.json
+          echo "published image from the cache: ${CACHE_HIT:-false}"
+          python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); d=m["disk"]; print("disk:", {k: d.get(k) for k in ("format", "dir", "size", "sha256")}); print("removed:", [r.get("path") for r in d.get("removed", [])])' out/image/manifest.json
+
+      # What the fix relies on in the initrd and the ramdisk, for the log.
+      - name: Facts about the initrd and the ramdisk
+        continue-on-error: true
+        if: steps.image.outcome == 'success'
+        run: |
+          mkdir -p "$RUNNER_TEMP/facts/initrd" "$RUNNER_TEMP/facts/ramdisk"
+          unpack() { ( cd "$1" && cpio -i -d -m --quiet --no-absolute-filenames --nonmatching 'dev/*' 2>/dev/null ) || true; }
+          gzip -dc out/image/initrd.img | unpack "$RUNNER_TEMP/facts/initrd"
+          gzip -dc out/image/ramdisk.img | unpack "$RUNNER_TEMP/facts/ramdisk"
+          cd "$RUNNER_TEMP/facts"
+          echo "===== initrd /init ====="; cat -n initrd/init
+          echo "===== initrd /scripts ====="; ls -la initrd/scripts
+          for f in initrd/scripts/*; do echo "===== $f ====="; cat -n "$f"; done
+          echo "===== ramdisk ====="; ls -la ramdisk
+          echo "===== ramdisk: imports, boot_completed triggers, seclabels ====="
+          grep -n -e '^import' -e 'sys.boot_completed' -e seclabel -e 'class_start' ramdisk/*.rc || true
+          echo "===== ramdisk default.prop ====="; cat ramdisk/default.prop
+          for f in ramdisk/init.x86.rc ramdisk/init.android_x86_64.rc; do
+            [[ -f "$f" ]] && { echo "===== $f ====="; cat -n "$f"; }
+          done
+
+      - name: Build the QEMU arguments
+        id: argv
+        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p out/prov
+          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/prov/initrd-page.img" "?$QUERY"
+          if [[ -n "$EXPERIMENT" ]]; then
+            node tests/append-initrd-script.mjs out/prov/initrd-page.img out/prov/initrd-x.img 99-porty-x "tests/provisioning-experiments/$EXPERIMENT.sh"
+            mv out/prov/initrd-x.img out/prov/initrd-page.img
+          fi
+          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+            "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
+            | awk -v initrd="$PWD/out/prov/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+            > out/prov/argv-native.txt
+          grep -qxF "$PWD/out/prov/initrd-page.img" out/prov/argv-native.txt
+          cat out/prov/argv-native.txt
+
+      - name: Boot Android and check the home screen
+        id: boot
+        if: steps.argv.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          read -r -a extra <<<"$EXTRA_ARGS"
+          python3 -I tests/provision-native.py \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/prov/argv-native.txt \
+            --work out/prov/boot \
+            --boot-timeout 2400 --settle 75 "${extra[@]}"
+
+      - name: Upload the logs
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provisioning-${{ matrix.name }}
+          path: |
+            out/prov/boot/result.json
+            out/prov/boot/serial.log
+            out/prov/boot/*.png
+            out/prov/argv-native.txt
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          QEMU: ${{ steps.qemu.outcome }}
+          IMAGE: ${{ steps.image.outcome }}
+          IMAGE_CACHED: ${{ steps.image-cache.outputs.cache-hit }}
+          ARGV: ${{ steps.argv.outcome }}
+          BOOT: ${{ steps.boot.outcome }}
+        run: |
+          set +e
+          details="$(python3 -I -c '
+          import json, sys
+          try:
+              r = json.load(open(sys.argv[1]))
+          except (OSError, ValueError):
+              print("no result"); sys.exit()
+          if not r.get("booted"):
+              print(r.get("error", "not booted")); sys.exit()
+          checks = r.get("checks", {})
+          bad = [k for k, c in checks.items() if not c["ok"]]
+          head = "booted in %.0f s; " % r["booted_seconds"]
+          print(head + ("%d checks pass" % len(checks) if not bad else "FAILED: " + ", ".join(bad)))
+          for k, c in checks.items():
+              print("| %s | %s | %s |" % (k, "pass" if c["ok"] else "**FAIL**", c["detail"].replace("|", "/")))
+          ' out/prov/boot/result.json 2>&1)"
+          first="$(sed -n 1p <<<"$details")"
+          state=failure
+          if [[ "$QEMU" != success ]]; then desc="native QEMU is missing"
+          elif [[ "$IMAGE" != success ]]; then desc="no image"
+          elif [[ "$ARGV" != success ]]; then desc="could not build the QEMU arguments"
+          elif [[ "$BOOT" != success ]]; then desc="$first"
+          else state=success; desc="$first"
+          fi
+          [[ "$IMAGE_CACHED" == true ]] && desc="$desc (published image)" || desc="$desc (image prepared here)"
+          echo "$state: $desc"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## Provisioning ($QUERY${EXPERIMENT:+, experiment $EXPERIMENT})"
+            echo
+            echo "**$state**: $desc"
+            echo
+            echo "| check | result | detail |"
+            echo "| --- | --- | --- |"
+            sed -n '2,$p' <<<"$details"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0

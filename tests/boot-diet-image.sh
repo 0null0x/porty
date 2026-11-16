@@ -111,6 +111,16 @@ for level in 1 2; do
     else
         bad "diet=$level: default.prop not as expected"
     fi
+    # Provisioning (boot-diet.js, PROVISION): one more action in the real init.rc.
+    if [[ "$said" == *"porty: provisioning at boot_completed (2 settings), hidden: nothing"* ]] \
+        && [[ "$(grep -c '^# porty: provisioning' "$work/android/init.rc")" == 1 ]] \
+        && [[ "$(tail -n 3 "$work/android/init.rc" | head -n 1)" == "# porty: provisioning (web/js/boot-diet.js)" ]] \
+        && [[ "$(tail -n 2 "$work/android/init.rc" | head -n 1)" == "on property:sys.boot_completed=1" ]] \
+        && tail -n 1 "$work/android/init.rc" | grep -q -F 'exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; cmd settings put secure user_setup_complete 1"'; then
+        pass "diet=$level: init.rc ends with the provisioning action ($(wc -l < "$work/ramdisk/init.rc") lines before)"
+    else
+        bad "diet=$level: init.rc not as expected: $(tail -n 3 "$work/android/init.rc")"
+    fi
     if [[ "$level" == 2 ]]; then
         check "diet=2: /init.zygote64.rc exists afterwards" test -s "$work/android/init.zygote64.rc"
         if grep -q 'zygote_secondary\|app_process32' "$work/android/init.zygote64.rc" 2>/dev/null; then
@@ -161,6 +171,23 @@ if [[ "$with_system" == --system ]]; then
             else
                 bad "ttm fix: /$ttm_path is not the module the page knows (sha256 $(sha256sum < "$work/android/$ttm_path" | cut -c1-64))"
             fi
+            # Provisioning (boot-diet.js, PROVISION): the packages the page
+            # hides are directories of the image; the script binds an empty
+            # one over each and adds its action to init.rc only once.
+            hide="$(node --input-type=module -e "
+                import { PROVISION as p } from '$repo/web/js/boot-diet.js';
+                console.log(p.hide.join(' '));")"
+            want_mounts=""
+            for dir in $hide; do
+                if debugfs -R "stat /${dir#system/}" "$work/sfs/system.img" 2>/dev/null | grep -q 'Type: directory'; then
+                    pass "provisioning: /$dir is a directory of the image ($(debugfs -R "ls -p /${dir#system/}" "$work/sfs/system.img" 2>/dev/null | cut -d/ -f6 | grep -v '^\.*$' | tr '\n' ' '))"
+                    mkdir -p "$work/android/$dir"
+                    want_mounts+="mount --bind porty-empty $dir"$'\n'
+                else
+                    bad "provisioning: the image has no directory /$dir"
+                fi
+            done
+            echo "    the ramdisk's sh and cmd come from the image: $(debugfs -R 'stat /bin/cmd' "$work/sfs/system.img" 2>/dev/null | grep -o 'Type: [a-z]*' | head -1), exec_background in init: $(grep -c -a exec_background "$work/ramdisk/init")"
             # shellcheck disable=SC2016
             said="$(cd "$work/android" && busybox sh -c 'mount() { echo "mount $*"; }; for s in `ls "$1"/scripts/*`; do test -e "$s" && source $s; done' sh "$work/combined" 2>&1)" || true
             echo "    the scripts printed: $said"
@@ -169,6 +196,14 @@ if [[ "$with_system" == --system ]]; then
                 pass "ttm fix: the script binds a copy with the expected hash over the module"
             else
                 bad "ttm fix: script output or the patched copy"
+            fi
+            if [[ "$(grep '^mount --bind porty-empty ' <<<"$said")"$'\n' == "$want_mounts" ]] \
+                && [[ "$said" == *"porty: provisioning at boot_completed (2 settings), hidden: SetupWizard AnalyticsService Taskbar"* ]] \
+                && [[ -d "$work/android/porty-empty" && -z "$(ls -A "$work/android/porty-empty")" ]] \
+                && [[ "$(grep -c '^# porty: provisioning' "$work/android/init.rc")" == 1 ]]; then
+                pass "provisioning: the script binds an empty directory over the three packages; init.rc has the action once"
+            else
+                bad "provisioning: script output or init.rc"
             fi
             if command -v objdump >/dev/null; then
                 before="$(objdump -d --disassemble=ttm_bo_vm_open "$work/android/$ttm_path" | grep -c -E '\sjne\s' || true)"

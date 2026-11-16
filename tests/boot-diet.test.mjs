@@ -4,13 +4,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parseConfig } from '../web/js/config.js';
 import {
-    DIET_LEVELS, DIET_SCRIPT, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps, dietScript,
+    DIET_LEVELS, DIET_SCRIPT, PROVISION, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps, dietScript,
     parseProps,
 } from '../web/js/boot-diet.js';
 import { appendInitramfs, appendOffset, newcArchive, parseNewc } from '../web/js/initramfs.js';
@@ -73,14 +73,15 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
     assert.equal(dflt.diet, 1);
     assert.deepEqual(dietProps(dflt), [
         ['debug.sf.nobootanimation', '1'], ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract']]);
-    assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract ttmfix');
+    assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract ttmfix provisioned');
     // the screen must come on: never the quiescent boot
     assert.ok(DIET_LEVELS.flat().every(([k]) => !/quiescent/.test(k)));
 
     const off = parseConfig('?diet=0', {});
     assert.deepEqual(dietProps(off), []);
-    assert.equal(describeDiet(off), ' props: none ttmfix');
-    assert.equal(describeDiet(parseConfig('?diet=0&ttmfix=0', {})), ' props: none');
+    assert.equal(describeDiet(off), ' props: none ttmfix provisioned');
+    assert.equal(describeDiet(parseConfig('?diet=0&ttmfix=0&setup=1', {})), ' props: none');
+    assert.equal(describeDiet(parseConfig('?diet=0&ttmfix=0', {})), ' props: none provisioned');
     assert.deepEqual(dietProps(parseConfig('?diet=0&props=a.b=c', {})), [['a.b', 'c']]);
     assert.equal(parseConfig('?diet=7', {}).diet, 2);
     assert.deepEqual(dietProps(parseConfig('?diet=2', {})).slice(3), [
@@ -261,6 +262,85 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         out = run();
         assert.equal(String(out.stdout), 'porty: ttm.ko could not be fixed, left alone\n');
         assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-ttm.ko')));
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+// --- provisioning: no setup wizard, the device marked as set up --------------------------
+{
+    // On by default, whatever the diet; off when the wizard is asked for.
+    assert.equal(dietFixes(parseConfig('', {})).provision, PROVISION);
+    assert.equal(dietFixes(parseConfig('?diet=0&ttmfix=0&gfx=vesa', {})).provision, PROVISION);
+    assert.equal(dietFixes(parseConfig('?setup=1', {})).provision, false);
+    assert.deepEqual(PROVISION.hide,
+        ['system/priv-app/SetupWizard', 'system/priv-app/AnalyticsService', 'system/priv-app/Taskbar']);
+    assert.deepEqual(PROVISION.settings, [['global', 'device_provisioned', '1'], ['secure', 'user_setup_complete', '1']]);
+
+    // The script: after the properties and the module fix; alone, too.
+    const props = dietProps(parseConfig('', {}));
+    const before = dietScript(props, { ttm: TTM_FIX });
+    const script = dietScript(props, { ttm: TTM_FIX, provision: PROVISION });
+    assert.equal(dietScript(props, { ttm: TTM_FIX, provision: false }), before);
+    assert.ok(script.startsWith(before.slice(0, -1)), 'provisioning is appended to the script');
+    const action = '\n# porty: provisioning (web/js/boot-diet.js)\non property:sys.boot_completed=1\n' +
+        '    exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; ' +
+        'cmd settings put secure user_setup_complete 1"\n';
+    assert.ok(script.includes(`<<'PORTY_EOF'\n${action}PORTY_EOF\n`));
+    const alone = dietScript([], { provision: PROVISION });
+    assert.ok(alone.includes('porty_provision') && !alone.includes('porty_diet') && !alone.includes('porty_module'));
+    const initrd = new Uint8Array([0x1f, 0x8b, 8, 0, 0]);
+    assert.equal(applyBootDiet(initrd, [], { ttm: false, provision: false }), initrd);
+    assert.equal(ascii(parseNewc(applyBootDiet(initrd, [], { provision: PROVISION }), 8).entries[1].data), alone);
+
+    // Nothing from outside ends up in the script.
+    for (const bad of [{ hide: ['system/a b'] }, { hide: ['system/../x'] }, { hide: ['data/app'] }, { hide: ['system/a;reboot'] },
+        { hide: 'system/app' }, { hide: new Array(17).fill('system/app/X') }, { settings: [] },
+        { settings: [['global', 'a', '1; reboot']] }, { settings: [['global', 'a b', '1']] }, { settings: [['x', 'a', '1']] },
+        { settings: [['global', 'a', '$(reboot)']] }, { settings: [['global', 'a']] }, { settings: [['global', 'a"', '1']] }]) {
+        assert.throws(() => dietScript([], { provision: { ...PROVISION, ...bad } }), /bad provisioning/, JSON.stringify(bad));
+    }
+
+    // Run it like /init does, in a stand-in for the unpacked ramdisk with the
+    // system image at ./system.  "mount" is a shell function here (binding
+    // needs root); it records what it was asked to do.
+    const shell = have('busybox') ? ['busybox', 'sh'] : ['sh'];
+    const dir = mkdtempSync(path.join(tmpdir(), 'porty-provision-'));
+    const run = () => spawnSync(shell[0], [...shell.slice(1), '-c',
+        'mount() { echo "mount $*" >> mounts; }; . ./script'], { cwd: dir, input: '' });
+    try {
+        writeFileSync(path.join(dir, 'script'), alone);
+
+        // no init.rc (the native tests' tiny guest): say so, touch nothing
+        mkdirSync(path.join(dir, 'system/priv-app/SetupWizard'), { recursive: true });
+        let out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: no init.rc, device not provisioned\n');
+        assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-empty')));
+
+        // the image: the wizard and the taskbar are there, the analytics service is not
+        const rc = 'import /init.environ.rc\n\non property:sys.boot_completed=1\n    bootchart stop\n';
+        writeFileSync(path.join(dir, 'init.rc'), rc);
+        mkdirSync(path.join(dir, 'system/priv-app/Taskbar'));
+        writeFileSync(path.join(dir, 'system/priv-app/AnalyticsService'), 'a file, not a package directory');
+        out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: provisioning at boot_completed (2 settings), hidden: SetupWizard Taskbar\n');
+        assert.equal(readFileSync(path.join(dir, 'mounts'), 'utf8'),
+            'mount --bind porty-empty system/priv-app/SetupWizard\nmount --bind porty-empty system/priv-app/Taskbar\n');
+        assert.deepEqual(readdirSync(path.join(dir, 'porty-empty')), []);
+        assert.equal(readFileSync(path.join(dir, 'init.rc'), 'utf8'), rc + action);
+
+        // sourced again: init.rc gets the action once
+        out = run();
+        assert.equal(readFileSync(path.join(dir, 'init.rc'), 'utf8'), rc + action);
+
+        // an image without any of the packages: only the settings
+        rmSync(path.join(dir, 'system'), { recursive: true });
+        writeFileSync(path.join(dir, 'init.rc'), rc);
+        out = run();
+        assert.equal(String(out.stdout), 'porty: provisioning at boot_completed (2 settings), hidden: nothing\n');
+        assert.equal(readFileSync(path.join(dir, 'init.rc'), 'utf8'), rc + action);
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

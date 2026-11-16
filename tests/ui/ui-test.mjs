@@ -105,6 +105,9 @@ try {
     assert.ok(wantFixes.ttm, 'the default configuration fixes ttm.ko');
     assert.equal(Buffer.from(appended.entries[1].data).toString('latin1'), dietScript(wantProps, wantFixes));
     assert.ok(initrd.notes.some((n) => n.startsWith('The kernel module ttm.ko is replaced at boot')));
+    assert.ok(wantFixes.provision, 'the default configuration provisions Android');
+    assert.ok(Buffer.from(appended.entries[1].data).toString('latin1').includes('cmd settings put global device_provisioned 1'));
+    assert.ok(initrd.notes.some((n) => n.startsWith('Android is marked as set up once it has booted')));
     assert.ok(initrd.notes.some((n) => n.startsWith('Android properties set at boot: debug.sf.nobootanimation=1, ')));
     ok(`initrd.img gets the boot-diet script appended (${wantProps.length} properties, ${initrd.tail.length} bytes)`);
 

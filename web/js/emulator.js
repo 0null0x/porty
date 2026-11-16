@@ -288,6 +288,10 @@ export class Emulator {
         } else if (this.cfg.gfx !== 'vesa') {
             this.notes.push('ttmfix=0: ttm.ko is left as shipped; the guest panics when surfaceflinger forks.');
         }
+        this.notes.push(fixes.provision
+            ? 'Android is marked as set up once it has booted, and its setup wizard, analytics service and ' +
+                'second launcher (Taskbar) are hidden, so the boot ends on the home screen; setup=1 leaves all that alone.'
+            : 'setup=1: the setup wizard is left to run (it stops without Google\'s services).');
 
         // --- QEMU ---------------------------------------------------------------
         const ramdiskPath = `${IMAGE_DIR}/${manifest.ramdisk.file}`;

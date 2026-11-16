@@ -18,6 +18,9 @@
 // The same script also replaces one kernel module, ttm.ko, with a copy in
 // which two bytes differ (TTM_FIX below): without that the guest's kernel
 // panics as soon as Android collects stack traces.
+//
+// And it does what a setup wizard would have done (PROVISION below): the
+// only one in the image crashes without Google's services.
 // Pure functions (no DOM).
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -95,16 +98,59 @@ export const TTM_FIX = {
     patchedSha256: '1958d6138042f15e0b83369914962e7d0d041ac0e831ec44cadb8908b3166408',
 };
 
+// Provisioning: what stands between a first boot and the home screen.
+//
+// A new Android has Settings.Global.DEVICE_PROVISIONED = 0 and
+// Settings.Secure.USER_SETUP_COMPLETE = 0 (SettingsProvider's defaults.xml:
+// def_device_provisioned and def_user_setup_complete are false, and no
+// property changes them).  The setup wizard, the HOME activity with the
+// highest priority, sets both to 1 and disables itself; that is all AOSP's
+// own wizard does (packages/apps/Provision, DefaultActivity.onCreate).
+// Until then the home key and the notification shade stay off.
+//
+// Android-x86 9.0-r2 has no Provision app, only Google's SetupWizard, and
+// the published image has none of Google's services: with SETUPWIZARD=0 the
+// wizard still starts and dies in onCreate ("SecurityException: Failed to
+// find provider com.google.settings", the provider of the removed
+// GoogleServicesFramework), again and again: "Android Setup keeps
+// stopping" over a black screen, for good.  So:
+//
+//   - hide: three packages are kept from PackageManagerService by binding
+//     an empty directory over theirs (it skips a directory without an APK):
+//     SetupWizard; AnalyticsService (org.android_x86.analytics, which
+//     crashes without Play services' analytics, "RuntimeException: Stub!",
+//     and has nobody to report to without a network); and Taskbar, the
+//     second launcher: with two HOME activities of the same priority and no
+//     preference, Android asks "Select a Home app" (ResolverActivity)
+//     instead of showing one.  Launcher3 remains as the only launcher.
+//   - settings: once Android has booted (sys.boot_completed=1, the trigger
+//     Android-x86's own init.android_x86_64.rc uses for init.sh), init runs
+//     "cmd settings put" for the two settings, which is what
+//     /system/bin/settings does.  SystemUI and the window manager observe
+//     both settings and follow.
+//
+// Not with setup=1 (the wizard was asked for).  Evidence: native boots in
+// .github/workflows/provisioning.yml.
+export const PROVISION = {
+    hide: ['system/priv-app/SetupWizard', 'system/priv-app/AnalyticsService', 'system/priv-app/Taskbar'],
+    settings: [['global', 'device_provisioned', '1'], ['secure', 'user_setup_complete', '1']],
+};
+
 const FIX_PATH = /^[A-Za-z0-9._/-]{1,200}$/;
+const SETTING = /^[a-z0-9_]{1,64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
 /**
- * Which kernel fixes a config gets: { ttm: false | TTM_FIX }.  Not with
- * gfx=vesa (nomodeset: bochs-drm never drives the screen, nothing maps a
- * TTM buffer) and not with ttmfix=0.
+ * Which fixes a config gets: { ttm: false | TTM_FIX, provision: false |
+ * PROVISION }.  The kernel fix not with gfx=vesa (nomodeset: bochs-drm never
+ * drives the screen, nothing maps a TTM buffer) and not with ttmfix=0; the
+ * provisioning not with setup=1.
  */
 export function dietFixes(cfg) {
-    return { ttm: cfg.ttmfix !== false && cfg.gfx !== 'vesa' ? TTM_FIX : false };
+    return {
+        ttm: cfg.ttmfix !== false && cfg.gfx !== 'vesa' ? TTM_FIX : false,
+        provision: cfg.setup ? false : PROVISION,
+    };
 }
 
 /** "k=v,k=v" from the URL -> { props: [[k, v]...], rejected: n }. */
@@ -142,11 +188,11 @@ export function dietProps(cfg) {
     return [...merged];
 }
 
-/** For the configuration line: " props: k=v k=v" and the kernel fix. */
+/** For the configuration line: " props: k=v k=v" and the fixes. */
 export function describeDiet(cfg) {
     const props = dietProps(cfg);
     return (props.length ? ` props: ${props.map((p) => p.join('=')).join(' ')}` : ' props: none')
-        + (dietFixes(cfg).ttm ? ' ttmfix' : '');
+        + (dietFixes(cfg).ttm ? ' ttmfix' : '') + (dietFixes(cfg).provision ? ' provisioned' : '');
 }
 
 /** Shell lines that set the properties (empty: none to set). */
@@ -233,11 +279,58 @@ function moduleFixLines(fix) {
 }
 
 /**
+ * Shell lines that provision the device (see PROVISION): packages hidden
+ * under an empty directory of the root tmpfs, and an action appended to
+ * init.rc.  Sourcing the script twice changes nothing more.
+ */
+function provisionLines(provision) {
+    if (!provision) {
+        return [];
+    }
+    const { hide, settings } = provision;
+    const ok = Array.isArray(hide) && hide.length <= 16
+        && hide.every((dir) => typeof dir === 'string' && FIX_PATH.test(dir) && !dir.includes('..') && dir.startsWith('system/'))
+        && Array.isArray(settings) && settings.length > 0 && settings.length <= 8
+        && settings.every((item) => Array.isArray(item) && item.length === 3 && /^(global|secure|system)$/.test(item[0])
+            && SETTING.test(item[1]) && SETTING.test(item[2]));
+    if (!ok) {
+        throw new Error(`dietScript: bad provisioning ${JSON.stringify(provision)}`);
+    }
+    const put = settings.map((item) => `cmd settings put ${item.join(' ')}`).join('; ');
+    return [
+        'porty_provision()',
+        '{',
+        '\tif [ ! -f init.rc ]; then',
+        '\t\techo "porty: no init.rc, device not provisioned"',
+        '\t\treturn',
+        '\tfi',
+        '\tporty_n=',
+        '\tmkdir -p porty-empty',
+        `\tfor porty_d in ${hide.join(' ')}; do`,
+        '\t\tif [ -d $porty_d ] && mount --bind porty-empty $porty_d; then',
+        '\t\t\tporty_n="$porty_n ${porty_d##*/}"',
+        '\t\tfi',
+        '\tdone',
+        "\tif ! grep -q '^# porty: provisioning' init.rc; then",
+        "\t\tcat >> init.rc <<'PORTY_EOF'",
+        '',
+        '# porty: provisioning (web/js/boot-diet.js)',
+        'on property:sys.boot_completed=1',
+        `    exec_background u:r:init:s0 -- /system/bin/sh -c "${put}"`,
+        'PORTY_EOF',
+        '\tfi',
+        `\techo "porty: provisioning at boot_completed (${settings.length} settings), hidden:\${porty_n:- nothing}"`,
+        '}',
+        'porty_provision',
+    ];
+}
+
+/**
  * The script for the initrd (busybox ash, sourced by /init from /android).
  * Lines for the same keys are removed first: init keeps the first value of
  * a "ro." property and the last of any other.
  * @param props  [[key, value]...]
- * @param fixes  { ttm: false | a module fix like TTM_FIX }
+ * @param fixes  { ttm: false | a module fix like TTM_FIX, provision: false | PROVISION }
  */
 export function dietScript(props, fixes = {}) {
     for (const [key, value] of props) {
@@ -250,6 +343,7 @@ export function dietScript(props, fixes = {}) {
         '# Sourced by /init in /android after ramdisk.img was unpacked there.',
         ...propLines(props),
         ...moduleFixLines(fixes.ttm),
+        ...provisionLines(fixes.provision),
         '',
     ].join('\n');
 }
@@ -264,5 +358,5 @@ export function dietArchive(props, fixes = {}) {
 
 /** initrd.img with the diet script appended; unchanged when there is nothing to do. */
 export function applyBootDiet(initrd, props, fixes = {}) {
-    return props.length || fixes.ttm ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
+    return props.length || fixes.ttm || fixes.provision ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
 }

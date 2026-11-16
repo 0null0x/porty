@@ -56,7 +56,7 @@ export const PARAM_HELP = [
     ['dpi', 'Android screen density (default derived from res).'],
     ['gfx', '"auto" (default) or "vesa" (adds nomodeset).'],
     ['disk', '"virtio" (default) or "ide".'],
-    ['setup', '1 keeps the Android setup wizard (default: skipped).'],
+    ['setup', '1 keeps the Android setup wizard, which stops without Google\'s services (default: the page hides it and marks Android as set up, see boot-diet.js).'],
     ['serial', '1 opens the serial console panel at start.'],
     ['cache', '2 MiB disk chunks kept in RAM (default 64, phones 16).'],
     ['parallel', 'concurrent chunk downloads (default 4).'],
