@@ -108,6 +108,11 @@ export function buildQemuArgs(cfg, manifest, paths) {
         // Absolute pointer, as in Android-x86's qemu-android script.
         ...(cfg.usb ? ['-usb', '-device', 'usb-tablet'] : []),
 
+        // Time dilation (?timescale=, patch 0011) slows QEMU's virtual
+        // clock. The RTC follows the host's clock unless told otherwise,
+        // and would then run ahead of every other clock the guest has.
+        ...(cfg.timescale > 1 ? ['-rtc', 'base=utc,clock=vm'] : []),
+
         '-serial', 'mon:stdio',
         '-parallel', 'none',
         '-nic', 'none',

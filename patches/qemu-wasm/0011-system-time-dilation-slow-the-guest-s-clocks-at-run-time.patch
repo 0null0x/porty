@@ -1,0 +1,228 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 12:00:00 +0000
+Subject: [PATCH] system: time dilation, slow the guest's clocks at run time
+
+Android's system_server Watchdog kills the process when a monitored
+thread does not answer for 60 s of guest uptime, a constant in Android 9
+with no property to relax it.  Under QEMU-Wasm the guest executes so few
+instructions per second that boot steps take longer than that (one took
+106 s), the Watchdog fired after about 100 minutes of a boot test and
+zygote and system_server started over.
+
+porty_set_time_scale(N) makes the guest's time pass N times slower than
+the host's, so N times more work fits into each guest second and the
+periodic tick costs N times less of the host's time.
+
+Without icount, QEMU_CLOCK_VIRTUAL and QEMU_CLOCK_VIRTUAL_RT are
+cpu_get_clock() and the TSC under TCG is cpu_get_ticks(); both add an
+offset kept in timers_state to a host reading (get_clock() and
+cpu_get_host_ticks(), which is get_clock() too on a wasm32 host).  The
+host readings are divided by N at exactly those places, so the HPET, PIT,
+local APIC timer and ACPI PM timer (all on QEMU_CLOCK_VIRTUAL) and the
+TSC slow down together and the kernel's TSC calibration against the
+PIT/HPET finds the same frequency as before.  The offsets, which are
+what vm_stop/vm_start and the "timer" migration section keep, stay in
+guest units: a saved clock does not depend on the scale, and a snapshot
+can be loaded under a different one.  The mc146818 RTC runs on
+QEMU_CLOCK_HOST by default and is left alone; the page passes
+"-rtc clock=vm" together with a scale so that it follows.
+
+timerlist_deadline_ns(), from which the main loop and aio_poll() take
+their host timeouts, multiplies the deadlines of the two virtual clocks
+by N; otherwise QEMU would wake up early over and over for each guest
+timer.  QEMU_CLOCK_REALTIME and QEMU_CLOCK_HOST (display refresh,
+Porty's input timer, migration) are unchanged.
+
+The default scale is 1, for which the new helpers return the host
+readings unchanged and the deadline is not touched.  Not meant to be
+combined with -icount.
+---
+diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+index 9a366e551f..06ad9e4124 100644
+--- a/include/qemu/timer.h
++++ b/include/qemu/timer.h
+@@ -176,6 +176,13 @@ bool qemu_clock_expired(QEMUClockType type);
+  */
+ bool qemu_clock_use_for_deadline(QEMUClockType type);
+ 
++/*
++ * Porty: time dilation.  The clocks the guest sees run this many times
++ * slower than the host's (1: real time).  Set with porty_set_time_scale()
++ * in system/cpu-timers.c only.
++ */
++extern int porty_time_scale;
++
+ /**
+  * qemu_clock_deadline_ns_all:
+  * @type: the clock type
+diff --git a/system/cpu-timers.c b/system/cpu-timers.c
+index 7452d97b67..68362b1139 100644
+--- a/system/cpu-timers.c
++++ b/system/cpu-timers.c
+@@ -38,13 +38,59 @@
+ #include "sysemu/cpu-throttle.h"
+ #include "sysemu/cpu-timers-internal.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#else
++#define EMSCRIPTEN_KEEPALIVE
++#endif
++
+ /* clock and ticks */
+ 
++/*
++ * Porty: time dilation.  With a scale of N > 1 the guest's clocks advance
++ * N times slower than the host's, so that a guest running on a slow
++ * emulator gets N times more instructions done per second of its own time
++ * (Android's system_server Watchdog gives up after 60 s of guest uptime).
++ *
++ * Without icount, everything the guest can measure time with derives from
++ * the two values below: QEMU_CLOCK_VIRTUAL and QEMU_CLOCK_VIRTUAL_RT are
++ * cpu_get_clock() (HPET, PIT, local APIC timer, ACPI PM timer, the RTC
++ * with "-rtc clock=vm", UHCI frames, serial port timing), and the TSC
++ * under TCG is cpu_get_ticks().  Dividing the host readings here keeps
++ * them all consistent with each other: the kernel calibrating the TSC
++ * against the PIT or HPET finds the same frequency as without dilation.
++ * timers_state's offsets stay in guest units, which is what vm_stop,
++ * vm_start and migration keep ("timer" section), so saved clocks do not
++ * depend on the scale and a snapshot loads under any scale.
++ * QEMU_CLOCK_REALTIME and QEMU_CLOCK_HOST are not touched.
++ *
++ * Not meant for -icount (the virtual clock is then the instruction
++ * counter, but timerlist_deadline_ns() would still stretch the waits).
++ *
++ * porty_time_scale is written under vm_clock_seqlock and vm_clock_lock.
++ * With a scale of 1 the two functions return the host readings unchanged.
++ */
++static inline int64_t porty_host_clock(void)
++{
++    int n = qatomic_read(&porty_time_scale);
++    int64_t t = get_clock();
++
++    return n > 1 ? t / n : t;
++}
++
++static inline int64_t porty_host_ticks(void)
++{
++    int n = qatomic_read(&porty_time_scale);
++    int64_t t = cpu_get_host_ticks();
++
++    return n > 1 ? t / n : t;
++}
++
+ static int64_t cpu_get_ticks_locked(void)
+ {
+     int64_t ticks = timers_state.cpu_ticks_offset;
+     if (timers_state.cpu_ticks_enabled) {
+-        ticks += cpu_get_host_ticks();
++        ticks += porty_host_ticks();
+     }
+ 
+     if (timers_state.cpu_ticks_prev > ticks) {
+@@ -77,7 +123,7 @@ int64_t cpu_get_clock_locked(void)
+ 
+     time = timers_state.cpu_clock_offset;
+     if (timers_state.cpu_ticks_enabled) {
+-        time += get_clock();
++        time += porty_host_clock();
+     }
+ 
+     return time;
+@@ -109,8 +155,8 @@ void cpu_enable_ticks(void)
+     seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                        &timers_state.vm_clock_lock);
+     if (!timers_state.cpu_ticks_enabled) {
+-        timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
+-        timers_state.cpu_clock_offset -= get_clock();
++        timers_state.cpu_ticks_offset -= porty_host_ticks();
++        timers_state.cpu_clock_offset -= porty_host_clock();
+         timers_state.cpu_ticks_enabled = 1;
+     }
+     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+@@ -127,7 +173,7 @@ void cpu_disable_ticks(void)
+     seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                        &timers_state.vm_clock_lock);
+     if (timers_state.cpu_ticks_enabled) {
+-        timers_state.cpu_ticks_offset += cpu_get_host_ticks();
++        timers_state.cpu_ticks_offset += porty_host_ticks();
+         timers_state.cpu_clock_offset = cpu_get_clock_locked();
+         timers_state.cpu_ticks_enabled = 0;
+     }
+@@ -135,6 +181,44 @@ void cpu_disable_ticks(void)
+                          &timers_state.vm_clock_lock);
+ }
+ 
++/*
++ * Porty: set the time scale (1 = real time, at most PORTY_TIME_SCALE_MAX)
++ * and return the value in effect.  The page calls this (?timescale=) before
++ * main() starts QEMU.  Changing it while the guest runs is allowed as
++ * well: the offsets are moved so that neither the clock nor the ticks
++ * jump, only their rate changes.  May be called from any thread; it only
++ * takes the spinlock that guards timers_state.
++ */
++#define PORTY_TIME_SCALE_MAX 64
++
++int porty_set_time_scale(int n);
++EMSCRIPTEN_KEEPALIVE int porty_set_time_scale(int n)
++{
++    if (n < 1) {
++        n = 1;
++    } else if (n > PORTY_TIME_SCALE_MAX) {
++        n = PORTY_TIME_SCALE_MAX;
++    }
++
++    seqlock_write_lock(&timers_state.vm_clock_seqlock,
++                       &timers_state.vm_clock_lock);
++    if (n != qatomic_read(&porty_time_scale)) {
++        if (timers_state.cpu_ticks_enabled) {
++            int64_t ticks = cpu_get_ticks_locked();
++            int64_t clock = cpu_get_clock_locked();
++
++            qatomic_set(&porty_time_scale, n);
++            timers_state.cpu_ticks_offset = ticks - porty_host_ticks();
++            timers_state.cpu_clock_offset = clock - porty_host_clock();
++        } else {
++            qatomic_set(&porty_time_scale, n);
++        }
++    }
++    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
++                         &timers_state.vm_clock_lock);
++    return n;
++}
++
+ static bool icount_state_needed(void *opaque)
+ {
+     return icount_enabled();
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index 6a0de33dd2..10d96944d2 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -239,9 +239,27 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
+         return 0;
+     }
+ 
++    /*
++     * Porty: the callers wait this long on the host.  With time dilation
++     * (system/cpu-timers.c) a nanosecond of the virtual clocks lasts
++     * porty_time_scale host nanoseconds; without this the main loop
++     * would wake up early again and again for every guest timer.
++     */
++    if (timer_list->clock->type == QEMU_CLOCK_VIRTUAL ||
++        timer_list->clock->type == QEMU_CLOCK_VIRTUAL_RT) {
++        int scale = qatomic_read(&porty_time_scale);
++
++        if (scale > 1) {
++            delta = delta > INT64_MAX / scale ? INT64_MAX : delta * scale;
++        }
++    }
++
+     return delta;
+ }
+ 
++/* Porty: host time per unit of guest time; see system/cpu-timers.c. */
++int porty_time_scale = 1;
++
+ /* Calculate the soonest deadline across all timerlists attached
+  * to the clock. This is used for the icount timeout so we
+  * ignore whether or not the clock should be used in deadline

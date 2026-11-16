@@ -40,6 +40,10 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
     assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
     assert.deepEqual([desktop.jitgc, parseConfig('?jitgc=0', {}).jitgc], [true, false]);
+    // time dilation: off by default (phones too), an integer from 1 to 16
+    assert.deepEqual([desktop.timescale, phone.timescale], [1, 1]);
+    assert.deepEqual(['?timescale=8', '?timescale=0', '?timescale=99', '?timescale=x', '?timescale=2.9']
+        .map((q) => parseConfig(q, {}).timescale), [8, 1, 16, 1, 2]);
 
     // desktop keeps the linked size (no patching) when the config fits
     assert.equal(requiredWasmMemoryMb(desktop), 1920);
@@ -166,6 +170,11 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(drives[1], 'if=virtio,index=1,media=disk,format=raw,file=/img/ramdisk.img');
     assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
     assert.ok(!buildQemuArgs(parseConfig('?usb=0', {}), manifest, paths).includes('usb-tablet'));
+    // the RTC follows the dilated virtual clock, and only then
+    assert.ok(!args.includes('-rtc'));
+    const slow = buildQemuArgs(parseConfig('?timescale=4', {}), manifest, paths);
+    assert.equal(slow[slow.indexOf('-rtc') + 1], 'base=utc,clock=vm');
+    assert.deepEqual(slow.filter((a, i) => a !== '-rtc' && slow[i - 1] !== '-rtc'), args);
     const ide = buildQemuArgs(parseConfig('?disk=ide', {}), manifest, paths).filter((a) => a.startsWith('if=ide'));
     assert.ok(ide[0].includes('media=cdrom') && ide[1].endsWith('read-only=on'));
     // commas in the URL are escaped for QEMU's option parser

@@ -48,6 +48,7 @@ export const PARAM_HELP = [
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
+    ['timescale', 'guest time runs this many times slower than real time (1-16, default 1), so Android\'s timeouts allow for a slow emulator.'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
     ['dpi', 'Android screen density (default derived from res).'],
@@ -139,6 +140,9 @@ export function parseConfig(search, env = {}) {
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
         // false: patch 0010's "do not wait for the garbage collector".
         jitgc: boolParam(params, 'jitgc', true),
+        // Patch 0011's time dilation: the guest's clocks (and with them
+        // Android's 60 s Watchdog) run this many times slower. 1: off.
+        timescale: intParam(params, 'timescale', 1, 1, 16),
         cpu: /^[A-Za-z0-9_,+=.-]+$/.test(cpu) ? cpu : 'Nehalem',
         width,
         height,

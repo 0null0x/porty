@@ -272,6 +272,14 @@ export class Emulator {
                         this.notes.push('This QEMU build cannot skip the garbage-collector wait; ?jitgc= ignored.');
                     }
                 }
+                if (this.cfg.timescale > 1) {
+                    if (typeof Module._porty_set_time_scale === 'function') {
+                        const n = Module._porty_set_time_scale(this.cfg.timescale);
+                        this.notes.push(`Guest time runs ${n} times slower than real time (timescale=${n}).`);
+                    } else {
+                        this.notes.push('This QEMU build has no time dilation; ?timescale= ignored.');
+                    }
+                }
                 if (this.cfg.jit < 0) {
                     return;
                 }
