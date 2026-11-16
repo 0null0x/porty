@@ -14,6 +14,12 @@
 name: WebKit memory
 
 on:
+  # A push only prints the glue (and makes the workflow known to GitHub, so
+  # that it can be dispatched from this branch).
+  push:
+    branches: [swarm/webkit-memory]
+    paths:
+      - .github/workflows/webkit-memory.yml
   workflow_dispatch:
     inputs:
       variants:
@@ -52,6 +58,7 @@ defaults:
 jobs:
   plan:
     name: Plan
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -69,7 +76,7 @@ jobs:
 
   dump:
     name: QEMU's JavaScript glue
-    if: ${{ inputs.dump == '1' }}
+    if: ${{ github.event_name == 'push' || inputs.dump == '1' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
