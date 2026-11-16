@@ -63,8 +63,13 @@ jobs:
           names = [n for n in names if n in plan["variants"]]
           boots = os.environ.get("BOOTS", "")
           boots = max(1, min(4, int(boots))) if boots.isdigit() else plan["boots"]
-          include = [{"variant": n, "boot": b} for n in names
-                     for b in range(1, plan["variants"][n].get("boots", boots) + 1)]
+          if plan.get("together"):
+              # one job per boot, all variants in it, the order rotated
+              include = [{"variant": "+".join(names[b % len(names):] + names[:b % len(names)]), "boot": b + 1}
+                         for b in range(boots)]
+          else:
+              include = [{"variant": n, "boot": b} for n in names
+                         for b in range(1, plan["variants"][n].get("boots", boots) + 1)]
           print("matrix=" + json.dumps({"include": include[:20]}))
           ' tests/guest-memory-variants.json | tee -a "$GITHUB_OUTPUT"
 
@@ -197,35 +202,36 @@ jobs:
           echo "published image from the cache: ${CACHE_HIT:-false}"
           python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); d=m["disk"]; print("disk:", {k: d.get(k) for k in ("format", "dir", "size", "sha256")}); print("removed:", [r.get("path") for r in d.get("removed", [])])' out/image/manifest.json
 
-      - name: Build the QEMU arguments
-        id: argv
-        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
-        continue-on-error: true
-        run: |
-          mkdir -p out/gm
-          QUERY="$(python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])); v = p["variants"][sys.argv[2]]; q = v.get("query", ""); print(v.get("base", p["base"]) + ("&" + q if q else ""))' tests/guest-memory-variants.json "$VARIANT")"
-          echo "query: $QUERY"
-          echo "query=$QUERY" >> "$GITHUB_OUTPUT"
-          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/gm/initrd-page.img" "?$QUERY"
-          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
-            "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
-            | awk -v initrd="$PWD/out/gm/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
-            > out/gm/argv-native.txt
-          grep -qxF "$PWD/out/gm/initrd-page.img" out/gm/argv-native.txt
-          cat out/gm/argv-native.txt
-
+      # Runners differ (the same guest work takes twice as long on some CPU
+      # models), so a job boots all its variants ("a+b") one after the
+      # other on its own runner, and times are compared within a job.
       - name: Boot Android and start the apps
         id: boot
-        if: steps.argv.outcome == 'success'
+        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
         continue-on-error: true
-        timeout-minutes: 75
+        timeout-minutes: 85
         run: |
-          python3 -I tests/guest-memory-native.py \
-            --qemu out/native-qemu/qemu-system-x86_64 \
-            --argv-file out/gm/argv-native.txt \
-            --work out/gm/boot \
-            --variants tests/guest-memory-variants.json --variant "$VARIANT" \
-            --facts "$(( BOOT == 1 ? 1 : 0 ))"
+          CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "runner CPU: $CPU, $(nproc) threads"
+          first=1
+          for v in ${VARIANT//+/ }; do
+            mkdir -p "out/gm/$v"
+            QUERY="$(python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])); v = p["variants"][sys.argv[2]]; q = v.get("query", ""); print(v.get("base", p["base"]) + ("&" + q if q else ""))' tests/guest-memory-variants.json "$v")"
+            echo "===== variant $v: $QUERY"
+            node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/gm/$v/initrd-page.img" "?$QUERY"
+            node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+              "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
+              | awk -v initrd="$PWD/out/gm/$v/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+              > "out/gm/$v/argv-native.txt"
+            grep -qxF "$PWD/out/gm/$v/initrd-page.img" "out/gm/$v/argv-native.txt"
+            python3 -I tests/guest-memory-native.py \
+              --qemu out/native-qemu/qemu-system-x86_64 \
+              --argv-file "out/gm/$v/argv-native.txt" \
+              --work "out/gm/$v/boot" --cpu "$CPU" --query "$QUERY" \
+              --variants tests/guest-memory-variants.json --variant "$v" \
+              --facts "$(( BOOT == 1 && first == 1 ? 1 : 0 ))" || true
+            first=0
+          done
 
       - name: Upload the logs
         if: ${{ always() }}
@@ -234,10 +240,10 @@ jobs:
         with:
           name: guest-memory-${{ matrix.variant }}-${{ matrix.boot }}
           path: |
-            out/gm/boot/result.json
-            out/gm/boot/serial.log
-            out/gm/boot/*.png
-            out/gm/argv-native.txt
+            out/gm/*/boot/result.json
+            out/gm/*/boot/serial.log
+            out/gm/*/boot/*.png
+            out/gm/*/argv-native.txt
           retention-days: 5
           if-no-files-found: warn
 
@@ -249,10 +255,9 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          QUERY: ${{ steps.argv.outputs.query }}
         run: |
           set +e
-          details="$(python3 -I tests/guest-memory-report.py out/gm/boot/result.json 2>&1)"
+          details="$(python3 -I tests/guest-memory-report.py out/gm/*/boot/result.json 2>&1)"
           first="$(sed -n 1p <<<"$details")"
           state=success
           grep -q '^ok' <<<"$first" || state=failure
@@ -260,7 +265,7 @@ jobs:
           gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
             -f description="${first:0:140}" -f target_url="$RUN_URL" >/dev/null || true
           {
-            echo "## Guest memory: $VARIANT, boot $BOOT ($QUERY)"
+            echo "## Guest memory: $VARIANT, boot $BOOT"
             echo
             sed -n '1,$p' <<<"$details"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -40,6 +40,7 @@ def summary(r):
 
     return {
         "name": r.get("name", "?"),
+        "cpu": " ".join(w for w in r.get("cpu", "").split() if w[:1].isdigit() or w.isupper())[:24],
         "ok": bool(r.get("booted")) and bool(launches) and all(x.get("drawn") for x in launches)
               and not r.get("error") and not r.get("reboots"),
         "error": r.get("error", "" if r.get("booted") else "not booted"),
@@ -67,7 +68,7 @@ def summary(r):
     }
 
 
-COLUMNS = ("name", "ok", "boot_s", "r1_ms", "r2_ms", "host_s", "warm2", "timeouts", "ss_restart", "avail_home_mb", "avail_end_mb",
+COLUMNS = ("name", "cpu", "ok", "boot_s", "r1_ms", "r2_ms", "host_s", "warm2", "timeouts", "ss_restart", "avail_home_mb", "avail_end_mb",
            "swap_end_mb", "zram_used_mb", "load_end", "majfault", "disk_mb", "kills", "lmkd", "died", "starts",
            "anr", "crash", "reboots")
 
@@ -78,22 +79,22 @@ def main():
         print("no result")
         return
     rows = sorted((summary(r) for r in results), key=lambda s: s["name"])
-    if len(rows) == 1:
-        s = rows[0]
-        print(("ok" if s["ok"] else "FAILED " + str(s["error"])) + ": round 1 %s ms, round 2 %s ms (%s warm), "
-              "disk %s MB, majfault %s, kills %s, swap %s MB, avail %s MB" % (
-                  s["r1_ms"], s["r2_ms"], s["warm2"], s["disk_mb"], s["majfault"], s["kills"], s["swap_end_mb"],
-                  s["avail_end_mb"]))
+    if len(sys.argv) > 1 and sys.argv[1] != "-":
+        print(("ok: " if all(s["ok"] for s in rows) else "FAILED: ") + "; ".join(
+            "%s round 1 %s ms, round 2 %s ms (%s warm), lmkd kills %s" % (
+                s["name"], s["r1_ms"], s["r2_ms"], s["warm2"], s["lmkd"]) for s in rows))
         print()
     print("| " + " | ".join(COLUMNS) + " |")
     print("|" + " --- |" * len(COLUMNS))
     for s in rows:
         print("| " + " | ".join(str(s[c]) for c in COLUMNS) + " |")
-    if len(results) == 1:
+    for r in results if len(results) <= 4 else []:
+        print()
+        print("%s (%s)" % (r.get("name"), r.get("query", "")))
         print()
         print("| round | app | kind | TotalTime ms | host s | avail MB | swap MB | load | majfault | disk MB | kills |")
         print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
-        for x in results[0].get("launches", []):
+        for x in r.get("launches", []):
             a = x.get("after", {})
             print("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
                 x["round"], x["component"].split("/")[0], x["kind"], x.get("TotalTime"), x["host_seconds"],

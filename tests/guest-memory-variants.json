@@ -4,8 +4,8 @@
   "run": [
     "base",
     "lmk-200",
-    "lmk-cached",
-    "mem1024"
+    "lowram-minfree",
+    "lmk-minfree"
   ],
   "boots": 3,
   "apps": [
@@ -14,9 +14,7 @@
     "com.android.calculator2",
     "com.android.deskclock",
     "com.android.contacts",
-    "com.android.calendar",
-    "com.android.documentsui",
-    "com.android.dialer"
+    "com.android.calendar"
   ],
   "variants": {
     "base": {
@@ -46,5 +44,6 @@
       "query": "",
       "boots": 2
     }
-  }
+  },
+  "together": true
 }

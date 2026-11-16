@@ -222,6 +222,8 @@ def main():
     ap.add_argument("--facts", type=int, default=1)
     ap.add_argument("--variants", help="tests/guest-memory-variants.json: the apps, and a variant's setup commands")
     ap.add_argument("--variant", default="")
+    ap.add_argument("--cpu", default="", help="the host's CPU model, for the result")
+    ap.add_argument("--query", default="", help="the page parameters, for the result")
     opts = ap.parse_args()
     if opts.variants:
         with open(opts.variants, encoding="utf-8") as f:
@@ -237,7 +239,7 @@ def main():
     with open(opts.argv_file, encoding="utf-8") as f:
         argv = [line.rstrip("\n") for line in f if line.rstrip("\n") != ""]
 
-    result = {"mode": "guest-memory", "name": opts.name, "booted": False, "milestones": {}, "launches": [], "guest": {}}
+    result = {"mode": "guest-memory", "name": opts.name, "cpu": opts.cpu, "query": opts.query, "booted": False, "milestones": {}, "launches": [], "guest": {}}
     vm = snap.Machine(opts.qemu, argv, opts.work)
     log("QEMU started: " + " ".join(vm.args))
 

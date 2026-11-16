@@ -564,7 +564,9 @@ try {
                 bootedAt = Date.now();
             }
         }
-        if (booted && Date.now() - bootedAt > 90000) {
+        // LINGER: seconds to keep watching after the boot (and the input probe);
+        // a SHELL_INIT command that takes long needs them.
+        if (booted && Date.now() - bootedAt > Math.max(0, Number(process.env.LINGER) || 90) * 1000) {
             break;
         }
     }
