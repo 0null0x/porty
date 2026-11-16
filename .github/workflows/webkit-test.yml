@@ -76,8 +76,9 @@ jobs:
       - name: Matrix
         id: matrix
         env:
-          QUERIES: ${{ inputs.queries || 'wasmmem=1280&jitcap=4000 wasmmem=1280&jitcap=8000 wasmmem=1280&jitcap=15000' }}
-          BROWSERS: ${{ inputs.browsers || 'webkit chrome' }}
+          # A push runs one WebKit job; start the rest by hand.
+          QUERIES: ${{ inputs.queries || 'wasmmem=1280&jitcap=4000' }}
+          BROWSERS: ${{ inputs.browsers || 'webkit' }}
           BENCH: ${{ inputs.bench || 'first' }}
         run: |
           # Only words of the characters page parameters and browser names need.
