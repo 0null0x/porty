@@ -31,6 +31,9 @@
 //   TABLE_GROW      experiment: QEMU's function table grows by this many
 //                   entries at a time instead of one per compiled block
 //                   (the test rewrites qemu/out.js on its way to the browser)
+//   BROWSER_ENV     experiment: options of WebKit's JavaScript engine, set
+//                   as environment variables of the browser, e.g.
+//                   "JSC_useOMGJIT=0" (space separated, JSC_name=value only)
 //   PLAYWRIGHT_DIR  directory that has node_modules/playwright-core
 //   CHROME          Chrome binary for BROWSER=chrome (default: Playwright's
 //                   "chrome" channel, the installed Google Chrome)
@@ -64,12 +67,17 @@ const benchMode = (process.env.BENCH || '1').toLowerCase();
 const benchModules = Math.max(500, Math.min(15000, Number(process.env.BENCH_MODULES) || 8000));
 const coiMode = (process.env.COI || 'auto').toLowerCase();
 const tableGrow = Math.max(0, Math.min(65536, Number(process.env.TABLE_GROW) || 0));
+// Experiment: options for WebKit's JavaScript engine, as environment
+// variables of the browser ("JSC_useOMGJIT=0 JSC_useBBQJIT=0").
+const browserEnv = Object.fromEntries((process.env.BROWSER_ENV || '').split(/\s+/)
+    .map((w) => /^(JSC_[A-Za-z0-9]+)=([A-Za-z0-9._-]+)$/.exec(w)).filter(Boolean).map((m) => [m[1], m[2]]));
+const envText = Object.entries(browserEnv).map(([k, v]) => `${k}=${v}`).join(' ');
 const queryText = (process.env.QUERY || '').trim().replace(/^\?/, '');
 const params = new URLSearchParams(queryText);
 params.set('serial', '1');
 const url = `${siteUrl}?${params}`;
 const statusContext = `${process.env.STATUS_CONTEXT ||
-    (browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome')} ${queryText || 'defaults'}${tableGrow ? ` tablegrow=${tableGrow}` : ''}`.slice(0, 100);
+    (browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome')} ${queryText || 'defaults'}${tableGrow ? ` tablegrow=${tableGrow}` : ''}${envText ? ` ${envText}` : ''}`.slice(0, 100);
 
 const t0 = Date.now();
 const elapsed = () => {
@@ -231,7 +239,10 @@ let page;
 let closing = false;
 try {
     if (browserName === 'webkit') {
-        browser = await playwright.webkit.launch({ headless: true });
+        browser = await playwright.webkit.launch({
+            headless: true,
+            ...(envText ? { env: { ...process.env, ...browserEnv } } : {}),
+        });
     } else {
         browser = await playwright.chromium.launch({
             headless: true,
@@ -253,7 +264,16 @@ try {
     await postStatus('error', `the browser did not start: ${String(e.message || e).split('\n')[0]}`);
     process.exit(0);
 }
-log(`browser: ${result.version}, device=${device}, playwright ${require('playwright-core/package.json').version}`);
+let cpuModel = '';
+try {
+    cpuModel = (/^model name\s*:\s*(.*)$/m.exec(readFileSync('/proc/cpuinfo', 'utf8')) || ['', ''])[1];
+} catch (e) {
+    cpuModel = '';
+}
+result.cpu = cpuModel;
+result.browserEnv = envText;
+log(`browser: ${result.version}, device=${device}, playwright ${require('playwright-core/package.json').version}` +
+    `, cpu ${cpuModel}${envText ? `, browser environment ${envText}` : ''}`);
 page.setDefaultTimeout(120000);
 page.on('pageerror', (e) => note(`pageerror: ${(e && e.stack) || e}`));
 page.on('crash', () => {
@@ -1414,7 +1434,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
     const be = result.bench || {};
     const rows = result.jit.filter((r, i, a) => i === a.length - 1 || i % Math.max(1, Math.floor(a.length / 30)) === 0);
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
-        `## ${result.version}: \`${queryText || 'defaults'}\``,
+        `## ${result.version}: \`${queryText || 'defaults'}\`${envText ? ` with ${envText}` : ''} on ${cpuModel}`,
         '',
         `- **${verdict}**`,
         `- URL: ${url}`,
