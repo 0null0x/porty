@@ -61,6 +61,10 @@ FACTS = (
                       " -e RescueParty -e 'Exit zygote' -e 'Process: ' -e 'Caused by' -e 'porty' -e 'Failed to parse'"
                       " -e 'java.lang' | cut -c1-230 | tail -70"),
     ("system_server", "pidof system_server; ps -A -o PID,ETIME,NAME | grep -e system_server -e zygote -e systemui -e launcher"),
+    ("anr", "logcat -b system,main -d -v time | grep -m1 -A26 'ANR in ' | cut -c1-200"),
+    ("anr_files", "for f in /data/anr/*; do echo $f $(grep -m1 'Cmd line' $f); done"),
+    ("anr_main", "f=$(grep -l 'Cmd line: com.android.systemui' /data/anr/* | head -1); grep -m1 -A50 '\"main\" prio' $f | cut -c1-200;"
+                 " grep -A30 'RenderThread\" ' $f | head -40 | cut -c1-200"),
     ("uptime", "cat /proc/uptime; cat /proc/loadavg"),
 )
 

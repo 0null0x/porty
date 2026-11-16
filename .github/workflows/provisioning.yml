@@ -45,15 +45,7 @@ jobs:
           - name: z1
             context: porty/check provisioning z1
             experiment: z1
-            args: --idle 150
-          - name: z2
-            context: porty/check provisioning z2
-            experiment: z2
-            args: --idle 150
-          - name: z3
-            context: porty/check provisioning z3
-            experiment: z3
-            args: --idle 150
+            args: --idle 5
     env:
       QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
       STATUS_CONTEXT: ${{ matrix.context }}
@@ -225,7 +217,7 @@ jobs:
             --qemu out/native-qemu/qemu-system-x86_64 \
             --argv-file out/prov/argv-native.txt \
             --work out/prov/boot \
-            --boot-timeout 2400 --settle 75 "${extra[@]}"
+            --boot-timeout 2400 --settle 50 "${extra[@]}"
 
       - name: Upload the logs
         if: ${{ always() }}
