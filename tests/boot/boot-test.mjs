@@ -438,9 +438,14 @@ try {
                     'logcat -d -b main -b system -t 12 2>/dev/null | cut -c1-150\r'));
                 await sleep(5000);
             }
-            await page.evaluate(() => globalThis.__porty.serial.send('getprop sys.boot_completed\r'));
+            // A marker the typed command's echo cannot contain: the echo
+            // shows "$(getprop ...)", only the output shows the value.  A
+            // bare "getprop sys.boot_completed" followed by a "1" matched
+            // once when another command's output landed after the echo.
+            await page.evaluate(() => globalThis.__porty.serial.send(
+                'echo BOOTCHK:$(getprop sys.boot_completed):END\r'));
         }
-        if (!booted && /getprop sys\.boot_completed[^\n]*\n\s*1\s*\r?\n/.test(stripAnsi(recent))) {
+        if (!booted && /BOOTCHK:1:END/.test(stripAnsi(recent))) {
             booted = true;
             bootedAt = Date.now();
             log('ANDROID BOOT COMPLETED (sys.boot_completed=1)');
