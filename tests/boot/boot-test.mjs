@@ -635,7 +635,7 @@ async function inputProbe() {
         'echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END',
     ].join('; ');
     // The busiest threads over one second of the guest's time.
-    const guestTop = 'top -b -H -n 1 -d 1 -m 14 -o %CPU,PID,TID,S,CMD,NAME 2>&1 | tail -15 | cut -c1-110 | sed "s/^/TOP|/"';
+    const guestTop = 'top -b -H -n 1 -d 1 -m 14 -s 1 -o %CPU,PID,TID,PR,S,CMD,NAME 2>&1 | tail -15 | cut -c1-110 | sed "s/^/TOP|/"';
     // How fast the guest runs a hot loop now: seconds for 20000 rounds of
     // the shell's arithmetic.  Comparable between runs and conditions.
     const calibrate = async (label) => {
@@ -670,8 +670,18 @@ async function inputProbe() {
     };
     const clock0 = await guestClock();
     log(`INPUT PROBE: guest clock ${clock0 ? `${clock0.tod.toFixed(3)} s of its day, read back in ${clock0.at - clock0.sent} ms` : 'not read'}`);
-    await send(`${guestSample}; ${guestLog}\r`);
-    await sleep(25000);
+    // surfaceflinger's scheduling: policy 1 is SCHED_FIFO, which the kernel
+    // lets have sched_rt_runtime_us of every second before anything else.
+    await send(`${guestSample}; echo SFSCHED:$(for t in /proc/$(pidof surfaceflinger)/task/*; do ` +
+        'cut -d" " -f2,40,41 $t/stat; done | sort | uniq -c | tr "\n" ";")' +
+        `:rt_runtime $(cat /proc/sys/kernel/sched_rt_runtime_us):END; ${guestLog}; echo LOGDONE:$((1+1)):END\r`);
+    // The event log must have answered before the tap, or the shell is
+    // still waiting for it during the launch.
+    for (let i = 0; i < 36 && !logDone; i++) {
+        await sleep(5000);
+    }
+    log(`INPUT PROBE: the event log ${logDone ? 'answered' : 'did not answer in 180 s'} before the tap`);
+    logDone = 0;
     let prevSt = marks.st;
     let prevPs = marks.ps;
     const before = await pageSample(true);
