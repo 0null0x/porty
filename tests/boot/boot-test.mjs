@@ -434,8 +434,9 @@ async function inputProbe() {
     let lastFocus = '';
     // Marker lines of the guest, newest of each kind (the output of the
     // commands, never their echo: an echo has "$(" after the colon).
-    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map() };
+    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map(), top: [] };
     let pendingLine = '';
+    let logDone = 0;
     const sleep = async (ms) => {
         await new Promise((resolve) => setTimeout(resolve, ms));
         const text = await page.evaluate(() => (globalThis.__cap ? globalThis.__cap.splice(0).join('') : ''));
@@ -485,7 +486,17 @@ async function inputProbe() {
             }
             m = line.match(/LMK:(\d+):(\d+):(\d+):END/);
             if (m) {
-                marks.lmk = { kernel: Number(m[1]), events: Number(m[2]), anr: Number(m[3]) };
+                marks.lmk = { ...(marks.lmk || { events: -1, anr: -1 }), kernel: Number(m[1]) };
+            }
+            m = line.match(/AMC:(\d+):(\d+):END/);
+            if (m) {
+                marks.lmk = { ...(marks.lmk || { kernel: -1 }), events: Number(m[1]), anr: Number(m[2]) };
+            }
+            if (/TOP\|/.test(line) && !line.includes('sed "s')) {
+                marks.top.push(line.replace(/^.*TOP\|/, '').replace(/\r$/, ''));
+            }
+            if (/LOGDONE:2:END/.test(line)) {
+                logDone = Date.now();
             }
             if (/CALDONE:\d+:END/.test(line) && !marks.cal) {
                 marks.cal = Date.now();
@@ -596,24 +607,31 @@ async function inputProbe() {
         };
     }, setBase);
     // One line of markers from the guest; see the parser in sleep().
+    // During the launch only what /proc answers by itself: logcat waits for
+    // logd's reader, which runs at background priority, and dumpsys for
+    // system_server; with the CPU this busy neither came back for ten
+    // minutes and the shell hung on them (run 43903544035).
     const EVENTS = 'am_proc_start|am_proc_died|am_kill|am_activity_launch_time|am_low_memory|am_anr|' +
         'am_proc_bound|am_restart_activity|am_on_resume_called|am_create_activity|am_focused_stack';
     const guestSample = [
         'echo ST:$(head -1 /proc/stat):$(grep -E "^(pgmajfault|pswpin|pswpout) " /proc/vmstat)' +
             ':$(cat /proc/loadavg):$(grep -E "^(MemFree|MemAvailable|SwapTotal|SwapFree):" /proc/meminfo):END',
         'echo PS:$(for n in system_server surfaceflinger com.android.gallery3d com.android.launcher3 ' +
-            'com.android.systemui zygote64 zygote; do for p in $(pidof $n); do ' +
+            'com.android.systemui zygote64 zygote logd; do for p in $(pidof $n); do ' +
             'echo $n/$(cut -d" " -f14-15 /proc/$p/stat | tr " " +); done; done):END',
-        // The event log once per sample, into a file the next commands read.
+        'echo LMK:$(dmesg | grep -c -i -E "lowmemorykiller|out of memory|killed process"):0:0:END',
+    ].join('; ');
+    // Before the tap and after the launch: the activity manager's events
+    // and the focused window.
+    const guestLog = [
         `logcat -b events -d | grep -E "${EVENTS}" > /data/local/tmp/porty-am.txt`,
-        'echo LMK:$(dmesg | grep -c -i -E "lowmemorykiller|out of memory|killed process")' +
-            ':$(grep -c -E "am_low_memory|am_kill" /data/local/tmp/porty-am.txt)' +
+        'echo AMC:$(grep -c -E "am_low_memory|am_kill" /data/local/tmp/porty-am.txt)' +
             ':$(grep -c am_anr /data/local/tmp/porty-am.txt):END',
-        'tail -6 /data/local/tmp/porty-am.txt | cut -c1-170 | sed "s/^/EV|/"',
+        'tail -24 /data/local/tmp/porty-am.txt | cut -c1-170 | sed "s/^/EV|/"',
         'echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END',
     ].join('; ');
     // The busiest threads over one second of the guest's time.
-    const guestTop = 'top -b -H -n 1 -d 1 -m 12 -o %CPU,PID,TID,S,CMD,NAME 2>&1 | tail -13 | cut -c1-110 | sed "s/^/TOP|/"';
+    const guestTop = 'top -b -H -n 1 -d 1 -m 14 -o %CPU,PID,TID,S,CMD,NAME 2>&1 | tail -15 | cut -c1-110 | sed "s/^/TOP|/"';
     // How fast the guest runs a hot loop now: seconds for 20000 rounds of
     // the shell's arithmetic.  Comparable between runs and conditions.
     const calibrate = async (label) => {
@@ -648,7 +666,7 @@ async function inputProbe() {
     };
     const clock0 = await guestClock();
     log(`INPUT PROBE: guest clock ${clock0 ? `${clock0.tod.toFixed(3)} s of its day, read back in ${clock0.at - clock0.sent} ms` : 'not read'}`);
-    await send(`${guestSample}\r`);
+    await send(`${guestSample}; ${guestLog}\r`);
     await sleep(25000);
     let prevSt = marks.st;
     let prevPs = marks.ps;
@@ -671,12 +689,13 @@ async function inputProbe() {
     let peakInFlight = 0;
     result.firstChangeS = -1;   // 10% of the screen differs: the starting window
     result.screenChangedS = -1; // 40%: another window covers the launcher
-    result.focusedS = -1;
     const samples = [];
+    const timeline = [];
+    let lastDiff = 0;
     while (Date.now() - tapAt < probeWaitMs) {
         if (guestEveryMs && Date.now() >= nextGuest) {
             nextGuest = Date.now() + guestEveryMs;
-            await send(`${guestSample}${guestRound++ % 3 === 1 ? `; ${guestTop}` : ''}\r`);
+            await send(`${guestSample}${guestRound++ % 2 === 1 ? `; ${guestTop}` : ''}\r`);
         }
         await sleep(5000);
         let now;
@@ -687,6 +706,10 @@ async function inputProbe() {
             continue;
         }
         peakInFlight = Math.max(peakInFlight, now.disk ? now.disk.inFlight : 0);
+        if (Math.abs(now.diff - lastDiff) >= 1) {
+            lastDiff = now.diff;
+            timeline.push(`${since()}s:${now.diff}%`);
+        }
         if (result.firstChangeS < 0 && now.diff >= 10) {
             result.firstChangeS = since();
             log(`INPUT PROBE: launch t+${since()} s: ${now.diff}% of the screen changed`);
@@ -699,10 +722,6 @@ async function inputProbe() {
         if (!shotDone && since() >= 15) {
             shotDone = true;
             await shot('after-touch', true);
-        }
-        if (result.focusedS < 0 && /gallery/i.test(lastFocus)) {
-            result.focusedS = since();
-            log(`INPUT PROBE: Gallery in front: ${lastFocus} after ${since()} s (polled every 30 s)`);
         }
         if (Date.now() >= nextLine || now.exited) {
             nextLine = Date.now() + 30000;
@@ -752,21 +771,27 @@ async function inputProbe() {
         }
         // Done: Gallery has the focus and its window is on the screen; one
         // more round of samples for the event log's launch time.
-        if (result.screenChangedS >= 0 && (result.focusedS >= 0 || !guestEveryMs) &&
-            since() - Math.max(result.focusedS, result.screenChangedS) >= 35) {
+        if (!launchOnly && result.screenChangedS >= 0 && since() - result.screenChangedS >= 35) {
             break;
         }
     }
-    if (result.focusedS < 0 && guestEveryMs) {
-        log(`INPUT PROBE: Gallery in front: not within ${Math.round(probeWaitMs / 1000)} s`);
+    result.screenTimeline = timeline.join(' ');
+    log(`INPUT PROBE: how much of the screen differed from the home screen, when it changed: ${result.screenTimeline || 'never'}`);
+    for (const line of marks.top) {
+        log(`INPUT PROBE: top| ${line}`);
     }
     // The event log's own account, in guest time since the tap.
     const clock1 = await guestClock();
-    await send('echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END; ' +
-        `logcat -b events -d | grep -E "${EVENTS}" | tail -24 | cut -c1-170 | sed "s/^/EV|/"; ` +
+    lastFocus = '';
+    await send(`${guestLog}; ` +
         'logcat -d -b main -b system | grep -E "Displayed |ANR in |Skipped [0-9]+ frames|lowmemorykiller|Low on memory" ' +
-        '| tail -12 | cut -c1-170\r');
-    await sleep(30000);
+        '| tail -12 | cut -c1-170; echo LOGDONE:$((1+1)):END\r');
+    // These wait for logd and system_server, which may be starved.
+    for (let i = 0; i < 36 && !logDone; i++) {
+        await sleep(5000);
+    }
+    result.logAnsweredS = logDone ? Math.round((logDone - tapAt) / 1000) : -1;
+    result.focusedAtEnd = /gallery/i.test(lastFocus);
     result.focusAtEnd = lastFocus.replace(/^mCurrentFocus=/, '').slice(0, 80);
     const ts = before.timescale || 8;
     const day = (d) => (d < -43200 ? d + 86400 : d);
@@ -1130,8 +1155,10 @@ stopThrottle();
 const verdict = exitCode ? 'failed' : (booted ? 'booted' : 'still booting at the deadline');
 const secs = (v) => (v >= 0 ? `${v} s` : 'not seen');
 const launchLine = launchResult
-    ? `Gallery: focused ${secs(launchResult.focusedS)}, first frame ${secs(launchResult.firstFrameS)}, ` +
-        `screen changed ${secs(launchResult.screenChangedS)} (${launchResult.conditions})`
+    ? `Gallery: screen changed ${secs(launchResult.screenChangedS)} (${launchResult.screenTimeline}), ` +
+        `first frame by the event log ${secs(launchResult.firstFrameS)}, ` +
+        `${launchResult.focusedAtEnd ? 'focused' : 'not focused'} at ${secs(launchResult.logAnsweredS)} ` +
+        `(${launchResult.conditions})`
     : '';
 log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}${launchLine ? `; ${launchLine}` : ''}`);
 log(`network: ${netSummary()}; ${workerCount} workers`);
