@@ -170,7 +170,8 @@ jobs:
           mkdir "$RUNNER_TEMP/qemu-native"
           cd "$RUNNER_TEMP/qemu-native"
           "$RUNNER_TEMP/qemu-wasm/configure" --without-default-features --enable-tools \
-            --disable-system --disable-user --disable-docs --disable-werror
+            --disable-system --disable-user --disable-docs --disable-werror \
+            --with-coroutine=ucontext
           ninja qemu-img
 
       - name: Read a miniature system disk back through qcow2 and porty

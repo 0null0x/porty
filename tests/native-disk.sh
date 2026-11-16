@@ -9,7 +9,8 @@
 # usage: tests/native-disk.sh <qemu-img> <image-dir>
 #   <qemu-img>   from the tree made by build/apply-patches.sh, e.g.
 #                configure --without-default-features --enable-tools
-#                --disable-system --disable-user && ninja qemu-img
+#                --disable-system --disable-user --with-coroutine=ucontext
+#                && ninja qemu-img
 #   <image-dir>  output of scripts/prepare-image.sh
 set -euo pipefail
 
