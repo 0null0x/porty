@@ -93,9 +93,17 @@ def boot(vm, opts, result):
                 if vm.rearm:
                     vm.rearm = False
                     awake = False
-                if not awake and opts.wake_lock:
+                if not awake:
                     awake = True
-                    vm.sh("echo porty > /sys/power/wake_lock", 30)
+                    if opts.wake_lock:
+                        vm.sh("echo porty > /sys/power/wake_lock", 30)
+                    if opts.trace:
+                        # Diagnosis: kernel messages and Android's own account of
+                        # crashes and shutdowns on the serial console.
+                        vm.sh("echo 7 > /proc/sys/kernel/printk; (logcat -b all -v time -s RescueParty:* "
+                              "ShutdownThread:* PowerManagerService:W AndroidRuntime:E init:* Zygote:* "
+                              "SystemServer:E ActivityManager:W BootReceiver:* Watchdog:* DEBUG:F porty:* "
+                              "PackageManager:W > /dev/kmsg 2>&1 &)", 30)
             if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
                 return vm.elapsed()
         if now - last_report >= 60:
@@ -174,6 +182,8 @@ def main():
     ap.add_argument("--settle", type=float, default=60, help="seconds between sys.boot_completed=1 and the checks")
     ap.add_argument("--wake-lock", type=int, default=1,
                     help="1: take a kernel wake lock as soon as the shell answers, so the machine cannot suspend")
+    ap.add_argument("--trace", type=int, default=0,
+                    help="1: kernel messages and Android's crash and shutdown messages on the serial console")
     ap.add_argument("--idle", type=float, default=0,
                     help="seconds to leave the guest alone after the checks, then look at the screen again")
     ap.add_argument("--min-lit", type=float, default=20.0, help="percent of the screen that must not be black")

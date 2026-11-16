@@ -42,14 +42,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: hide-wizard
+          - name: baseline
+            context: porty/check provisioning x0
+            experiment: ''
+            args: --trace 1
+          - name: hide-only
             context: porty/check provisioning x1
-            experiment: hide-wizard
-            args: --idle 200
+            experiment: hide-only
+            args: --trace 1
           - name: hide-wizard-taskbar
             context: porty/check provisioning x2
             experiment: hide-wizard-taskbar
-            args: --idle 200 --wake-lock 0
+            args: --trace 1
     env:
       QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
       STATUS_CONTEXT: ${{ matrix.context }}
@@ -220,7 +224,7 @@ jobs:
             --qemu out/native-qemu/qemu-system-x86_64 \
             --argv-file out/prov/argv-native.txt \
             --work out/prov/boot \
-            --boot-timeout 2400 --settle 75 $EXTRA_ARGS
+            --boot-timeout 2400 --settle 75 $EXTRA_ARGS | cut -c1-2000
 
       - name: Upload the logs
         if: ${{ always() }}
