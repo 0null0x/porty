@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { snapshotVersion } from '../../web/js/diskcache.js';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
 const puppeteer = require('puppeteer-core');
@@ -112,8 +113,11 @@ try {
         assert.equal(lines[1], `url ${url}snapshot`);
         assert.equal(lines[2], `chunk-size ${manifest.chunk_size}`);
         assert.equal(lines[3], `size ${manifest.uncompressed_size}`);
+        // "v" names the chunk and "s" the snapshot (the disk cache's version).
+        const version = snapshotVersion(manifest);
+        assert.match(version, /^[0-9a-f]{16}$/);
         assert.deepEqual(lines.slice(4), manifest.chunks.map((c) =>
-            `chunk ${c.size} ${c.sha256} ${c.file}?v=${c.sha256.slice(0, 16)}`));
+            `chunk ${c.size} ${c.sha256} ${c.file}?v=${c.sha256.slice(0, 16)}&s=${version}`));
         ok(`the chunk index for QEMU lists all ${manifest.chunks.length} chunks with size and SHA-256`);
 
         // 2. The stream ends: the normal running UI, without a boot.
@@ -128,7 +132,7 @@ try {
         assert.equal(p.stats.chunksFetched, manifest.chunks.length);
         assert.equal(p.stats.progress, 1);
         assert.deepEqual(p.snapshot.urls, manifest.chunks.map((c) =>
-            `${url}snapshot/${c.file}?v=${c.sha256.slice(0, 16)}`));
+            `${url}snapshot/${c.file}?v=${c.sha256.slice(0, 16)}&s=${version}`));
         assert.equal(p.note, '');
         ok('every chunk was fetched (synchronous XHR in a worker, through the service worker); then the running UI');
         const crumb = await page.evaluate(() => JSON.parse(localStorage.getItem('porty.run')));

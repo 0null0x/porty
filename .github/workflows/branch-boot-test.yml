@@ -1,0 +1,315 @@
+# Boots a work branch's page in headless Chrome without deploying it:
+# assembles the site of a ref from the caches (the QEMU-Wasm build, the
+# Android image and, if one was made for that ref, the resume snapshot),
+# serves it on the runner and runs tests/boot/boot-test.mjs against it.
+# The live site only ever has main; this is how page changes are tried in a
+# real browser before they are merged.
+#
+# Start it by hand, for example
+#   gh workflow run branch-boot-test.yml -R <owner>/<repo> --ref swarm/<you> \
+#     -f query='jitcap=15000' -f minutes=14 -f no_http_cache=true
+# on a branch that has this file (git checkout origin/<a branch that has
+# it> -- .github/workflows/branch-boot-test.yml tests/ui/serve.py
+# tests/boot/visit-report.py), or from a branch that has it with
+# -f ref=<branch or commit>.  Caches are per branch: a run can restore what
+# its own branch (--ref) and main saved.  So a snapshot made by snapshot.yml
+# on swarm/<you> is only found by a run started with --ref swarm/<you>;
+# with -f ref= from another branch the site is assembled without it, unless
+# main has a snapshot for the same image, patches and guest-shaping code.
+#
+# The run never fails, because every failed run emails the repository
+# owner.  The verdict is the commit status "porty/branch-boot <query>" on
+# the tested commit and the job summary; the log has everything else
+# (screenshots as base64 JPEG, see tests/boot/extract-shots.py).
+name: Branch boot test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to test (default, the branch the run is started on)
+        type: string
+        default: ''
+      query:
+        description: Page parameters, e.g. jitcap=15000 or diskcache=0
+        type: string
+        default: ''
+      minutes:
+        description: Minutes per visit (a resume needs about 10 before the input probe starts)
+        type: number
+        default: 14
+      cpu_throttle:
+        description: Slow the browser's threads down this many times (CPU_THROTTLE of the boot test; 1 is off)
+        type: number
+        default: 1
+      no_http_cache:
+        description: Turn the browser's HTTP cache off (NO_HTTP_CACHE of the boot test, and Chrome without a disk cache)
+        type: boolean
+        default: false
+      visits:
+        description: Visits in the same browser profile, one after the other (2 shows what a returning visitor gets)
+        type: number
+        default: 1
+      net_mbps:
+        description: Limit the runner's own web server to this many Mbit/s (0 is unlimited)
+        type: number
+        default: 0
+      pages_like:
+        description: Serve without COOP/COEP headers, as GitHub Pages does (the service worker then adds them)
+        type: boolean
+        default: false
+      env:
+        description: More environment for the boot test, NAME=value separated by spaces (e.g. INPUT_PROBE=0 PROBE_WAIT=600)
+        type: string
+        default: ''
+  push:
+    branches: ['swarm/**']
+    paths:
+      - .github/workflows/branch-boot-test.yml
+      - web/coi-serviceworker.js
+      - web/js/diskcache.js
+      - web/js/diskcache-sw.js
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: branch-boot-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.query }}-${{ inputs.cpu_throttle }}-${{ inputs.no_http_cache }}-${{ inputs.visits }}-${{ inputs.net_mbps }}-${{ inputs.pages_like }}-${{ inputs.env }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  boot:
+    name: Boot the branch's site in headless Chrome
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    # Nothing here may turn the run red (see above).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          git log -1 --oneline
+
+      # ------------------------------------------------- site, from caches ---
+      # The keys of build-and-deploy.yml, branch-check.yml and snapshot.yml.
+      # QEMU-Wasm is never built here (hours): branch-check.yml builds and
+      # caches it when a branch changes the patches.
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        if: steps.versions.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Restore the prepared Android image
+        id: image-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      # A branch that changed how the image is made has none cached: prepare
+      # it from the ISO, as branch-check.yml does.  (No snapshot fits it.)
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Prepare the Android image from the ISO
+        id: image
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/fetch-android.sh out/iso
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
+          rm -rf out/iso
+
+      - name: Restore the resume snapshot
+        id: snapshot-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/artifact/snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}-${{ hashFiles('web/js/qemu-args.js', 'web/js/config.js', 'web/js/boot-diet.js', 'web/js/initramfs.js', 'scripts/snapshot/**') }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        with:
+          node-version: 22
+
+      - name: Assemble the site
+        id: site
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && (steps.image-cache.outputs.cache-hit == 'true' || steps.image.outcome == 'success')
+        continue-on-error: true
+        env:
+          HAVE_SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          SHA: ${{ steps.versions.outputs.sha }}
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
+          extra=()
+          if [[ "$HAVE_SNAPSHOT" == true ]]; then
+            extra=(--snapshot out/artifact/snapshot)
+          else
+            echo "no resume snapshot in the caches this run can read: the page will boot"
+          fi
+          scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$SHA" "${extra[@]}"
+          du -sb dist
+          cat dist/build.json
+
+      # ----------------------------------------------------------- visits ---
+      - name: Boot
+        id: boot
+        if: steps.site.outcome == 'success'
+        continue-on-error: true
+        env:
+          PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+          # Live "porty/boot" statuses go to the commit the run was started
+          # on; with another ref they would sit on the wrong commit.
+          GITHUB_TOKEN: ${{ inputs.ref == '' && github.token || '' }}
+          QUERY: ${{ inputs.query }}
+          MINUTES: ${{ inputs.minutes || 14 }}
+          CPU_THROTTLE: ${{ inputs.cpu_throttle || 1 }}
+          NO_HTTP_CACHE: ${{ inputs.no_http_cache && '1' || '' }}
+          VISITS: ${{ inputs.visits || 1 }}
+          NET_MBPS: ${{ inputs.net_mbps || 0 }}
+          PAGES_LIKE: ${{ inputs.pages_like }}
+          EXTRA_ENV: ${{ inputs.env }}
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium)"
+          export CHROME SITE_URL="http://127.0.0.1:8080/"
+          # Runner CPUs differ (an EPYC 7763 runs the guest about half as
+          # fast as a Xeon 6975P-C): every visit's line names the CPU, and
+          # visits are only comparable within one job.
+          cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || true)"
+          echo "runner CPU: ${cpu:-unknown}, $(nproc) threads"
+          free -m
+          "$CHROME" --version
+          work="$RUNNER_TEMP/branch-boot"
+          mkdir -p "$work"
+          # NAME=value pairs for the boot test; nothing else is accepted.
+          for pair in $EXTRA_ENV; do
+            if [[ "$pair" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_.,:/@%+=-]*$ ]]; then
+              export "${pair?}"
+              echo "boot test environment: $pair"
+            else
+              echo "::warning::ignored '$pair' (not NAME=value)"
+            fi
+          done
+          # The same profile for every visit: the second one finds the
+          # service worker, Cache Storage and HTTP cache of the first.
+          export USER_DATA_DIR="$work/profile"
+          if [[ -n "$NO_HTTP_CACHE" ]]; then
+            # Also for harnesses that do not know NO_HTTP_CACHE yet.
+            export CHROME_ARGS="${CHROME_ARGS:-} --disk-cache-size=1 --media-cache-size=1"
+          fi
+          serve=(python3 tests/ui/serve.py dist 8080 "--log=$work/server.log")
+          [[ "$PAGES_LIKE" == true ]] || serve+=(--isolate)
+          [[ "$NET_MBPS" == 0 ]] || serve+=("--mbps=$NET_MBPS")
+          "${serve[@]}" &
+          server=$!
+          for _ in $(seq 50); do
+            curl -fsS -o /dev/null "${SITE_URL}index.html" 2>/dev/null && break
+            sleep 0.2
+          done
+          : > "$work/server.log"
+          : > "$work/report.txt"
+          for visit in $(seq "$VISITS"); do
+            echo "::group::visit $visit of $VISITS"
+            before="$(wc -l < "$work/server.log")"
+            node tests/boot/boot-test.mjs 2>&1 | tee "$work/visit-$visit.log" || true
+            tail -n "+$((before + 1))" "$work/server.log" > "$work/server-$visit.log"
+            echo "::endgroup::"
+            line="$(python3 -I tests/boot/visit-report.py "visit $visit" "$work/visit-$visit.log" "$work/server-$visit.log" || true)"
+            echo "${line:-visit $visit|error|no report}; runner CPU: ${cpu:-unknown}" | tee -a "$work/report.txt"
+            du -sh "$USER_DATA_DIR" || true
+          done
+          kill "$server" 2>/dev/null || true
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.versions.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          QEMU: ${{ steps.qemu-cache.outputs.cache-hit }}
+          IMAGE_CACHE: ${{ steps.image-cache.outputs.cache-hit }}
+          IMAGE: ${{ steps.image.outcome }}
+          SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          SITE: ${{ steps.site.outcome }}
+          QUERY: ${{ inputs.query }}
+          REF: ${{ inputs.ref }}
+          SHORT: c${{ inputs.cpu_throttle || 1 }}${{ inputs.no_http_cache && ' nocache' || '' }} v${{ inputs.visits || 1 }} ${{ inputs.net_mbps || 0 }}M${{ inputs.pages_like && ' pages' || '' }}
+          CONDITIONS: cpu/${{ inputs.cpu_throttle || 1 }} ${{ inputs.no_http_cache && 'no-http-cache' || 'http-cache' }} ${{ inputs.net_mbps || 0 }}Mbit ${{ inputs.pages_like && 'pages-like' || 'own-headers' }} ${{ inputs.env }}
+        run: |
+          report="$RUNNER_TEMP/branch-boot/report.txt"
+          state=error
+          if [[ "$CHECKOUT" != success ]]; then text="could not check out '${REF}'"
+          elif [[ "$QEMU" != true ]]; then text="no QEMU-Wasm build cached for this ref's patches (run Branch check on it first)"
+          elif [[ "$SITE" != success ]]; then text="the site could not be assembled (image cache: ${IMAGE_CACHE:-miss}, prepared: ${IMAGE:-no})"
+          elif [[ ! -s "$report" ]]; then text="the boot test did not report"
+          else
+            state="$(tail -n 1 "$report" | cut -d'|' -f2)"
+            text="$(sed 's/|[a-z]*|/: /' "$report" | tr '\n' ' ')"
+          fi
+          snapshot="no resume snapshot"
+          if [[ "$SNAPSHOT" == true ]]; then snapshot="with the resume snapshot"; fi
+          {
+            echo "## Branch boot test"
+            echo
+            echo "- Commit: \`${SHA:-?}\` ${REF:+(ref \`$REF\`)}, query \`${QUERY:-defaults}\`, $snapshot"
+            echo "- Conditions: $CONDITIONS"
+            if [[ -s "$report" ]]; then
+              while IFS='|' read -r label result line; do
+                echo "- **$label** ($result): $line"
+              done < "$report"
+            else
+              echo "- $text"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$state: $text"
+          if [[ -n "${SHA:-}" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" -f state="$state" \
+              -f context="$(printf 'porty/branch-boot %s [%s]' "${QUERY:-defaults}" "$SHORT" | cut -c1-100)" \
+              -f description="$(printf '%s' "$text" | cut -c1-139)" -f target_url="$RUN_URL" >/dev/null || true
+          fi
+          exit 0

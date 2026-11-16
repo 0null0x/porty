@@ -185,7 +185,8 @@ Threads need `SharedArrayBuffer`, which browsers expose only to
 cross-origin-isolated pages (COOP `same-origin` + COEP). GitHub Pages cannot
 set response headers, so the page loads
 [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) 0.1.7
-(MIT, vendored unmodified): a service worker that re-serves every response
+(MIT, vendored; since 2026-11-16 with two marked additions for the disk
+cache, `web/js/diskcache-sw.js`): a service worker that re-serves every response
 with those headers and reloads the page once. QEMU-Wasm's own demo site
 uses the same file on GitHub Pages.
 

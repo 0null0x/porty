@@ -320,3 +320,6 @@ console.log('unit: all checks passed');
 
 // The boot diet (appended initramfs archive, ?diet= and ?props=) has its own file.
 await import('./boot-diet.test.mjs');
+
+// So has the disk cache (web/js/diskcache.js and diskcache-sw.js).
+await import('./diskcache.test.mjs');

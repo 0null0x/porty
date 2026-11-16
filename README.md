@@ -187,6 +187,7 @@ and say how far it got, with that message.
 | `props` | | More Android properties, `key=value,key=value` (letters, digits, `.`, `_`, `-`); they override `diet`, for example `props=debug.sf.nobootanimation=0` |
 | `ttmfix` | 1 | `0` leaves the kernel module `ttm.ko` as shipped. By default the page replaces it at boot with a copy in which 2 bytes differ, because this kernel panics on a warning in `ttm_bo_vm_open` whenever Android collects stack traces (after every "not responding" app); see [docs/PLAN.md](docs/PLAN.md) |
 | `resume` | auto | A site that publishes a snapshot resumes the saved, already booted Android instead of booting. `0` always boots; `1` resumes even when the address sets machine parameters (the snapshot's own settings then apply) |
+| `diskcache` | on, 1536 | The 2 MiB chunks of the system image and the chunks of the saved Android are stored on the device (Cache Storage, through the service worker) once downloaded, so the guest's re-reads and later visits need neither the network nor the browser's HTTP cache. `0` stores and reads nothing; a number of 64 or more is the limit in MB, after which nothing more is stored. A new image or snapshot replaces the stored one. The start page says how much is stored and can delete it |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |
 | `cmdline` | | Replace the whole kernel command line |
 | `qemu` | | Extra QEMU arguments |

@@ -12,6 +12,10 @@
 //   DUMP_FILES     comma-separated paths in QEMU's in-memory filesystem to
 //                  print at the end, e.g. the -D log of
 //                  QUERY="qemu=-d%20cpu_reset,guest_errors%20-D%20/tmp/q.log"
+//   USER_DATA_DIR  browser profile directory to use and keep, so that a
+//                  second run is a second visit (service worker, Cache
+//                  Storage and HTTP cache of the first are there)
+//   CHROME_ARGS    more Chrome flags, space separated
 //
 // Exit status: 0 whatever happened to Android (the verdict is in the log,
 // the job summary and a warning annotation: a red run would e-mail the
@@ -51,10 +55,12 @@ const browser = await puppeteer.launch({
     executablePath: process.env.CHROME || '/usr/bin/google-chrome',
     headless: true,
     protocolTimeout: 300000,
+    ...(process.env.USER_DATA_DIR ? { userDataDir: process.env.USER_DATA_DIR } : {}),
     args: [
         '--no-sandbox', '--disable-gpu', '--window-size=480,900',
         '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
         '--disable-backgrounding-occluded-windows',
+        ...(process.env.CHROME_ARGS || '').split(/\s+/).filter(Boolean),
     ],
 });
 const page = await browser.newPage();
@@ -570,6 +576,19 @@ try {
     }
     await shot('final', true);
     await dumpFiles();
+    // Where the start's time went, and what the disk cache did (pages
+    // before the disk cache have neither).
+    const visit = await page.evaluate(async () => {
+        const e = globalThis.__porty;
+        const dc = e && e.diskCache;
+        return {
+            timings: (e && e.timings) || null,
+            diskCache: dc ? await dc.stats().catch(() => null) : null,
+            stored: dc ? await dc.usage(e.manifest && e.manifest.disk, e.snapshot).catch(() => null) : null,
+            controlled: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+        };
+    }).catch((e) => ({ error: e.message }));
+    log(`VISIT: ${JSON.stringify(visit)}`);
 } catch (e) {
     log(`TEST ERROR: ${e.stack || e}`);
     await shot('error', true);

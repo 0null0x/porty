@@ -1,6 +1,20 @@
 /*! coi-serviceworker v0.1.7 - Guido Zuidhof and contributors, licensed under MIT */
 let coepCredentialless = false;
 if (typeof window === 'undefined') {
+    // Porty: chunks of the system image and of the snapshot are kept in
+    // Cache Storage (js/diskcache-sw.js).  Without that file the worker
+    // still does its first job, the COOP/COEP headers.
+    try {
+        importScripts("js/diskcache-sw.js?v=1");
+    } catch (e) {
+        console.warn("Porty disk cache not loaded:", e);
+    }
+    self.addEventListener("message", (ev) => {
+        if (self.portyDiskCache) {
+            self.portyDiskCache.onMessage(ev);
+        }
+    });
+
     self.addEventListener("install", () => self.skipWaiting());
     self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 
@@ -24,6 +38,13 @@ if (typeof window === 'undefined') {
     self.addEventListener("fetch", function (event) {
         const r = event.request;
         if (r.cache === "only-if-cached" && r.mode !== "same-origin") {
+            return;
+        }
+
+        // Porty: a disk chunk is answered from the device if it is there.
+        const chunk = self.portyDiskCache ? self.portyDiskCache.respond(event) : null;
+        if (chunk) {
+            event.respondWith(chunk);
             return;
         }
 

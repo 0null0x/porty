@@ -49,13 +49,19 @@ window.coi = {
       <li><strong>Experimental and slow.</strong> Every x86 instruction is translated in the
         browser. Booting takes minutes, not seconds, and may not finish on a phone.</li>
       <li><strong>Large download.</strong> Tens of MB to start, then several hundred MB of the
-        system image are fetched on demand while Android boots. Use Wi-Fi.</li>
+        system image are fetched on demand while Android boots. Use Wi-Fi. What was downloaded
+        is kept on this device for the next visit.</li>
       <li><strong>Needs memory.</strong> <span id="memnote">1 GB or more of RAM is reserved for the
         guest.</span> Close other tabs first.</li>
       <li><strong>Live session.</strong> Nothing is saved. Reloading the page starts from scratch.</li>
       <li><strong>No Google Play, no Google apps.</strong> This is the open-source Android-x86 image.</li>
       <li><strong>No network, no cellular, no SMS, no calls, no camera, no sound.</strong></li>
     </ul>
+
+    <p id="diskcache-note" class="note" role="status" hidden>
+      <span id="diskcache-text"></span>
+      <button id="diskcache-clear" type="button" hidden>Delete them</button>
+    </p>
 
     <details id="advanced">
       <summary>Settings and URL parameters</summary>
