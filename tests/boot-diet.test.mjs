@@ -10,7 +10,7 @@ import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parseConfig } from '../web/js/config.js';
 import {
-    DIET_LEVELS, DIET_SCRIPT, PROVISION, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps, dietScript,
+    DIET_LEVELS, DIET_SCRIPT, LOWMEM_PROPS, PROVISION, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps, dietScript,
     parseProps,
 } from '../web/js/boot-diet.js';
 import { appendInitramfs, appendOffset, newcArchive, parseNewc } from '../web/js/initramfs.js';
@@ -71,24 +71,39 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
 {
     const dflt = parseConfig('', {});
     assert.equal(dflt.diet, 1);
+    assert.equal(dflt.lowmem, true);
     assert.deepEqual(dietProps(dflt), [
-        ['debug.sf.nobootanimation', '1'], ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract']]);
-    assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract ttmfix provisioned');
+        ['debug.sf.nobootanimation', '1'], ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract'],
+        ['ro.lmk.medium', '1001'], ['ro.lmk.critical', '200']]);
+    assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract'
+        + ' ro.lmk.medium=1001 ro.lmk.critical=200 ttmfix provisioned');
     // the screen must come on: never the quiescent boot
     assert.ok(DIET_LEVELS.flat().every(([k]) => !/quiescent/.test(k)));
 
-    const off = parseConfig('?diet=0', {});
+    const off = parseConfig('?diet=0&lowmem=0', {});
     assert.deepEqual(dietProps(off), []);
     assert.equal(describeDiet(off), ' props: none ttmfix provisioned');
-    assert.equal(describeDiet(parseConfig('?diet=0&ttmfix=0&setup=1', {})), ' props: none');
-    assert.equal(describeDiet(parseConfig('?diet=0&ttmfix=0', {})), ' props: none provisioned');
-    assert.deepEqual(dietProps(parseConfig('?diet=0&props=a.b=c', {})), [['a.b', 'c']]);
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&setup=1', {})), ' props: none');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0', {})), ' props: none provisioned');
+    assert.deepEqual(dietProps(parseConfig('?diet=0&lowmem=0&props=a.b=c', {})), [['a.b', 'c']]);
+
+    // lowmem: lmkd's levels, whatever the diet; off with lowmem=0; props override them
+    assert.deepEqual(LOWMEM_PROPS, [['ro.lmk.medium', '1001'], ['ro.lmk.critical', '200']]);
+    assert.deepEqual(dietProps(parseConfig('?diet=0', {})), LOWMEM_PROPS);
+    assert.deepEqual(dietProps(parseConfig('?lowmem=0', {})), DIET_LEVELS[1]);
+    assert.equal(parseConfig('?lowmem=0', {}).lowmem, false);
+    assert.deepEqual(dietProps(parseConfig('?diet=0&props=ro.lmk.critical=900', {})),
+        [['ro.lmk.medium', '1001'], ['ro.lmk.critical', '900']]);
+    // lmkd never ends what is on screen (oom_adj 0 and 100), and nothing at medium pressure
+    const lmk = Object.fromEntries(LOWMEM_PROPS);
+    assert.ok(Number(lmk['ro.lmk.critical']) > 100 && Number(lmk['ro.lmk.critical']) <= 900);
+    assert.ok(Number(lmk['ro.lmk.medium']) > 1000);
     assert.equal(parseConfig('?diet=7', {}).diet, 2);
-    assert.deepEqual(dietProps(parseConfig('?diet=2', {})).slice(3), [
+    assert.deepEqual(dietProps(parseConfig('?diet=2&lowmem=0', {})).slice(3), [
         ['ro.zygote', 'zygote64'], ['ro.product.cpu.abilist', 'x86_64'], ['ro.product.cpu.abilist32', '']]);
 
     // props add and override; an overridden key moves to the end, once
-    const more = parseConfig('?props=config.disable_cameraservice=1,debug.sf.nobootanimation=0,x-y_z.9=', {});
+    const more = parseConfig('?lowmem=0&props=config.disable_cameraservice=1,debug.sf.nobootanimation=0,x-y_z.9=', {});
     assert.deepEqual(dietProps(more), [
         ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract'],
         ['config.disable_cameraservice', '1'], ['debug.sf.nobootanimation', '0'], ['x-y_z.9', '']]);
@@ -108,7 +123,7 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
 
 // --- the script ------------------------------------------------------------------------
 {
-    const props = dietProps(parseConfig('?diet=2', {}));
+    const props = dietProps(parseConfig('?diet=2&lowmem=0', {}));
     const script = dietScript(props);
     assert.match(script, /sed -e '\/\^debug\\\.sf\\\.nobootanimation=\/d' -e '\/\^pm\\\.dexopt\\\.first-boot=\/d' /);
     assert.match(script, /<<'PORTY_EOF'\ndebug\.sf\.nobootanimation=1\npm\.dexopt\.first-boot=extract\npm\.dexopt\.boot=extract\nro\.zygote=zygote64\nro\.product\.cpu\.abilist=x86_64\nro\.product\.cpu\.abilist32=\nPORTY_EOF\n/);
@@ -236,7 +251,7 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         out = run();
         assert.equal(out.status, 0, String(out.stderr));
         assert.equal(String(out.stdout),
-            'porty: boot diet, 3 properties in default.prop\nporty: ttm.ko fixed (2 bytes at 26173)\n');
+            'porty: boot diet, 5 properties in default.prop\nporty: ttm.ko fixed (2 bytes at 26173)\n');
         assert.equal(readFileSync(path.join(dir, 'mounts'), 'utf8'), `mount --bind porty-ttm.ko ${fix.module}\n`);
         const copy = readFileSync(path.join(dir, 'porty-ttm.ko'));
         assert.equal(copy.length, module.length);

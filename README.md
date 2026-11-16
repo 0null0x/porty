@@ -185,6 +185,7 @@ and say how far it got, with that message.
 | `fps` | 30 | Canvas refresh cap |
 | `diet` | 1 | Android properties set at boot to shorten it: `1` no boot animation (the screen stays black until the launcher) and first-boot app preparation without verification; `0` none; `2` also a 64-bit-only Android without the 32-bit zygote (experiment) |
 | `props` | | More Android properties, `key=value,key=value` (letters, digits, `.`, `_`, `-`); they override `diet`, for example `props=debug.sf.nobootanimation=0` |
+| `lowmem` | 1 | Android's low memory killer (lmkd) keeps background apps until memory is critically short and never ends the app on screen (`ro.lmk.medium=1001`, `ro.lmk.critical=200`). `0` leaves it as shipped: without swap it then ends every app that is left for another within seconds, and each return is a cold start |
 | `ttmfix` | 1 | `0` leaves the kernel module `ttm.ko` as shipped. By default the page replaces it at boot with a copy in which 2 bytes differ, because this kernel panics on a warning in `ttm_bo_vm_open` whenever Android collects stack traces (after every "not responding" app); see [docs/PLAN.md](docs/PLAN.md) |
 | `resume` | auto | A site that publishes a snapshot resumes the saved, already booted Android instead of booting. `0` always boots; `1` resumes even when the address sets machine parameters (the snapshot's own settings then apply) |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |

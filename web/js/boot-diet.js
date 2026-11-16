@@ -64,6 +64,33 @@ export const DIET_LEVELS = [
     ],
 ];
 
+// Memory: when Android ends background apps (?lowmem=, on by default).
+//
+// Android 9's lmkd (system/core/lmkd, the user-space low memory killer; this
+// kernel has no in-kernel one) acts on the kernel's memory pressure events:
+// at "medium" pressure it kills processes from oom_adj ro.lmk.medium (800)
+// up, at "critical" from ro.lmk.critical (0) up, until MemFree is back at
+// the highest value it saw at low pressure.  It is meant to weigh that
+// against swap use, but this kernel has neither swap nor swap accounting
+// (no zram, no CONFIG_MEMCG_SWAP: "memory.memsw.usage_in_bytes open: No
+// such file or directory" at every event), so it kills at every event; and
+// MemFree is always small here, because the page cache fills what is free.
+// In a 768 MiB guest with 240-330 MiB "available", every app left for
+// another was killed within seconds and every return to it was a cold
+// start, the slowest thing this guest does (native boots, 2026-11-16,
+// .github/workflows/guest-memory.yml: four apps started twice round took
+// 53-56 s the second time, 24-29 s with these levels, all four still alive).
+//
+// With these levels lmkd leaves medium pressure to the kernel, which drops
+// page cache, and at critical pressure ends cached apps first and, when
+// none are left, background services and the previous app, never what is
+// on screen.  Read by lmkd when it starts, so they have to be in the
+// property file.
+export const LOWMEM_PROPS = [
+    ['ro.lmk.medium', '1001'],
+    ['ro.lmk.critical', '200'],
+];
+
 // The kernel fix.  Android-x86 9.0-r2 draws through the fbdev emulation of
 // bochs-drm: surfaceflinger maps /dev/graphics/fb0, and that mapping
 // (bochsfb_mmap -> ttm_fbdev_mmap) uses TTM's vm_ops on a file that is not
@@ -175,13 +202,15 @@ export function parseProps(raw) {
 
 /**
  * The properties a config asks for, in order, each key once: the levels up
- * to cfg.diet, then cfg.props (which override).
+ * to cfg.diet, the memory levels unless lowmem=0, then cfg.props (which
+ * override).
  * @returns {[string, string][]}
  */
 export function dietProps(cfg) {
     const level = Math.min(DIET_LEVELS.length - 1, Math.max(0, cfg.diet ?? 1));
     const merged = new Map();
-    for (const [key, value] of [...DIET_LEVELS.slice(0, level + 1).flat(), ...(cfg.props || [])]) {
+    const lowmem = cfg.lowmem === false ? [] : LOWMEM_PROPS;
+    for (const [key, value] of [...DIET_LEVELS.slice(0, level + 1).flat(), ...lowmem, ...(cfg.props || [])]) {
         merged.delete(key);
         merged.set(key, value);
     }
