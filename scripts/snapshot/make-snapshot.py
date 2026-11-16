@@ -183,7 +183,9 @@ class Machine:
         except Exception:
             self.kill()
             raise
-        self.out = b""          # everything the guest printed since the last trim
+        self.out = b""          # everything the guest printed
+        self.boots = 0
+        self.reboots = []       # seconds after start at which the guest came up again
         self.total = 0
         self.counter = 0
 
@@ -207,9 +209,22 @@ class Machine:
             return False
         self.out += data
         self.total += len(data)
+        self.check_reboot()
         # (Kept whole: sh() remembers offsets into it.  A boot prints well
         # under a megabyte.)
         return True
+
+    def check_reboot(self):
+        """Notice the guest starting over: the kernel banner appears again.
+        Prints what the console showed before it, once per reboot."""
+        boots = [m.start() for m in re.finditer(rb"Linux version ", self.out)]
+        if len(boots) > self.boots and len(boots) > 1:
+            before = self.out[max(0, boots[-1] - 12000):boots[-1]].decode("utf-8", "replace")
+            log(f"THE GUEST REBOOTED after {self.elapsed():.0f} s (boot number {len(boots)}); console before it:")
+            for line in before.replace("\r", "").split("\n")[-120:]:
+                print("    | " + line[:300], flush=True)
+            self.reboots.append(round(self.elapsed(), 1))
+        self.boots = max(self.boots, len(boots))
 
     def wait_for(self, pattern, timeout, start=0):
         deadline = time.monotonic() + timeout
@@ -409,6 +424,7 @@ def do_save(opts, argv):
                 progress(work, f"booting, {now / 60:.0f} min, {stage}, serial {vm.total // 1024} KiB")
                 write_json(result_path, result)
 
+        result["reboots_during_boot"] = list(vm.reboots)
         if booted is None:
             result.setdefault("error", f"sys.boot_completed was not 1 after {vm.elapsed():.0f} s")
             result["elapsed_seconds"] = round(vm.elapsed(), 1)
@@ -534,6 +550,14 @@ def do_save(opts, argv):
 
         result["screen"] = vm.screenshot("screen-final", show=True)
         log(f"screen: {result['screen']}")
+        result["reboots"] = vm.reboots
+        if any(t > booted for t in vm.reboots):
+            # What was prepared above is gone (/data is a tmpfs), and a guest
+            # that restarts by itself would do so in the browser as well.
+            result["error"] = (f"the guest rebooted by itself {vm.reboots} s after start "
+                               f"(it had booted after {booted:.0f} s); not saved")
+            result["serial_tail"] = vm.tail(40)
+            return result
         if not vm.alive():
             result["error"] = f"QEMU exited with status {vm.proc.returncode} before the save"
             return result

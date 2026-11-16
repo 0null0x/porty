@@ -254,6 +254,7 @@ jobs:
             --state "$RUNNER_TEMP/vm.state" \
             --runstate "$RUNSTATE" \
             --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))" \
+            --settle 300 \
             "${extra[@]}"
 
       - name: Cut the stream into compressed chunks
