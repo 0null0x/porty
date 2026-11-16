@@ -36,7 +36,8 @@ def main():
     if not save:
         parts.append("QEMU was not started")
     elif save.get("booted"):
-        parts.append(f"booted in {save['booted_seconds'] / 60:.1f} min")
+        parts.append(f"booted in {save['booted_seconds'] / 60:.1f} min"
+                     + (f" after {len(save['reboots'])} reboots" if save.get("reboots") else ""))
     else:
         parts.append(f"not booted after {save.get('elapsed_seconds', 0) / 60:.0f} min")
     if save and save.get("error"):
@@ -65,7 +66,8 @@ def main():
             if save.get(key):
                 out.append(f"- {key}: `{json.dumps(save[key])}`")
         guest = save.get("guest", {})
-        for key in ("fingerprint", "focus", "clocksource", "dmesg_tsc", "cpu_model", "cpu_mhz",
+        for key in ("provisioned", "provision_workaround", "home", "suspends", "zygote_crashes",
+                    "fingerprint", "focus", "clocksource", "dmesg_tsc", "cpu_model", "cpu_mhz",
                     "cpu_flags", "loadavg", "meminfo_before", "zero_fill", "zero_fill_mb",
                     "meminfo_after", "uptime", "date"):
             if key in guest:
@@ -73,7 +75,7 @@ def main():
                 out.append(f"- guest {key}: `{text[:900]}`")
         if save.get("migrate"):
             out.append(f"- migration ({save.get('migrate_seconds')} s): `{json.dumps(save['migrate'])[:1500]}`")
-        for key in ("status_before", "status_after", "error"):
+        for key in ("status_before", "status_after", "reboots", "stable_seconds", "wake_lock", "error"):
             if save.get(key):
                 out.append(f"- {key}: `{json.dumps(save[key])}`")
         machine = save.get("machine", {})

@@ -10,10 +10,13 @@
 #   snapshot/manifest.json, snapshot/000000.zz ...   see scripts/snapshot/pack-snapshot.py
 #   logs/                                            serial log, screenshots,
 #                                                    QEMU's view of the machine
+# and "android-snapshot-image", the prepared image (out/image) it was made
+# from.  A push makes a second pair, "android-snapshot-vesa", for gfx=vesa.
 #
 # The run itself never fails, because every failed run emails the repository
-# owner.  The verdict is the commit status "porty/snapshot" and the job
-# summary; read the status with
+# owner.  The verdict is the commit status "porty/snapshot <name>" and the
+# job summary (the log also has the screenshots as base64 PNG); read the
+# status with
 #   gh api repos/<owner>/<repo>/commits/<sha>/statuses
 name: Snapshot
 
@@ -64,19 +67,33 @@ defaults:
     shell: bash --noprofile --norc -euo pipefail {0}
 
 env:
-  QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
   RUNSTATE: ${{ inputs.runstate || 'running' }}
   GUEST_COMMAND: ${{ inputs.guest_command || '' }}
   # 1: kernel and Android shutdown messages on the serial console.  For
   # finding out why a guest restarts; such a snapshot is not for publishing.
-  TRACE_REBOOT: '1'
+  TRACE_REBOOT: '0'
   BOOT_TIMEOUT_MIN: ${{ inputs.boot_timeout_min || '180' }}
 
 jobs:
   snapshot:
-    name: Boot Android natively and save it
+    name: Boot Android natively and save it (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        # "phone": the page's phone configuration.  "phone-vesa": the same
+        # with gfx=vesa (nomodeset, 800x600 VESA framebuffer), which keeps
+        # the kernel's bochs-drm/ttm driver out of the guest: with it, the
+        # kernel panics whenever Android dumps surfaceflinger's stack (after
+        # any "not responding" app), see the console in the job log.  A run
+        # by hand makes one snapshot, for the query given.
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch'
+          && format('[{{"name":"custom","query":"{0}","artifact":"android-snapshot"}}]', inputs.query)
+          || '[{"name":"phone","query":"mem=768&tb=128&cache=16","artifact":"android-snapshot"},{"name":"phone-vesa","query":"mem=768&tb=128&cache=16&gfx=vesa","artifact":"android-snapshot-vesa"}]') }}
+    env:
+      QUERY: ${{ matrix.query }}
+      STATUS_CONTEXT: porty/snapshot ${{ matrix.name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,6 +204,7 @@ jobs:
           tail -1 "$RUNNER_TEMP/prepare.log"
           rm -rf out/iso
           sha256sum out/image/manifest.json
+          python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1]))["disk"]; print("disk:", {k: d.get(k) for k in ("format", "dir", "size", "virtual_size", "sha256", "content_sha256")})' out/image/manifest.json
 
       # --- the page's own arguments -------------------------------------------
       - name: Build the QEMU arguments
@@ -242,7 +260,7 @@ jobs:
           (
             while sleep 240; do
               [[ -f out/snap/save/progress.txt ]] || continue
-              gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context=porty/snapshot \
+              gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context="$STATUS_CONTEXT" \
                 -f description="$(head -c 140 out/snap/save/progress.txt)" -f target_url="$RUN_URL" >/dev/null 2>&1 || true
             done
           ) &
@@ -325,8 +343,23 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: android-snapshot
+          name: ${{ matrix.artifact }}
           path: out/artifact
+          retention-days: 5
+          compression-level: 0
+          if-no-files-found: warn
+
+      # prepare-image.sh does not produce the same bytes twice (the qcow2
+      # container), and the snapshot belongs to the disk it was made from:
+      # keep that image next to it.
+      - name: Upload the image the snapshot was made from
+        id: upload-image
+        if: steps.pack.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}-image
+          path: out/image
           retention-days: 5
           compression-level: 0
           if-no-files-found: warn
@@ -370,10 +403,10 @@ jobs:
             desc="$details"
           fi
           echo "$state: $desc"
-          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context=porty/snapshot \
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
             -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
           {
-            echo "## Snapshot"
+            echo "## Snapshot ($QUERY)"
             echo
             echo "**$state**: $desc"
             echo

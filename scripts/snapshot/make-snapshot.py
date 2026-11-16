@@ -85,6 +85,10 @@ def ppm_to_png(ppm_path, png_path):
             "sampled_colours": len(colours)}
 
 
+class Rebooted(Exception):
+    """The guest restarted while it was being prepared."""
+
+
 class Qmp:
     def __init__(self, path, timeout=60):
         deadline = time.monotonic() + timeout
@@ -189,6 +193,9 @@ class Machine:
         self.out = b""          # everything the guest printed
         self.boots = 0
         self.rearm = False      # set after a reboot: the guest lost what was set up
+        self.boot_started = 0.0 # when the current boot began, seconds after start
+        self.strict = False     # True: a reboot raises Rebooted
+        self.max_reboots = 12
         self.reboots = []       # seconds after start at which the guest came up again
         self.total = 0
         self.counter = 0
@@ -228,11 +235,15 @@ class Machine:
             for line in before.replace("\r", "").split("\n")[-120:]:
                 print("    | " + line[:300], flush=True)
             self.reboots.append(round(self.elapsed(), 1))
+            self.boot_started = self.elapsed()
             self.rearm = True
-            self.show_debug()
-            if len(self.reboots) >= 3:
+            if len(self.reboots) <= 2:
+                self.show_debug()
+            if len(self.reboots) >= self.max_reboots:
                 raise RuntimeError(f"the guest keeps rebooting by itself, {self.reboots} s after start")
         self.boots = max(self.boots, len(boots))
+        if self.strict and self.rearm:
+            raise Rebooted()
 
     def show_debug(self):
         """Print the end of QEMU's debug log and the QMP events so far."""
@@ -402,206 +413,220 @@ def do_save(opts, argv):
                  ("kernel", re.compile(rb"Linux version")),
                  ("android_found", re.compile(rb"found at /dev/")),
                  ("shell", PROMPT))
-        shell = False
-        awake = False
-        booted = None
-        last_probe = 0.0
-        last_report = 0.0
-        last_shot = 0.0
-        while vm.elapsed() < opts.boot_timeout:
-            if not vm.alive():
-                result["error"] = f"QEMU exited with status {vm.proc.returncode} during boot"
-                break
-            vm.pump(2.0)
-            now = vm.elapsed()
-            for key, pattern in watch:
-                if key not in marks and pattern.search(vm.out):
-                    marks[key] = round(now, 1)
-                    log(f"milestone {key} at {now:.0f} s")
-            shell = shell or "shell" in marks
-            # Without a prompt after ten minutes, type anyway once a minute.
-            due = (shell and now - last_probe >= 10) or (not shell and now > 600 and now - last_probe >= 60)
-            if due:
-                last_probe = now
-                status, text = vm.sh("getprop sys.boot_completed", timeout=45)
-                if status is not None:
-                    shell = True
-                    marks.setdefault("shell", round(now, 1))
-                    if vm.rearm:
-                        vm.rearm = False
-                        awake = False
-                    if not awake:
-                        # Android-x86 suspends the machine (ACPI S3) when the
-                        # screen times out, one minute after boot.  A kernel
-                        # wake lock prevents that from the first moment, and
-                        # stays in the saved machine: nobody is there to
-                        # press a power button in the browser.
-                        awake = True
-                        code, out = vm.sh("echo porty > /sys/power/wake_lock && cat /sys/power/wake_lock", 30)
-                        result["wake_lock"] = out if code == 0 else f"[status {code}] {out}"
-                        log(f"wake lock: {result['wake_lock']}")
-                        if opts.trace_reboot:
-                            # Diagnosis only (it interleaves with the answers
-                            # read here): kernel and Android messages about
-                            # shutting down, on the serial console.
-                            vm.sh("echo 8 > /proc/sys/kernel/printk; (logcat -b all -v time -s RescueParty:* "
-                                  "ShutdownThread:* PowerManagerService:* AndroidRuntime:E init:* Zygote:* "
-                                  "SystemServer:E ActivityManager:E BootReceiver:* Watchdog:* DEBUG:F "
-                                  "> /dev/kmsg 2>&1 &)", 30)
-                if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
-                    booted = vm.elapsed()
-                    break
-            if now - last_shot >= 300:
-                last_shot = now
-                shot = vm.screenshot("screen-progress")
-                marks_text = ", ".join(f"{k} {v:.0f}s" for k, v in marks.items()) or "nothing yet"
-                log(f"{now / 60:.0f} min: {marks_text}; screen {shot}; serial {vm.total} bytes")
-            if now - last_report >= 30:
-                last_report = now
-                stage = "shell up" if shell else ("kernel" if "kernel" in marks else "firmware")
-                progress(work, f"booting, {now / 60:.0f} min, {stage}, serial {vm.total // 1024} KiB")
-                write_json(result_path, result)
-
-        result["reboots_during_boot"] = list(vm.reboots)
-        if booted is None:
-            result.setdefault("error", f"sys.boot_completed was not 1 after {vm.elapsed():.0f} s")
-            result["elapsed_seconds"] = round(vm.elapsed(), 1)
-            result["screen"] = vm.screenshot("screen-final", show=True)
-            if shell and vm.alive():
-                for name, command in (("logcat_tail", "logcat -d -t 80"),
-                                      ("props", "getprop | grep -e boot -e init.svc | head -60"),
-                                      ("ps", "ps -A | tail -40"), ("uptime", "uptime")):
-                    result[name] = vm.sh(command, timeout=120)[1].split("\n")
-            result["serial_tail"] = vm.tail(60)
-            return result
-
-        result["booted"] = True
-        result["booted_seconds"] = round(booted, 1)
-        marks["boot_completed"] = round(booted, 1)
-        log(f"sys.boot_completed=1 after {booted:.0f} s")
-        progress(work, f"booted in {booted / 60:.1f} min, settling")
-        result["screen_booted"] = vm.screenshot("screen-booted", show=True)
-
-        guest = result["guest"] = {}
-
-        def run(key, command, timeout=120):
-            status, text = vm.sh(command, timeout)
-            guest[key] = text if status == 0 else f"[status {status}] {text}"
-            log(f"guest {key}: {guest[key][:1500]}")
-            return status, text
-
-        # Keep the display on: a sleeping screen would be saved black, and
-        # nobody is there to wake it in the browser.
-        run("screen_timeout", "settings put system screen_off_timeout 2147483647")
-        run("stay_on", "svc power stayon true")
-
-        # A device that is not provisioned has no home screen: the launcher
-        # is not allowed to start until the setup wizard has finished.  With
-        # SETUPWIZARD=0 the wizard should finish by itself; if it has not
-        # (the slim image's wizard crashes without Google's services), do
-        # its job here, so that the saved machine shows a home screen.
-        run("provisioned", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
-        run("setup_crash", "logcat -b crash -d | grep -m1 -A6 'Process: com.google.android.setupwizard' | cut -c1-200", 180)
-        run("home_candidates", "cmd package query-activities --brief -a android.intent.action.MAIN"
-                               " -c android.intent.category.HOME | grep /", 180)
-        if opts.provision and guest["provisioned"].split() != ["1", "1"]:
-            guest["provision_workaround"] = True
-            run("provision_1", "settings put global device_provisioned 1; settings put secure user_setup_complete 1", 180)
-            run("provision_2", "pm disable-user --user 0 com.google.android.setupwizard", 180)
-            launcher = [line.strip() for line in guest["home_candidates"].split("\n")
-                        if "launcher3" in line.lower()]
-            if launcher:
-                run("provision_3", f"cmd package set-home-activity {launcher[0]}", 180)
-            run("provision_4", "am start -a android.intent.action.MAIN -c android.intent.category.HOME", 180)
-        else:
-            guest["provision_workaround"] = False
-
-        settle_end = time.monotonic() + opts.settle
-        while time.monotonic() < settle_end and vm.alive():
-            vm.pump(2.0)
-        # Wait a little longer while the guest is still busy (first-boot work).
-        for _ in range(12):
-            status, text = vm.sh("cat /proc/loadavg", 30)
-            guest["loadavg"] = text
+        # The guest sometimes restarts by itself (a kernel panic, see the
+        # console printed at each reboot).  /data is a tmpfs, so every boot
+        # is a first boot: wait for one that stays up through the
+        # preparation and the settling time, and save that one.
+        while True:
+            vm.strict = False
             try:
-                if float(text.split()[0]) < opts.max_load:
-                    break
-            except (ValueError, IndexError):
-                pass
-            end = time.monotonic() + 30
-            while time.monotonic() < end and vm.alive():
-                vm.pump(2.0)
-        log(f"guest load: {guest.get('loadavg')}")
+                shell = False
+                awake = False
+                booted = None
+                last_probe = 0.0
+                last_report = 0.0
+                last_shot = 0.0
+                while vm.elapsed() < opts.boot_timeout:
+                    if not vm.alive():
+                        result["error"] = f"QEMU exited with status {vm.proc.returncode} during boot"
+                        break
+                    vm.pump(2.0)
+                    now = vm.elapsed()
+                    for key, pattern in watch:
+                        if key not in marks and pattern.search(vm.out):
+                            marks[key] = round(now, 1)
+                            log(f"milestone {key} at {now:.0f} s")
+                    shell = shell or "shell" in marks
+                    # Without a prompt after ten minutes, type anyway once a minute.
+                    due = (shell and now - last_probe >= 10) or (not shell and now > 600 and now - last_probe >= 60)
+                    if due:
+                        last_probe = now
+                        status, text = vm.sh("getprop sys.boot_completed", timeout=45)
+                        if status is not None:
+                            shell = True
+                            marks.setdefault("shell", round(now, 1))
+                            if vm.rearm:
+                                vm.rearm = False
+                                awake = False
+                            if not awake:
+                                # Android-x86 suspends the machine (ACPI S3) when the
+                                # screen times out, one minute after boot.  A kernel
+                                # wake lock prevents that from the first moment, and
+                                # stays in the saved machine: nobody is there to
+                                # press a power button in the browser.
+                                awake = True
+                                code, out = vm.sh("echo porty > /sys/power/wake_lock && cat /sys/power/wake_lock", 30)
+                                result["wake_lock"] = out if code == 0 else f"[status {code}] {out}"
+                                log(f"wake lock: {result['wake_lock']}")
+                                if opts.trace_reboot:
+                                    # Diagnosis only (it interleaves with the answers
+                                    # read here): kernel and Android messages about
+                                    # shutting down, on the serial console.
+                                    vm.sh("echo 8 > /proc/sys/kernel/printk; (logcat -b all -v time -s RescueParty:* "
+                                          "ShutdownThread:* PowerManagerService:* AndroidRuntime:E init:* Zygote:* "
+                                          "SystemServer:E ActivityManager:E BootReceiver:* Watchdog:* DEBUG:F "
+                                          "> /dev/kmsg 2>&1 &)", 30)
+                        if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
+                            booted = vm.elapsed()
+                            break
+                    if now - last_shot >= 300:
+                        last_shot = now
+                        shot = vm.screenshot("screen-progress")
+                        marks_text = ", ".join(f"{k} {v:.0f}s" for k, v in marks.items()) or "nothing yet"
+                        log(f"{now / 60:.0f} min: {marks_text}; screen {shot}; serial {vm.total} bytes")
+                    if now - last_report >= 30:
+                        last_report = now
+                        stage = "shell up" if shell else ("kernel" if "kernel" in marks else "firmware")
+                        progress(work, f"booting, {now / 60:.0f} min, {stage}, serial {vm.total // 1024} KiB")
+                        write_json(result_path, result)
 
-        run("wake", "input keyevent 224", 180)
-        end = time.monotonic() + 10
-        while time.monotonic() < end and vm.alive():
-            vm.pump(2.0)
+                result["reboots_during_boot"] = list(vm.reboots)
+                if booted is None:
+                    result.setdefault("error", f"sys.boot_completed was not 1 after {vm.elapsed():.0f} s")
+                    result["elapsed_seconds"] = round(vm.elapsed(), 1)
+                    result["screen"] = vm.screenshot("screen-final", show=True)
+                    if shell and vm.alive():
+                        for name, command in (("logcat_tail", "logcat -d -t 80"),
+                                              ("props", "getprop | grep -e boot -e init.svc | head -60"),
+                                              ("ps", "ps -A | tail -40"), ("uptime", "uptime")):
+                            result[name] = vm.sh(command, timeout=120)[1].split("\n")
+                    result["serial_tail"] = vm.tail(60)
+                    return result
 
-        run("fingerprint", "getprop ro.build.fingerprint")
-        run("boot_completed", "getprop sys.boot_completed")
-        run("clocksource", "cat /sys/devices/system/clocksource/clocksource0/current_clocksource")
-        run("clocksources", "cat /sys/devices/system/clocksource/clocksource0/available_clocksource")
-        run("dmesg_tsc", "dmesg | grep -i -e tsc -e clocksource | head -20")
-        run("cpu_model", "grep -m1 'model name' /proc/cpuinfo")
-        run("cpu_mhz", "grep -m1 MHz /proc/cpuinfo")
-        run("cpu_flags", "grep -m1 flags /proc/cpuinfo")
-        run("cmdline", "cat /proc/cmdline")
-        run("data_mount", "grep ' /data ' /proc/mounts")
-        run("uptime", "cat /proc/uptime")
-        run("date", "date -u '+%Y-%m-%dT%H:%M:%SZ'")
-        run("focus", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
-        run("crashes", "logcat -b crash -d -t 30 | cut -c1-220", 180)
-        run("home", "cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN", 180)
-        run("provisioned_after", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
-        run("suspends", "dmesg | grep -c 'PM: suspend entry'; dmesg | grep 'PM: suspend' | tail -4", 60)
-        run("zygote_crashes", "logcat -b crash -d | grep -c 'No region space mem map';"
-                              " getprop init.svc.zygote; getprop init.svc.zygote_secondary; getprop ro.zygote", 180)
-        for i, command in enumerate(opts.guest_command):
-            run(f"extra_{i}", command, 600)
-        if opts.guest_command:
-            end = time.monotonic() + 20
-            while time.monotonic() < end and vm.alive():
-                vm.pump(2.0)
-            run("focus_after_extra", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
-        run("meminfo_before", "head -7 /proc/meminfo")
+                result["booted"] = True
+                # The boot that is saved, from its kernel banner; and since
+                # QEMU started, which includes boots that ended in a reboot.
+                boot_seconds = booted - vm.boot_started
+                result["booted_seconds"] = round(boot_seconds, 1)
+                result["booted_after_start_seconds"] = round(booted, 1)
+                marks["boot_completed"] = round(booted, 1)
+                log(f"sys.boot_completed=1 after {boot_seconds:.0f} s ({booted:.0f} s after start, "
+                    f"{len(vm.reboots)} reboots before)")
+                progress(work, f"booted in {boot_seconds / 60:.1f} min ({len(vm.reboots)} reboots before), settling")
+                vm.strict = True
+                result["screen_booted"] = vm.screenshot("screen-booted", show=True)
 
-        run("sync", "sync; echo 3 > /proc/sys/vm/drop_caches", 300)
-        status, text = run("memfree_kb", "grep MemFree /proc/meminfo")
-        m = re.search(r"(\d+) kB", text)
-        free_mb = int(m.group(1)) // 1024 if m else 0
-        fill_mb = free_mb - opts.zero_reserve
-        if opts.zero_free and fill_mb >= 16 and "tmpfs" in guest.get("data_mount", ""):
-            # Freed memory keeps its old contents and would be saved as data.
-            # Fill most of it with zeros through the tmpfs /data and free it
-            # again: QEMU stores an all-zero page as a few bytes.
-            run("zero_fill", f"dd if=/dev/zero of=/data/local/tmp/.porty-zero bs=1048576 count={fill_mb} 2>&1 | tail -1;"
-                             " rm -f /data/local/tmp/.porty-zero; sync", 900)
-            guest["zero_fill_mb"] = fill_mb
-        else:
-            guest["zero_fill_mb"] = 0
-        run("meminfo_after", "head -7 /proc/meminfo")
-        run("boot_completed_after", "getprop sys.boot_completed")
-        end = time.monotonic() + opts.pause
-        while time.monotonic() < end and vm.alive():
-            vm.pump(1.0)
+                guest = result["guest"] = {}
 
-        result["screen"] = vm.screenshot("screen-final", show=True)
-        log(f"screen: {result['screen']}")
-        result["reboots"] = vm.reboots
-        if any(t > booted for t in vm.reboots):
-            # What was prepared above is gone (/data is a tmpfs), and a guest
-            # that restarts by itself would do so in the browser as well.
-            result["error"] = (f"the guest rebooted by itself {vm.reboots} s after start "
-                               f"(it had booted after {booted:.0f} s); not saved")
-            result["serial_tail"] = vm.tail(40)
-            return result
-        if not vm.alive():
-            result["error"] = f"QEMU exited with status {vm.proc.returncode} before the save"
-            return result
+                def run(key, command, timeout=120):
+                    status, text = vm.sh(command, timeout)
+                    guest[key] = text if status == 0 else f"[status {status}] {text}"
+                    log(f"guest {key}: {guest[key][:1500]}")
+                    return status, text
+
+                # Keep the display on: a sleeping screen would be saved black, and
+                # nobody is there to wake it in the browser.
+                run("screen_timeout", "settings put system screen_off_timeout 2147483647")
+                run("stay_on", "svc power stayon true")
+
+                # A device that is not provisioned has no home screen: the launcher
+                # is not allowed to start until the setup wizard has finished.  With
+                # SETUPWIZARD=0 the wizard should finish by itself; if it has not
+                # (the slim image's wizard crashes without Google's services), do
+                # its job here, so that the saved machine shows a home screen.
+                run("provisioned", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
+                run("setup_crash", "logcat -b crash -d | grep -m1 -A6 'Process: com.google.android.setupwizard' | cut -c1-200", 180)
+                run("home_candidates", "cmd package query-activities --brief -a android.intent.action.MAIN"
+                                       " -c android.intent.category.HOME | grep /", 180)
+                if opts.provision and guest["provisioned"].split() != ["1", "1"]:
+                    guest["provision_workaround"] = True
+                    run("provision_1", "settings put global device_provisioned 1; settings put secure user_setup_complete 1", 180)
+                    run("provision_2", "pm disable-user --user 0 com.google.android.setupwizard", 180)
+                    launcher = [line.strip() for line in guest["home_candidates"].split("\n")
+                                if "launcher3" in line.lower()]
+                    if launcher:
+                        run("provision_3", f"cmd package set-home-activity {launcher[0]}", 180)
+                    run("provision_4", "am start -a android.intent.action.MAIN -c android.intent.category.HOME", 180)
+                else:
+                    guest["provision_workaround"] = False
+
+                settle_end = time.monotonic() + opts.settle
+                while time.monotonic() < settle_end and vm.alive():
+                    vm.pump(2.0)
+                # Wait a little longer while the guest is still busy (first-boot work).
+                for _ in range(12):
+                    status, text = vm.sh("cat /proc/loadavg", 30)
+                    guest["loadavg"] = text
+                    try:
+                        if float(text.split()[0]) < opts.max_load:
+                            break
+                    except (ValueError, IndexError):
+                        pass
+                    end = time.monotonic() + 30
+                    while time.monotonic() < end and vm.alive():
+                        vm.pump(2.0)
+                log(f"guest load: {guest.get('loadavg')}")
+
+                run("wake", "input keyevent 224", 180)
+                end = time.monotonic() + 10
+                while time.monotonic() < end and vm.alive():
+                    vm.pump(2.0)
+
+                run("fingerprint", "getprop ro.build.fingerprint")
+                run("boot_completed", "getprop sys.boot_completed")
+                run("clocksource", "cat /sys/devices/system/clocksource/clocksource0/current_clocksource")
+                run("clocksources", "cat /sys/devices/system/clocksource/clocksource0/available_clocksource")
+                run("dmesg_tsc", "dmesg | grep -i -e tsc -e clocksource | head -20")
+                run("cpu_model", "grep -m1 'model name' /proc/cpuinfo")
+                run("cpu_mhz", "grep -m1 MHz /proc/cpuinfo")
+                run("cpu_flags", "grep -m1 flags /proc/cpuinfo")
+                run("cmdline", "cat /proc/cmdline")
+                run("data_mount", "grep ' /data ' /proc/mounts")
+                run("uptime", "cat /proc/uptime")
+                run("date", "date -u '+%Y-%m-%dT%H:%M:%SZ'")
+                run("focus", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
+                run("crashes", "logcat -b crash -d -t 30 | cut -c1-220", 180)
+                run("home", "cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN", 180)
+                run("provisioned_after", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
+                run("suspends", "dmesg | grep -c 'PM: suspend entry'; dmesg | grep 'PM: suspend' | tail -4", 60)
+                run("zygote_crashes", "logcat -b crash -d | grep -c 'No region space mem map';"
+                                      " getprop init.svc.zygote; getprop init.svc.zygote_secondary; getprop ro.zygote", 180)
+                for i, command in enumerate(opts.guest_command):
+                    run(f"extra_{i}", command, 600)
+                if opts.guest_command:
+                    end = time.monotonic() + 20
+                    while time.monotonic() < end and vm.alive():
+                        vm.pump(2.0)
+                    run("focus_after_extra", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
+                run("meminfo_before", "head -7 /proc/meminfo")
+
+                run("sync", "sync; echo 3 > /proc/sys/vm/drop_caches", 300)
+                status, text = run("memfree_kb", "grep MemFree /proc/meminfo")
+                m = re.search(r"(\d+) kB", text)
+                free_mb = int(m.group(1)) // 1024 if m else 0
+                fill_mb = free_mb - opts.zero_reserve
+                if opts.zero_free and fill_mb >= 16 and "tmpfs" in guest.get("data_mount", ""):
+                    # Freed memory keeps its old contents and would be saved as data.
+                    # Fill most of it with zeros through the tmpfs /data and free it
+                    # again: QEMU stores an all-zero page as a few bytes.
+                    run("zero_fill", f"dd if=/dev/zero of=/data/local/tmp/.porty-zero bs=1048576 count={fill_mb} 2>&1 | tail -1;"
+                                     " rm -f /data/local/tmp/.porty-zero; sync", 900)
+                    guest["zero_fill_mb"] = fill_mb
+                else:
+                    guest["zero_fill_mb"] = 0
+                run("meminfo_after", "head -7 /proc/meminfo")
+                run("boot_completed_after", "getprop sys.boot_completed")
+                end = time.monotonic() + opts.pause
+                while time.monotonic() < end and vm.alive():
+                    vm.pump(1.0)
+
+                result["screen"] = vm.screenshot("screen-final", show=True)
+                log(f"screen: {result['screen']}")
+                result["reboots"] = list(vm.reboots)
+                result["stable_seconds"] = round(vm.elapsed() - booted, 1)
+                if not vm.alive():
+                    result["error"] = f"QEMU exited with status {vm.proc.returncode} before the save"
+                    return result
+
+            except Rebooted:
+                log(f"the guest rebooted {len(vm.reboots)} time(s) so far; waiting for the next boot")
+                result["booted"] = False
+                continue
+            break
 
         # --- save ---------------------------------------------------------
-        progress(work, f"booted in {booted / 60:.1f} min, saving")
+        vm.strict = False
+        progress(work, f"booted in {result['booted_seconds'] / 60:.1f} min, saving")
         if os.path.exists(opts.state):
             os.unlink(opts.state)
         # No rate limit, and a switch-over threshold large enough that QEMU

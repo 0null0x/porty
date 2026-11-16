@@ -34,6 +34,9 @@ Layout written by "pack" (format 1, shared with the page):
                         "paused": it waits for "cont"
     firmware            {file: sha256} of the pc-bios files the saved ROM
                         blocks were made from
+    image_disk          the image manifest's "disk" entry without its chunk
+                        list (format, sizes, content hash): what the guest's
+                        system disk must contain
 
 "unpack" rebuilds the stream from a directory and checks every hash; the
 workflow restores from that copy, so the published files are what is tested.
@@ -116,6 +119,9 @@ def pack(opts):
         "uncompressed_sha256": whole.hexdigest(),
         "runstate": opts.runstate,
     }
+    with open(opts.image_manifest, encoding="utf-8") as f:
+        disk = json.load(f).get("disk", {})
+    manifest["image_disk"] = {k: v for k, v in disk.items() if not isinstance(v, (list, dict))}
     if opts.rom_dir:
         manifest["firmware"] = {name: sha256_file(os.path.join(opts.rom_dir, name))
                                 for name in sorted(os.listdir(opts.rom_dir))}
