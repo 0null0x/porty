@@ -1,0 +1,434 @@
+# surfaceflinger CPU check: boots the page's phone configuration in a NATIVE
+# QEMU (the one snapshot.yml builds, from the same patched QEMU-Wasm tree as
+# the site), once per variant and boot, and measures what surfaceflinger
+# costs once Android is up: its CPU time over fixed windows, the frames it
+# composed, the load, the screen, and whether the pointer still works.  See
+# docs/PLAN.md, "surfaceflinger's CPU".  tests/sf-cpu.py is the driver.
+#
+# The run itself never fails, because every failed run emails the repository
+# owner.  The results are the commit statuses "porty/check sf-cpu <variant>"
+# and the job summaries.
+name: surfaceflinger CPU check
+
+on:
+  push:
+    branches: [swarm/sf-cpu]
+    paths:
+      - .github/workflows/sf-cpu.yml
+      - tests/sf-cpu.py
+      - tests/apply-boot-diet.mjs
+      - tests/print-qemu-args.mjs
+      - scripts/snapshot/make-snapshot.py
+      - web/js/qemu-args.js
+      - web/js/config.js
+      - web/js/boot-diet.js
+      - web/js/initramfs.js
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: sf-cpu-${{ github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  PHONE: mem=768&tb=128&cache=16
+
+jobs:
+  # Native QEMU and the image, once, for every variant.
+  prepare:
+    name: Native QEMU and the image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      ready: ${{ steps.ready.outputs.ready }}
+      image_key: ${{ steps.ready.outputs.image_key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv binutils
+
+      # The same key as snapshot.yml: the same binary.
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          tail -30 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Save the native QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          out/native-qemu/qemu-system-x86_64 -display help | grep -q wasmfb
+          # Which display devices this build (and so the browser's) has at
+          # all: every one of them is a candidate for "another VGA model".
+          out/native-qemu/qemu-system-x86_64 -device help > "$RUNNER_TEMP/devices.txt"
+          echo "--- display devices ---"
+          sed -n '/^Display devices:/,/^$/p' "$RUNNER_TEMP/devices.txt"
+          echo "--- anything else that draws ---"
+          grep -i -e vga -e gpu -e display -e ramfb -e qxl "$RUNNER_TEMP/devices.txt" || true
+
+      # The image the site publishes (build-and-deploy.yml caches it under
+      # this key); a new one only if there is none.
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore cached Android-x86 ISO
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: prepare
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          tail -1 "$RUNNER_TEMP/prepare.log"
+          rm -rf out/iso
+
+      # Never under the published image's key: snapshot.yml takes whatever
+      # is there for the image the site serves.
+      - name: Keep a newly prepared image for this run
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: sfcpu-image-${{ github.run_id }}
+
+      - name: Ready
+        id: ready
+        if: ${{ always() }}
+        env:
+          QEMU: ${{ steps.qemu.outcome }}
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+          IMAGE_KEY: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+          RUN_KEY: sfcpu-image-${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          ready=false
+          [[ "$QEMU" == success && -s out/image/manifest.json ]] && ready=true
+          key="$RUN_KEY"; [[ "$CACHE_HIT" == true ]] && key="$IMAGE_KEY"
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "image_key=$key" >> "$GITHUB_OUTPUT"
+          echo "ready: $ready (qemu $QEMU, published image from the cache: ${CACHE_HIT:-false})"
+          gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context="porty/check sf-cpu" \
+            -f description="booting (native QEMU and image ready: $ready)" -f target_url="$RUN_URL" >/dev/null || true
+          exit 0
+
+  boots:
+    name: ${{ matrix.name }}
+    needs: prepare
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        # query: added to the page's address; device: another display device
+        # in place of the page's "-vga std" (tests/sf-cpu.py, DEVICES);
+        # at: seconds after the boot's preparation at which a 60 s window
+        # starts.
+        include:
+          - name: base
+            query: ''
+            boots: 2
+            at: '60,240'
+            device: ''
+          - name: long
+            query: ''
+            boots: 1
+            at: '60,600,1200'
+            device: ''
+          - name: hwaccel0
+            query: '&append=HWACCEL=0'
+            boots: 2
+            at: '60,240'
+            device: ''
+          - name: vesa
+            query: '&gfx=vesa'
+            boots: 2
+            at: '60,240'
+            device: ''
+          - name: virtio-vga
+            query: ''
+            boots: 2
+            at: '60,240'
+            device: 'virtio-vga'
+          - name: virtio-vga-hwaccel0
+            query: '&append=HWACCEL=0'
+            boots: 2
+            at: '60,240'
+            device: 'virtio-vga'
+    env:
+      NAME: ${{ matrix.name }}
+      QUERY_EXTRA: ${{ matrix.query }}
+      BOOTS: ${{ matrix.boots }}
+      WINDOW_AT: ${{ matrix.at }}
+      DEVICE: ${{ matrix.device }}
+      STATUS_CONTEXT: porty/check sf-cpu ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          echo "qemu_commit=$QEMU_WASM_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libglib2.0-0t64 libfdt1 zlib1g
+
+      - name: Restore the native QEMU
+        id: qemu-cache
+        if: needs.prepare.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Restore the image
+        id: image-cache
+        if: needs.prepare.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: ${{ needs.prepare.outputs.image_key }}
+
+      - name: Build the QEMU arguments
+        id: argv
+        if: needs.prepare.outputs.ready == 'true'
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          test -s out/image/manifest.json
+          query="$PHONE$QUERY_EXTRA"
+          echo "query: $query"
+          mkdir -p out/sf out/artifact
+          # The page changes initrd.img in memory before QEMU starts (boot
+          # diet, web/js/boot-diet.js); the native boot uses the same bytes.
+          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/sf/initrd-page.img" "?$query" \
+            | tee out/artifact/boot-diet.txt
+          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+            "$PWD/out/native-qemu/pc-bios" "?$query" \
+            | awk -v initrd="$PWD/out/sf/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+            > out/sf/argv-page.txt
+          grep -qxF "$PWD/out/sf/initrd-page.img" out/sf/argv-page.txt
+          if grep -q kvm out/sf/argv-page.txt; then exit 1; fi
+          cp out/sf/argv-page.txt out/artifact/
+          cat out/sf/argv-page.txt
+
+      - name: Boot and measure
+        id: boot
+        if: steps.argv.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 140
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          (
+            while sleep 180; do
+              [[ -f out/sf/work/progress.txt ]] || continue
+              gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context="$STATUS_CONTEXT" \
+                -f description="$(head -c 140 out/sf/work/progress.txt)" -f target_url="$RUN_URL" >/dev/null 2>&1 || true
+            done
+          ) &
+          reporter=$!
+          trap 'kill "$reporter" 2>/dev/null || true' EXIT
+          python3 -I tests/sf-cpu.py \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/sf/argv-page.txt \
+            --work out/sf/work \
+            --name "$NAME" \
+            --device "$DEVICE" \
+            --boots "$BOOTS" \
+            --window-at "$WINDOW_AT" \
+            --deadline 6600
+
+      - name: Collect logs
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          mkdir -p out/artifact
+          cp out/sf/work/result.json out/artifact/ 2>/dev/null || true
+          for d in out/sf/work/boot-*; do
+            [[ -d "$d" ]] || continue
+            mkdir -p "out/artifact/$(basename "$d")"
+            cp "$d"/serial.log "$d"/qemu.log "$d"/*.png "$d"/*.txt "out/artifact/$(basename "$d")/" 2>/dev/null || true
+          done
+          du -sh out/artifact || true
+
+      - name: Upload the logs
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sf-cpu-${{ matrix.name }}
+          path: out/artifact
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          READY: ${{ needs.prepare.outputs.ready }}
+          ARGV: ${{ steps.argv.outcome }}
+        run: |
+          set +e
+          python3 -I - out/sf/work/result.json "$NAME" "$READY" "$ARGV" > "$RUNNER_TEMP/report.txt" <<'PY'
+          import json, sys
+          path, name, ready, argv = sys.argv[1:5]
+          try:
+              result = json.load(open(path, encoding="utf-8"))
+          except (OSError, ValueError):
+              result = None
+          boots = (result or {}).get("boots") or []
+          booted = [b for b in boots if b.get("booted")]
+          if not boots:
+              why = "native QEMU or image missing" if ready != "true" else ("no QEMU arguments" if argv != "success" else "no boot was made")
+              state, line = "failure", f"{name}: {why}"
+          else:
+              line = result.get("summary", name)
+              state = "success" if len(booted) == len(boots) and not any(b.get("panic") for b in boots) else "failure"
+          print(state)
+          print(line)
+          print()
+          print("| boot | sys.boot_completed (s) | window | s after boot | sf CPU s | sf % | composer % | system_server % | frames | load | guest CPU user/sys/idle % | lit % | shade pulled by pointer | panic |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+          for b in boots:
+              inp = b.get("input") or {}
+              shade = f"changed={inp.get('screen_changed')} expanded={inp.get('shade')} events={inp.get('kernel_events')}" if inp else ""
+              lit = (b.get("screen") or {}).get("lit_percent", "")
+              ws = b.get("windows") or [{}]
+              for w in ws:
+                  cpu = w.get("cpu_percent") or {}
+                  print(f"| {b.get('boot')} | {b.get('booted_seconds', 'no')} | {w.get('label', '')} | {w.get('after_boot_seconds', '')} "
+                        f"| {w.get('sf_cpu_seconds', '')} | {w.get('sf_percent', '')} | {w.get('composer_percent', '')} | {w.get('system_server_percent', '')} "
+                        f"| {w.get('frames', '')} | {w.get('load_end', '')} | {cpu.get('user', '')}/{cpu.get('system', '')}/{cpu.get('idle', '')} "
+                        f"| {lit} | {shade} | {b.get('panic') or ''} |")
+          for b in boots[:1]:
+              ws = b.get("windows") or []
+              print("\n<details><summary>Windows (boot 1)</summary>\n")
+              for w in ws:
+                  print(f"**{w.get('label')}**\n\n```")
+                  print("top: " + ", ".join(f"{t['name']} {t['percent']}%" for t in w.get("top", [])))
+                  print("sf threads: " + ", ".join(f"{t['name']} {t['cpu_seconds']}s" for t in w.get("sf_threads", [])))
+                  if "layer_frames" in w:
+                      print("buffers queued per layer: " + json.dumps(w["layer_frames"]))
+                  print("```\n")
+              print("</details>")
+              for title, block in (("Diagnostics (boot 1)", b.get("diagnostics") or {}), ("Steps (boot 1)", b.get("steps") or {})):
+                  print(f"\n<details><summary>{title}</summary>\n")
+                  for key, value in block.items():
+                      print(f"**{key}**\n\n```\n{str(value)[:3500]}\n```\n")
+                  print("</details>")
+          PY
+          state="$(sed -n '1p' "$RUNNER_TEMP/report.txt")"
+          desc="$(sed -n '2p' "$RUNNER_TEMP/report.txt")"
+          [[ "$state" == success || "$state" == failure ]] || { state=failure; desc="$NAME: no report"; }
+          echo "$state: $desc"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## surfaceflinger CPU: $NAME"
+            echo
+            echo "**$state**: $desc"
+            echo
+            echo "Query \`$PHONE$QUERY_EXTRA\`, device change \`${DEVICE:-none}\`, $BOOTS boots, 60 s windows at \`$WINDOW_AT\` s."
+            sed -n '3,$p' "$RUNNER_TEMP/report.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
