@@ -1,0 +1,158 @@
+# Where WebKit's memory goes while Porty runs, and what bounds it: runs the
+# deployed site in Playwright's WebKit build (the engine of iPhone Safari, on
+# Linux) once per variant, one variant after another in the same job, so
+# that every variant of a job runs on the same CPU (runners differ by more
+# than 2x).  A variant is a set of options of WebKit's JavaScript engine
+# (JSC_*), page parameters and rewrites of QEMU's JavaScript glue on its way
+# to the browser (tests/boot/webkit-test.mjs, GLUE); see
+# tests/boot/webkit-variants.mjs for the syntax.
+#
+# The run never fails, because every failed run emails the repository owner.
+# Each variant posts a commit status ("porty/webkit-mem <variant>"), and the
+# job summary has one table row per variant: peak and steady resident memory
+# of the web content process, the shell loop, the Gallery launch, the CPU.
+name: WebKit memory
+
+on:
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: 'Variants, separated by ";". Words: name=<label>, q=<page parameters>, JSC_<option>=<value>, glue=<patch>+<patch>, probe=0'
+        type: string
+        default: 'name=base; name=nostack JSC_exceptionStackTraceLimit=0; name=gclog JSC_logGC=1'
+      query:
+        description: Page parameters of every variant (a variant's q= adds to them)
+        type: string
+        default: wasmmem=1280&jitcap=4000
+      replicas:
+        description: Jobs (1-6), each runs all variants in turn on its own runner
+        type: number
+        default: 1
+      minutes:
+        description: Deadline of one variant in minutes
+        type: number
+        default: 14
+      probe_seconds:
+        description: Seconds to wait for Gallery after the tap
+        type: number
+        default: 360
+      dump:
+        description: Print parts of QEMU's JavaScript glue (1) or not (0)
+        type: string
+        default: '0'
+
+permissions:
+  contents: read
+  statuses: write  # the verdicts (tests/boot/webkit-test.mjs)
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Matrix
+        id: matrix
+        env:
+          REPLICAS: ${{ inputs.replicas }}
+        run: |
+          n="$(python3 -I -c 'import os; v=os.environ.get("REPLICAS","1"); print(max(1, min(6, int(float(v))) if v.replace(".","",1).isdigit() else 1))')"
+          matrix="$(python3 -I -c "import json; print(json.dumps({'replica': list(range(1, $n + 1))}))")"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix"
+
+  dump:
+    name: QEMU's JavaScript glue
+    if: ${{ inputs.dump == '1' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Print the functions the variants rewrite
+        continue-on-error: true
+        run: |
+          site="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          dir="$(mktemp -d)"
+          curl -fsS --retry 3 -o "$dir/out.js" "${site}qemu/out.js" || { echo "no out.js"; exit 0; }
+          curl -fsS --retry 3 -o "$dir/worker.js" "${site}qemu/qemu-system-x86_64.worker.js" || true
+          wc -c "$dir"/*
+          for pat in 'ffi_call_js' '_emscripten_throw_longjmp' 'function invoke_vi(' 'function invoke_iii(' \
+                     'var getWasmTableEntry' 'var setWasmTableEntry' 'instrumentWasmExports' 'instrumentWasmImports' \
+                     'var stackSave' 'var stackRestore' '_setThrew' 'function instantiate_wasm' 'function remove_module_js' \
+                     'unbox_small_structs' 'var addFunction' 'var removeFunction' 'handleSleep' 'maybeStopUnwind' \
+                     '__emscripten_thread_mailbox_await' 'checkMailbox' 'emscripten_receive_on_main_thread_js' \
+                     '_emscripten_futex_wait' '__emscripten_notify_mailbox_postmessage' 'Atomics.waitAsync'; do
+            echo "::group::$pat"
+            grep -n -F -- "$pat" "$dir/out.js" | cut -c1-240 | head -20 || true
+            line="$(grep -n -F -m1 -- "$pat" "$dir/out.js" | cut -d: -f1 || true)"
+            if [ -n "$line" ]; then
+              sed -n "$((line > 3 ? line - 3 : 1)),$((line + 45))p" "$dir/out.js" | cut -c1-240
+            fi
+            echo "::endgroup::"
+          done
+          echo "::group::worker.js"
+          head -c 6000 "$dir/worker.js" || true
+          echo "::endgroup::"
+
+  test:
+    name: variants (${{ matrix.replica }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The pinned Playwright (tests/webkit/package-lock.json), without its
+      # install scripts.
+      - name: Install playwright-core
+        continue-on-error: true
+        working-directory: tests/webkit
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # Playwright's WebKit build and the system libraries it needs.  The
+      # download is untrusted: it gets a directory of its own outside the
+      # checkout, and nothing in it is run but the browser, by Playwright.
+      - name: Install WebKit
+        continue-on-error: true
+        working-directory: tests/webkit
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: |
+          mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+          npx --no-install playwright-core install --with-deps webkit
+          ls "$PLAYWRIGHT_BROWSERS_PATH"
+
+      - name: Variants
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_DIR: ${{ github.workspace }}/tests/webkit
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          GITHUB_TOKEN: ${{ github.token }}
+          VARIANTS: ${{ inputs.variants }}
+          BASE_QUERY: ${{ inputs.query }}
+          MINUTES: ${{ inputs.minutes || 14 }}
+          PROBE_SECONDS: ${{ inputs.probe_seconds || 360 }}
+          REPLICA: ${{ matrix.replica }}
+          WORK_DIR: ${{ runner.temp }}/variants
+        run: |
+          SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          export SITE_URL
+          nproc
+          free -m
+          grep -m1 'model name' /proc/cpuinfo || true
+          mkdir -p "$WORK_DIR"
+          timeout -k 30 320m node tests/boot/webkit-variants.mjs || echo "the variants ended with status $?"

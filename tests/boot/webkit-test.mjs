@@ -34,6 +34,19 @@
 //   BROWSER_ENV     experiment: options of WebKit's JavaScript engine, set
 //                   as environment variables of the browser, e.g.
 //                   "JSC_useOMGJIT=0" (space separated, JSC_name=value only)
+//   GLUE            experiment: rewrites of QEMU's JavaScript glue (qemu/out.js)
+//                   on its way to the browser, comma separated (see glueRewrite):
+//                     count   counters of what the glue does (throws for
+//                             longjmp, invoke wrappers, libffi calls, compiled
+//                             blocks, sleeps, XHRs, postMessage) in the
+//                             WebAssembly memory, sampled with the memory
+//                     ffi     libffi's ffi_call_js (every helper call of QEMU's
+//                             interpreter) without the arrays it allocates
+//                     slice   instantiate_wasm copies a block's bytes once
+//   SCAN            0 skips the scan of compiled blocks at the end
+//   PROBE           0 skips the tap on Gallery
+//   LOOP_ROUNDS     rounds of the shell loop (default 3)
+//   VARIANT         a label for the summary (tests/boot/webkit-variants.mjs)
 //   PLAYWRIGHT_DIR  directory that has node_modules/playwright-core
 //   CHROME          Chrome binary for BROWSER=chrome (default: Playwright's
 //                   "chrome" channel, the installed Google Chrome)
@@ -72,12 +85,18 @@ const tableGrow = Math.max(0, Math.min(65536, Number(process.env.TABLE_GROW) || 
 const browserEnv = Object.fromEntries((process.env.BROWSER_ENV || '').split(/\s+/)
     .map((w) => /^(JSC_[A-Za-z0-9]+)=([A-Za-z0-9._-]+)$/.exec(w)).filter(Boolean).map((m) => [m[1], m[2]]));
 const envText = Object.entries(browserEnv).map(([k, v]) => `${k}=${v}`).join(' ');
+const glue = (process.env.GLUE || '').split(/[\s,+]+/).filter((g) => /^[a-z0-9-]+$/.test(g));
+const scanBlocksAtEnd = process.env.SCAN !== '0';
+const probeAfterLoops = process.env.PROBE !== '0';
+const loopRounds = Math.max(1, Math.min(12, Number(process.env.LOOP_ROUNDS) || 3));
+const variantName = (process.env.VARIANT || '').replace(/[^A-Za-z0-9_=&.,:%+ -]/g, '').slice(0, 60);
 const queryText = (process.env.QUERY || '').trim().replace(/^\?/, '');
 const params = new URLSearchParams(queryText);
 params.set('serial', '1');
 const url = `${siteUrl}?${params}`;
-const statusContext = `${process.env.STATUS_CONTEXT ||
-    (browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome')} ${queryText || 'defaults'}${tableGrow ? ` tablegrow=${tableGrow}` : ''}${envText ? ` ${envText}` : ''}`.slice(0, 100);
+const statusContext = (process.env.STATUS_CONTEXT ? `${process.env.STATUS_CONTEXT}`
+    : `${browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome'} ${queryText || 'defaults'}` +
+    `${tableGrow ? ` tablegrow=${tableGrow}` : ''}${envText ? ` ${envText}` : ''}${glue.length ? ` glue=${glue.join('+')}` : ''}`).slice(0, 100);
 
 const t0 = Date.now();
 const elapsed = () => {
@@ -93,7 +112,8 @@ const secs = (ms) => Math.round(ms / 100) / 10;
 // Everything worth comparing between runs ends up here ("RESULT" line).
 const result = {
     browser: browserName, device, query: queryText, version: '', coi: '', features: null, bench: null,
-    tableGrow, boot: {}, probe: {}, jit: [], memory: [], crashed: false, errors: [],
+    tableGrow, glue, variant: variantName, boot: {}, probe: {}, jit: [], memory: [], crashed: false, errors: [],
+    peakRss: 0, peakTotal: 0, peakAt: 0,
 };
 const note = (msg) => {
     result.errors.push(msg.slice(0, 300));
@@ -713,6 +733,124 @@ async function fixedCosts() {
     }
 }
 
+/**
+ * Runs in the page: a worker that models QEMU's longjmp under Emscripten.
+ * QEMU leaves its CPU loop with siglongjmp() all the time; Emscripten turns
+ * that into a JavaScript exception ("throw Infinity") thrown by an import,
+ * through WebAssembly frames, to a JavaScript "invoke" wrapper that catches
+ * it.  The worker does this n times without returning to its event loop,
+ * as a vCPU thread does.
+ */
+function startLongjmpModel() {
+    const source = `
+    const bytes = new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+        1, 9, 2, 0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f,
+        2, 29, 2, 3, 0x65, 0x6e, 0x76, 6, 0x69, 0x6e, 0x76, 0x6f, 0x6b, 0x65, 0, 0,
+        3, 0x65, 0x6e, 0x76, 7, 0x74, 0x68, 0x72, 0x6f, 0x77, 0x65, 0x72, 0, 0,
+        3, 4, 3, 0, 1, 1,
+        7, 16, 2, 5, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0, 2, 4, 0x6c, 0x6f, 0x6f, 0x70, 0, 4,
+        10, 67, 3,
+        7, 0, 0x41, 40, 0x10, 3, 0x1a, 0x0b,
+        26, 0, 0x20, 0, 0x45, 0x04, 0x40, 0x10, 1, 0x0b, 0x20, 0, 0x45, 0x04, 0x7f, 0x41, 0, 0x05,
+        0x20, 0, 0x41, 1, 0x6b, 0x10, 3, 0x0b, 0x0b,
+        30, 1, 1, 0x7f, 0x02, 0x40, 0x03, 0x40, 0x20, 1, 0x20, 0, 0x4f, 0x0d, 1, 0x10, 0,
+        0x20, 1, 0x41, 1, 0x6a, 0x21, 1, 0x0c, 0, 0x0b, 0x0b, 0x20, 1, 0x0b]);
+    let ballast = 0, sink = null, inst = null;
+    const env = {
+        invoke() {
+            try {
+                inst.exports.inner();
+            } catch (e) {
+                if (e !== Infinity) {
+                    throw e;
+                }
+                if (ballast) {
+                    sink = new Array(ballast);
+                }
+            }
+        },
+        thrower() {
+            throw Infinity;
+        },
+    };
+    inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env });
+    self.onmessage = (ev) => {
+        ballast = ev.data.ballast || 0;
+        const t = performance.now();
+        let done = 0;
+        try {
+            done = inst.exports.loop(ev.data.n);
+        } catch (e) {
+            self.postMessage({ error: String(e) });
+            return;
+        }
+        self.postMessage({ ms: performance.now() - t, done, sink: sink ? sink.length : 0 });
+    };`;
+    if (globalThis.__longjmpWorker) {
+        globalThis.__longjmpWorker.terminate();
+    }
+    const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+    globalThis.__longjmpWorker = worker;
+    globalThis.__longjmpDone = null;
+    globalThis.__longjmpRun = (n, ballast) => {
+        globalThis.__longjmpDone = null;
+        worker.onmessage = (ev) => {
+            globalThis.__longjmpDone = ev.data;
+        };
+        worker.onerror = (ev) => {
+            globalThis.__longjmpDone = { error: `worker error: ${ev.message}` };
+        };
+        worker.postMessage({ n, ballast });
+    };
+}
+
+/** Does a thread that only throws and catches keep memory?  (WebKit: yes.) */
+async function longjmpBench() {
+    const out = [];
+    result.longjmp = out;
+    const content = () => (memorySample() || { content: 0 }).content;
+    const run = async (n, ballast, limitMs) => {
+        const before = content();
+        let peak = before;
+        const t = Date.now();
+        await page.evaluate(([count, b]) => globalThis.__longjmpRun(count, b), [n, ballast]);
+        let done = null;
+        while (!done && Date.now() - t < limitMs) {
+            await sleep(500);
+            peak = Math.max(peak, content());
+            done = await page.evaluate(() => globalThis.__longjmpDone);
+        }
+        return { before, peak, after: content(), done, seconds: (Date.now() - t) / 1000 };
+    };
+    for (const [name, ballast] of [['as Emscripten does it', 0], ['with 64 array slots allocated per catch', 64]]) {
+        await page.evaluate(startLongjmpModel);
+        await sleep(1000);
+        const warm = await run(20000, ballast, 60000);
+        if (!warm.done || warm.done.error) {
+            log(`LONGJMP MODEL ${name}: ${JSON.stringify(warm.done || 'no answer')}`);
+            continue;
+        }
+        const perSecond = 20000 / (warm.done.ms / 1000);
+        // About 40 s of throwing in one go, at most 3 million.
+        const n = Math.max(20000, Math.min(3000000, Math.round(perSecond * 40)));
+        const r = await run(n, ballast, 150000);
+        const row = {
+            name, throws: n, perSecond: Math.round(perSecond), finished: !!(r.done && !r.done.error),
+            usPerThrow: r.done && r.done.ms ? Math.round((r.done.ms * 1000 / n) * 10) / 10 : null,
+            before: r.before, peak: r.peak, after: r.after,
+            kbPerThrow: Math.round(((r.peak - r.before) * 1024 / n) * 1000) / 1000,
+        };
+        out.push(row);
+        log(`LONGJMP MODEL ${name}: ${n} throws in one go, ${row.usPerThrow} us each; content processes ` +
+            `${r.before} -> peak ${r.peak} MiB (${row.kbPerThrow} kB per throw), ${r.after} MiB at the end` +
+            (row.finished ? '' : ' (NOT FINISHED in 150 s)'));
+        await page.evaluate(() => globalThis.__longjmpWorker.terminate());
+        await sleep(3000);
+        row.stopped = content();
+        log(`LONGJMP MODEL ${name}: ${row.stopped} MiB after stopping the worker`);
+    }
+}
+
 async function jitBench() {
     const call = async (command) => {
         const r = await page.evaluate((c) => globalThis.__jitModel(c), command);
@@ -1154,6 +1292,7 @@ async function sample(label, every = 10000) {
     }
     const m = memorySample(withMaps);
     const h = s.heap || {};
+    const counters = await counterRates();
     const row = {
         t: Math.round((Date.now() - t0) / 1000), label,
         alive: h.jitAlive, compiled: h.jitCompiled, heapUsed: h.used, brk: h.brk,
@@ -1161,10 +1300,12 @@ async function sample(label, every = 10000) {
         rss: m ? m.rss : undefined, anon: m ? m.anon : undefined, shmem: m ? m.shmem : undefined,
         total: m ? m.total : undefined,
         ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest, code: m.code, heaps: m.heaps, giant: m.giant, names: m.names } : {}),
+        ...(counters && counters.rate ? { rates: counters.rate } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
-        `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}" | ${describeMemory(m)}`);
+        `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}" | ${describeMemory(m)}` +
+        (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : ''));
     return s;
 }
 
@@ -1276,7 +1417,7 @@ async function boot() {
         // slow by "timescale"): the same few blocks over and over, so after
         // the first round this is compiled code.
         b.loops = [];
-        for (let round = 1; round <= 3 && !result.crashed; round++) {
+        for (let round = 1; round <= loopRounds && !result.crashed; round++) {
             serialAll = '';
             const tLoop = Date.now();
             await send(`i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo LOOP${round}:$i:END\r`);
@@ -1418,6 +1559,9 @@ async function inputProbe() {
         await sample('settle', 0);
     }
     // What QEMU-Wasm compiled: the modules in its code buffer.
+    if (!scanBlocksAtEnd) {
+        return;
+    }
     try {
         const blocks = await page.evaluate(scanBlocks);
         for (const sm of blocks.samples || []) {
@@ -1433,12 +1577,214 @@ async function inputProbe() {
     }
 }
 
+// ---------------------------------------------------------- glue rewrites ---
+// Counters live in the WebAssembly memory, which every thread shares, below
+// Emscripten's GLOBAL_BASE (1024): nothing else uses those bytes.
+const COUNTER_BASE = 512;
+const COUNTER_NAMES = ['throws', 'invokes', 'catches', 'ffi', 'compiles', 'removes', 'sleeps', 'xhrs',
+    'ffiSlow', 'posts', 'c10', 'c11', 'c12', 'c13', 'c14', 'contexts'];
+
+const COUNT_PRELUDE = `
+var portyCounters = null;
+function portyCount(i) {
+  try {
+    if (!portyCounters) portyCounters = new Int32Array(wasmMemory.buffer, ${COUNTER_BASE}, 16);
+    Atomics.add(portyCounters, i, 1);
+  } catch (e) {}
+}
+portyCount(15);
+if (typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self !== 'undefined' && self.postMessage) {
+  var portyPostMessage = self.postMessage;
+  self.postMessage = function(m, t) { portyCount(9); return t === undefined ? portyPostMessage.call(self, m) : portyPostMessage.call(self, m, t); };
+}
+`;
+
+// libffi's ffi_call_js (src/wasm32/ffi.c) builds an argument array, one
+// two-element array per argument and the return type, saves and restores
+// the stack through exported functions and calls with apply(): for every
+// helper call of QEMU's interpreter.  This one decodes each signature once
+// and calls directly; anything but plain integer and pointer arguments goes
+// to the original (renamed portyFfiSlow).
+const FFI_FAST = `
+var portyFfiInfo = new Map();
+function portyFfiDecode(cif) {
+  var p = cif >> 2;
+  var nargs = HEAPU32[p + 1], nfixed = HEAPU32[p + 6], argTypes = HEAPU32[p + 2], rtype = HEAPU32[p + 3];
+  if (nargs !== nfixed || nargs > 7) return 0;
+  var rid = HEAPU16[(rtype + 6) >> 1], r;
+  if (rid === 0) r = 0;
+  else if (rid === 1 || rid === 9 || rid === 10 || rid === 14) r = 1;
+  else if (rid === 11 || rid === 12) r = 2;
+  else return 0;
+  var wide = 0;
+  for (var i = 0; i < nargs; i++) {
+    var id = HEAPU16[(HEAPU32[(argTypes >> 2) + i] + 6) >> 1];
+    if (id === 11 || id === 12) wide |= 1 << i;
+    else if (!(id === 1 || id === 9 || id === 10 || id === 14)) return 0;
+  }
+  return 1 + nargs + (r << 4) + (wide << 8);
+}
+function portyFfiArg(a, i, wide) {
+  return (wide >> i) & 1 ? HEAPU64[HEAPU32[a + i] >> 3] : HEAPU32[HEAPU32[a + i] >> 2];
+}
+function ffi_call_js(cif, fn, rvalue, avalue) {
+  /*PORTY_FFI_COUNT*/
+  var info = portyFfiInfo.get(cif);
+  if (info === undefined) {
+    info = portyFfiDecode(cif);
+    portyFfiInfo.set(cif, info);
+  }
+  if (info === 0) {
+    /*PORTY_FFI_SLOW_COUNT*/
+    return portyFfiSlow(cif, fn, rvalue, avalue);
+  }
+  info -= 1;
+  var wide = info >> 8, f = getWasmTableEntry(fn), a = avalue >> 2, r;
+  switch (info & 15) {
+  case 0: r = f(); break;
+  case 1: r = f(portyFfiArg(a, 0, wide)); break;
+  case 2: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide)); break;
+  case 3: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide)); break;
+  case 4: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide)); break;
+  case 5: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide),
+                portyFfiArg(a, 4, wide)); break;
+  case 6: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide),
+                portyFfiArg(a, 4, wide), portyFfiArg(a, 5, wide)); break;
+  default: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide),
+                 portyFfiArg(a, 4, wide), portyFfiArg(a, 5, wide), portyFfiArg(a, 6, wide)); break;
+  }
+  var kind = (info >> 4) & 3;
+  if (kind === 1) HEAPU32[rvalue >> 2] = r;
+  else if (kind === 2) HEAPU64[rvalue >> 3] = r;
+}
+`;
+
+/** Insert text before Emscripten's import object, or else before the first invoke wrapper. */
+function insertBeforeImports(js, text) {
+    for (const anchor of [/\n\s*var wasmImports\s*=/, /\nfunction invoke_[a-z]+\(/]) {
+        const m = anchor.exec(js);
+        if (m) {
+            return js.slice(0, m.index) + text + js.slice(m.index);
+        }
+    }
+    return js;
+}
+
+/**
+ * Rewrite QEMU's JavaScript glue (out.js) for the GLUE experiments; `applied`
+ * gets one entry per rewrite: how many places it changed (0: not found).
+ */
+function glueRewrite(js, applied) {
+    let out = js;
+    const count = (re, fn) => {
+        let n = 0;
+        out = out.replace(re, (...m) => {
+            n++;
+            return fn(...m);
+        });
+        return n;
+    };
+    if (glue.includes('ffi')) {
+        const renamed = count(/function ffi_call_js\(/, () => 'function portyFfiSlow(');
+        if (renamed) {
+            let fast = FFI_FAST;
+            if (glue.includes('count')) {
+                fast = fast.replace('/*PORTY_FFI_COUNT*/', 'portyCount(3);').replace('/*PORTY_FFI_SLOW_COUNT*/', 'portyCount(8);');
+            }
+            const before = out.length;
+            out = insertBeforeImports(out, fast);
+            applied.ffi = out.length > before ? 1 : 0;
+        } else {
+            applied.ffi = 0;
+        }
+    }
+    if (glue.includes('slice')) {
+        applied.slice = count(/new Uint8Array\(HEAP8\.slice\(([^)]*)\)\)/, (m, a) => `HEAP8.slice(${a})`);
+    }
+    if (glue.includes('count')) {
+        const before = out.length;
+        out = insertBeforeImports(out, COUNT_PRELUDE);
+        applied.countPrelude = out.length > before ? 1 : 0;
+        applied.countThrow = count(/((?:__emscripten_throw_longjmp\s*=\s*(?:\(\)\s*=>|function\s*\(\))|function\s+__emscripten_throw_longjmp\s*\(\))\s*\{)/,
+            (m, a) => `${a} portyCount(0);`);
+        applied.countInvoke = count(/(function invoke_[a-zA-Z0-9]+\([^)]*\)\s*\{\s*var sp = stackSave\(\);)/g, (m, a) => `${a} portyCount(1);`);
+        applied.countCatch = count(/(_setThrew\(1,\s*0\);)/g, (m, a) => `portyCount(2); ${a}`);
+        if (!glue.includes('ffi')) {
+            applied.countFfi = count(/(function ffi_call_js\([^)]*\)\s*\{)/, (m, a) => `${a} portyCount(3);`);
+        }
+        applied.countCompile = count(/(function instantiate_wasm\(\)\s*\{)/, (m, a) => `${a} portyCount(4);`);
+        applied.countRemove = count(/(function remove_module_js\(\)\s*\{)/, (m, a) => `${a} portyCount(5);`);
+        applied.countSleep = count(/((?:var\s+)?_emscripten_sleep\s*=\s*(?:\(ms\)\s*=>|function\s*\(ms\))\s*\{|function\s+_emscripten_sleep\s*\(ms\)\s*\{)/,
+            (m, a) => `${a} portyCount(6);`);
+        applied.countXhr = count(/new XMLHttpRequest\(\)/g, () => '(portyCount(7), new XMLHttpRequest())');
+    }
+    return out;
+}
+
+/** Runs in the page: the glue counters, or null without them. */
+function readCounters(base) {
+    const e = globalThis.__porty;
+    if (!e || !e.memory) {
+        return null;
+    }
+    return Array.from(new Int32Array(e.memory.buffer, base, 16));
+}
+
+let lastCounters = null;
+const counterStart = { t: 0, c: null };
+
+/** Counters since the last call, per second. */
+async function counterRates() {
+    if (!glue.includes('count')) {
+        return null;
+    }
+    let c;
+    try {
+        c = await page.evaluate(readCounters, COUNTER_BASE);
+    } catch (e) {
+        return null;
+    }
+    if (!c) {
+        return null;
+    }
+    const now = Date.now();
+    const out = { total: Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, c[i]]).filter(([n, v]) => v && !/^c1\d$/.test(n))) };
+    if (lastCounters) {
+        const dt = (now - lastCounters.t) / 1000;
+        out.rate = Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, Math.round((c[i] - lastCounters.c[i]) / dt)])
+            .filter(([n, v]) => v && n !== 'contexts' && !/^c1\d$/.test(n)));
+    }
+    if (!counterStart.c) {
+        counterStart.t = now;
+        counterStart.c = c;
+    }
+    lastCounters = { t: now, c };
+    return out;
+}
+
+// --------------------------------------------------------- peak sampler ---
+// Resident memory peaks between the samples: every 2 s, /proc/<pid>/status only.
+const peakTimer = setInterval(() => {
+    try {
+        const m = memorySample();
+        if (m && m.rss > result.peakRss) {
+            result.peakRss = m.rss;
+            result.peakAt = Math.round((Date.now() - t0) / 1000);
+        }
+        if (m && m.total > result.peakTotal) {
+            result.peakTotal = m.total;
+        }
+    } catch (e) {
+        // the browser is gone
+    }
+}, 2000);
+
 // ------------------------------------------------------------------ run ---
 function summarize() {
     const b = result.boot;
     const p = result.probe;
     const last = result.jit[result.jit.length - 1] || {};
-    const peak = result.jit.reduce((m, r) => Math.max(m, r.rss || 0), 0);
+    const peak = result.jit.reduce((m, r) => Math.max(m, r.rss || 0), result.peakRss || 0);
     const parts = [];
     if (result.crashed) {
         parts.push('CRASHED');
@@ -1471,23 +1817,35 @@ function summarize() {
 }
 
 try {
-    if (tableGrow > 0) {
-        // Experiment: Emscripten's addFunction() grows QEMU's table by one
-        // entry for every compiled block.  Grow it in steps instead and
-        // hand out the spare entries.  (QEMU's JavaScript is rewritten on
-        // its way to the browser; nothing on the site changes.)
+    if (tableGrow > 0 || glue.length) {
+        // Experiments on QEMU's JavaScript, rewritten on its way to the
+        // browser; nothing on the site changes.  TABLE_GROW: Emscripten's
+        // addFunction() grows QEMU's table by one entry for every compiled
+        // block; grow it in steps instead and hand out the spare entries.
+        // GLUE: see glueRewrite().
         const patch = `wasmTable.grow(${tableGrow});for(var portyI=wasmTable.length-${tableGrow};` +
             'portyI<wasmTable.length-1;portyI++)freeTableIndexes.push(portyI)';
         await page.context().route(/\/qemu\/out\.js/, async (route) => {
             try {
                 const response = await route.fetch();
-                const text = await response.text();
-                const hits = text.split('wasmTable.grow(1)').length - 1;
-                result.tableGrowHits = (result.tableGrowHits || 0) + hits;
-                result.tableGrowLoads = (result.tableGrowLoads || 0) + 1;
-                await route.fulfill({ response, body: text.split('wasmTable.grow(1)').join(patch) });
+                let text = await response.text();
+                result.glueLoads = (result.glueLoads || 0) + 1;
+                if (tableGrow > 0) {
+                    const hits = text.split('wasmTable.grow(1)').length - 1;
+                    result.tableGrowHits = (result.tableGrowHits || 0) + hits;
+                    text = text.split('wasmTable.grow(1)').join(patch);
+                }
+                if (glue.length) {
+                    const applied = {};
+                    text = glueRewrite(text, applied);
+                    if (!result.glueApplied) {
+                        result.glueApplied = applied;
+                        log(`GLUE ${glue.join('+')}: ${JSON.stringify(applied)} (load ${result.glueLoads})`);
+                    }
+                }
+                await route.fulfill({ response, body: text });
             } catch (e) {
-                log(`table-grow patch failed: ${String(e.message).split('\n')[0]}`);
+                log(`glue rewrite failed: ${String(e.message).split('\n')[0]}`);
                 await route.continue().catch(() => {});
             }
         });
@@ -1569,6 +1927,11 @@ try {
             note(`fixed-cost probe failed: ${String(e.message || e).split('\n')[0]}`);
         }
         try {
+            await longjmpBench();
+        } catch (e) {
+            note(`longjmp model failed: ${String(e.message || e).split('\n')[0]}`);
+        }
+        try {
             await jitBench();
         } catch (e) {
             note(`JIT MODEL failed: ${String(e.message || e).split('\n')[0]}`);
@@ -1583,7 +1946,16 @@ try {
         await sleep(3000);
         log(`memory before the start: ${describeMemory(memorySample())}`);
         if (await boot()) {
-            await inputProbe();
+            if (probeAfterLoops) {
+                await inputProbe();
+            } else {
+                for (let i = 0; i < 3 && !result.crashed; i++) {
+                    await sleep(10000);
+                    await drainSerial();
+                    lastSample = 0;
+                    await sample('settle', 0);
+                }
+            }
         }
         await shot('final');
     }
@@ -1592,6 +1964,15 @@ try {
     await shot('error');
 }
 
+clearInterval(peakTimer);
+if (counterStart.c && lastCounters && lastCounters.t > counterStart.t) {
+    const dt = (lastCounters.t - counterStart.t) / 1000;
+    result.counterRates = Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, Math.round((lastCounters.c[i] - counterStart.c[i]) / dt)])
+        .filter(([n, v]) => v && n !== 'contexts' && !/^c1\d$/.test(n)));
+    result.counterTotals = Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, lastCounters.c[i]]).filter(([, v]) => v));
+    log(`COUNTERS per second over ${Math.round(dt)} s: ${JSON.stringify(result.counterRates)}; totals ${JSON.stringify(result.counterTotals)}`);
+}
+log(`PEAK: content process ${result.peakRss} MiB at ${result.peakAt} s, all processes ${result.peakTotal} MiB`);
 const verdict = summarize();
 log(`SUMMARY: ${verdict}; elapsed ${elapsed()}`);
 console.log(`RESULT ${JSON.stringify(result)}`);
@@ -1602,7 +1983,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
     const be = result.bench || {};
     const rows = result.jit.filter((r, i, a) => i === a.length - 1 || i % Math.max(1, Math.floor(a.length / 30)) === 0);
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
-        `## ${result.version}: \`${queryText || 'defaults'}\`${envText ? ` with ${envText}` : ''} on ${cpuModel}`,
+        `## ${variantName ? `${variantName}: ` : ''}${result.version}: \`${queryText || 'defaults'}\`${envText ? ` with ${envText}` : ''}${glue.length ? ` glue ${glue.join('+')}` : ''} on ${cpuModel}`,
         '',
         `- **${verdict}**`,
         `- URL: ${url}`,
@@ -1612,6 +1993,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         ...(tableGrow ? [`- Experiment: table grows by ${tableGrow} (${result.tableGrowHits || 0} places rewritten in ${result.tableGrowLoads || 0} loads of out.js)`] : []),
         `- Compiled blocks in the code buffer: ${JSON.stringify(result.blocks || {})}`,
         ...(result.fixed ? [`- Fixed costs (MiB): ${JSON.stringify(result.fixed)}`] : []),
+        ...(result.longjmp || []).map((r) => `- longjmp model, ${r.name}: ${r.throws} throws, ${r.usPerThrow} us each, content processes ${r.before} -> peak ${r.peak} MiB (${r.kbPerThrow} kB per throw), ${r.stopped} MiB after stopping`),
         `- Boot: ${JSON.stringify(result.boot)}`,
         `- Probe: ${JSON.stringify(result.probe)}`,
         ...(be.make ? [
