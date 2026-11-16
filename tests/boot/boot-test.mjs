@@ -231,7 +231,7 @@ async function inputProbe() {
                 console.log(`serial| ${line.replace(/\r$/, '')}`);
             }
             // The output of the marker command, not its echo.
-            const m = line.match(/FOCUS:(mCurrentFocus[^\r\n]*):END/);
+            const m = line.match(/FOCUS:\s*(mCurrentFocus[^\r\n]*):END/);
             if (m) {
                 lastFocus = m[1];
             }
