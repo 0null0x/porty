@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parseConfig } from '../web/js/config.js';
 import {
-    DIET_LEVELS, DIET_SCRIPT, applyBootDiet, describeDiet, dietArchive, dietProps, dietScript, parseProps,
+    DIET_LEVELS, DIET_SCRIPT, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps, dietScript,
+    parseProps,
 } from '../web/js/boot-diet.js';
 import { appendInitramfs, appendOffset, newcArchive, parseNewc } from '../web/js/initramfs.js';
 
@@ -71,13 +73,14 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
     assert.equal(dflt.diet, 1);
     assert.deepEqual(dietProps(dflt), [
         ['debug.sf.nobootanimation', '1'], ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract']]);
-    assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract');
+    assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract ttmfix');
     // the screen must come on: never the quiescent boot
     assert.ok(DIET_LEVELS.flat().every(([k]) => !/quiescent/.test(k)));
 
     const off = parseConfig('?diet=0', {});
     assert.deepEqual(dietProps(off), []);
-    assert.equal(describeDiet(off), ' props: none');
+    assert.equal(describeDiet(off), ' props: none ttmfix');
+    assert.equal(describeDiet(parseConfig('?diet=0&ttmfix=0', {})), ' props: none');
     assert.deepEqual(dietProps(parseConfig('?diet=0&props=a.b=c', {})), [['a.b', 'c']]);
     assert.equal(parseConfig('?diet=7', {}).diet, 2);
     assert.deepEqual(dietProps(parseConfig('?diet=2', {})).slice(3), [
@@ -153,6 +156,111 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         rmSync(path.join(dir, 'default.prop'));
         const none = spawnSync(shell[0], [...shell.slice(1), '-c', '. ./script'], { cwd: dir });
         assert.equal(String(none.stdout), 'porty: no default.prop, boot diet skipped\n');
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+// --- the kernel module fix (ttm.ko) -----------------------------------------------------
+{
+    // On by default, also without any property; off with gfx=vesa and ttmfix=0.
+    assert.equal(parseConfig('', {}).ttmfix, true);
+    assert.equal(dietFixes(parseConfig('', {})).ttm, TTM_FIX);
+    assert.equal(dietFixes(parseConfig('?diet=0', {})).ttm, TTM_FIX);
+    assert.equal(dietFixes(parseConfig('?ttmfix=0', {})).ttm, false);
+    assert.equal(dietFixes(parseConfig('?gfx=vesa', {})).ttm, false);
+    assert.equal(describeDiet(parseConfig('?gfx=vesa', {})).includes('ttmfix'), false);
+
+    // What is known about the module: the jne of ttm_bo_vm_open's WARN_ON
+    // (0x65cd in .text, which starts at 0x70 in the file) becomes "66 90".
+    assert.equal(TTM_FIX.offset, 26173);
+    assert.deepEqual(TTM_FIX.bytes, [0x66, 0x90]);
+    assert.match(TTM_FIX.module, /^system\/lib\/modules\/4\.19\.110-android-x86_64-g066cc1d\/kernel\/drivers\/gpu\/drm\/ttm\/ttm\.ko$/);
+    assert.match(TTM_FIX.sha256, /^[0-9a-f]{64}$/);
+    assert.match(TTM_FIX.patchedSha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(TTM_FIX.sha256, TTM_FIX.patchedSha256);
+
+    // The script: the properties' part is unchanged, the fix follows it.
+    const props = dietProps(parseConfig('', {}));
+    const plain = dietScript(props);
+    assert.equal(dietScript(props, { ttm: false }), plain);
+    assert.ok(!plain.includes('porty_module'));
+    const fixed = dietScript(props, { ttm: TTM_FIX });
+    assert.ok(fixed.startsWith(plain.slice(0, -1)), 'the fix is appended to the script');
+    assert.match(fixed, /\n\tprintf '\\146\\220' \| dd of=porty-ttm\.ko bs=1 seek=26173 conv=notrunc 2>\/dev\/null\n/);
+    assert.match(fixed, /&& mount --bind porty-ttm\.ko \$porty_m; then\n/);
+    assert.ok(dietScript([], { ttm: TTM_FIX }).includes('porty_module') && !dietScript([], { ttm: TTM_FIX }).includes('porty_diet'));
+
+    // An initrd gets the archive for the fix alone, too.
+    const initrd = new Uint8Array([0x1f, 0x8b, 8, 0, 0]);
+    assert.equal(applyBootDiet(initrd, [], { ttm: false }), initrd);
+    const withFix = applyBootDiet(initrd, [], { ttm: TTM_FIX });
+    assert.equal(ascii(parseNewc(withFix, 8).entries[1].data), dietScript([], { ttm: TTM_FIX }));
+    assert.equal(ascii(parseNewc(dietArchive(props, { ttm: TTM_FIX }), 0).entries[1].data), fixed);
+
+    // Nothing from outside ends up in the script.
+    for (const bad of [{ module: 'a b' }, { module: '../x' }, { module: 'a;reboot' }, { sha256: 'xyz' },
+        { patchedSha256: '$(reboot)' }, { offset: -1 }, { offset: 1.5 }, { offset: '1; reboot' }, { bytes: [] },
+        { bytes: [256] }, { bytes: ['7'] }, { bytes: new Array(17).fill(0) }]) {
+        assert.throws(() => dietScript([], { ttm: { ...TTM_FIX, ...bad } }), /bad module fix/, JSON.stringify(bad));
+    }
+
+    // Run it like /init does, against a stand-in module: 64 KiB of noise
+    // with the jne at the real offset.  "mount" is a shell function here
+    // (binding needs root); it records what it was asked to do.
+    const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+    const module = new Uint8Array(40000).map((_, i) => (i * 7 + 3) % 256);
+    module.set([0x48, 0x39, 0x8a, 0xe0, 0x06, 0x00, 0x00, 0x75, 0x11, 0xf0, 0xff, 0x43, 0x28], TTM_FIX.offset - 7);
+    const patched = module.slice();
+    patched.set(TTM_FIX.bytes, TTM_FIX.offset);
+    const fix = { ...TTM_FIX, sha256: sha256(module), patchedSha256: sha256(patched) };
+    const shell = have('busybox') ? ['busybox', 'sh'] : ['sh'];
+    const dir = mkdtempSync(path.join(tmpdir(), 'porty-ttm-'));
+    const run = (script) => spawnSync(shell[0], [...shell.slice(1), '-c',
+        'mount() { echo "mount $*" >> mounts; }; . ./script'], { cwd: dir, input: '' , env: { ...process.env } });
+    try {
+        const file = path.join(dir, fix.module);
+        writeFileSync(path.join(dir, 'default.prop'), 'ro.debuggable=1\n');
+
+        // no module at all (the native tests' tiny guest): say so
+        writeFileSync(path.join(dir, 'script'), dietScript([], { ttm: fix }));
+        let out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: no ttm.ko, nothing to fix\n');
+
+        // the module that is known: a copy with the two bytes changed, bound over it
+        mkdirSync(path.dirname(file), { recursive: true });
+        writeFileSync(file, module);
+        writeFileSync(path.join(dir, 'script'), dietScript(props, { ttm: fix }));
+        out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout),
+            'porty: boot diet, 3 properties in default.prop\nporty: ttm.ko fixed (2 bytes at 26173)\n');
+        assert.equal(readFileSync(path.join(dir, 'mounts'), 'utf8'), `mount --bind porty-ttm.ko ${fix.module}\n`);
+        const copy = readFileSync(path.join(dir, 'porty-ttm.ko'));
+        assert.equal(copy.length, module.length);
+        const changed = [...copy].map((b, i) => (b === module[i] ? -1 : i)).filter((i) => i >= 0);
+        assert.deepEqual(changed, [26173, 26174]);
+        assert.deepEqual([...copy.subarray(26173, 26175)], [0x66, 0x90]);
+        assert.deepEqual([...readFileSync(file)], [...module], 'the shipped file itself is not written to');
+
+        // any other module (another build, a changed image): left alone
+        rmSync(path.join(dir, 'mounts'));
+        rmSync(path.join(dir, 'porty-ttm.ko'));
+        const other = module.slice();
+        other[100] ^= 1;
+        writeFileSync(file, other);
+        writeFileSync(path.join(dir, 'script'), dietScript([], { ttm: fix }));
+        out = run();
+        assert.equal(String(out.stdout), 'porty: ttm.ko is not the one known, left alone\n');
+        assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-ttm.ko')));
+
+        // the patch did not give the expected file: no bind, no copy left
+        writeFileSync(file, module);
+        writeFileSync(path.join(dir, 'script'), dietScript([], { ttm: { ...fix, patchedSha256: sha256(module) } }));
+        out = run();
+        assert.equal(String(out.stdout), 'porty: ttm.ko could not be fixed, left alone\n');
+        assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-ttm.ko')));
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

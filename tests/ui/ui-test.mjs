@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { parseConfig } from '../../web/js/config.js';
-import { DIET_SCRIPT, dietProps, dietScript } from '../../web/js/boot-diet.js';
+import { DIET_SCRIPT, dietFixes, dietProps, dietScript } from '../../web/js/boot-diet.js';
 import { parseNewc } from '../../web/js/initramfs.js';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
@@ -101,7 +101,10 @@ try {
     const appended = parseNewc(new Uint8Array(initrd.tail), padding);
     assert.equal(appended.end, initrd.tail.length, 'the archive ends the initrd');
     assert.deepEqual(appended.entries.map((e) => e.name), ['scripts', DIET_SCRIPT]);
-    assert.equal(Buffer.from(appended.entries[1].data).toString('latin1'), dietScript(wantProps));
+    const wantFixes = dietFixes(parseConfig(query, {}));
+    assert.ok(wantFixes.ttm, 'the default configuration fixes ttm.ko');
+    assert.equal(Buffer.from(appended.entries[1].data).toString('latin1'), dietScript(wantProps, wantFixes));
+    assert.ok(initrd.notes.some((n) => n.startsWith('The kernel module ttm.ko is replaced at boot')));
     assert.ok(initrd.notes.some((n) => n.startsWith('Android properties set at boot: debug.sf.nobootanimation=1, ')));
     ok(`initrd.img gets the boot-diet script appended (${wantProps.length} properties, ${initrd.tail.length} bytes)`);
 

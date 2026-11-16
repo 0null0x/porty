@@ -156,6 +156,8 @@ const snapshot = () => ({
     assert.deepEqual(rtc.slice(0, -2), buildQemuArgs(kept, imageManifest, pagePaths));
     assert.match(resumeVeto({ search: '?timescale=2' }), /sets timescale=/);
     assert.match(resumeVeto({ search: '?diet=0' }), /sets diet=/);
+    // ttm.ko fixed or not is decided when the saved machine boots.
+    assert.match(resumeVeto({ search: '?ttmfix=0' }), /sets ttmfix=/);
 
     // A desktop-sized snapshot is not for phones.
     const big = snapshot();

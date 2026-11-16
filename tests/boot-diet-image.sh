@@ -145,6 +145,44 @@ if [[ "$with_system" == --system ]]; then
             echo "    /system/build.prop, the lines for keys the diet touches:"
             debugfs -R 'cat /build.prop' "$work/sfs/system.img" 2>/dev/null | grep -E "^($keys)" | sed 's/^/        /' || echo "        (none)"
             echo "    /system/framework architectures: $(debugfs -R 'ls -p /framework' "$work/sfs/system.img" 2>/dev/null | cut -d/ -f6 | grep -E '^(x86|x86_64|arm|arm64|oat)$' | tr '\n' ' ')"
+
+            # The kernel module fix (boot-diet.js, TTM_FIX): the module the
+            # image ships must be the one the page knows, and the page's
+            # script, sourced like /init sources it (in /android, with the
+            # system image at ./system), must put the patched copy over it.
+            # "mount" is a shell function here: binding needs root.
+            read -r ttm_path ttm_sha ttm_patched ttm_offset < <(node --input-type=module -e "
+                import { TTM_FIX as f } from '$repo/web/js/boot-diet.js';
+                console.log(f.module, f.sha256, f.patchedSha256, f.offset);")
+            mkdir -p "$work/android/$(dirname "$ttm_path")"
+            debugfs -R "dump /${ttm_path#system/} $work/android/$ttm_path" "$work/sfs/system.img" >/dev/null 2>&1 || true
+            if [[ "$(sha256sum < "$work/android/$ttm_path" | cut -c1-64)" == "$ttm_sha" ]]; then
+                pass "ttm fix: the image's ttm.ko is the one the page knows ($(stat -c %s "$work/android/$ttm_path") bytes)"
+            else
+                bad "ttm fix: /$ttm_path is not the module the page knows (sha256 $(sha256sum < "$work/android/$ttm_path" | cut -c1-64))"
+            fi
+            # shellcheck disable=SC2016
+            said="$(cd "$work/android" && busybox sh -c 'mount() { echo "mount $*"; }; for s in `ls "$1"/scripts/*`; do test -e "$s" && source $s; done' sh "$work/combined" 2>&1)" || true
+            echo "    the scripts printed: $said"
+            if [[ "$said" == *"mount --bind porty-ttm.ko $ttm_path"*"porty: ttm.ko fixed (2 bytes at $ttm_offset)"* ]] \
+                && [[ "$(sha256sum < "$work/android/porty-ttm.ko" | cut -c1-64)" == "$ttm_patched" ]]; then
+                pass "ttm fix: the script binds a copy with the expected hash over the module"
+            else
+                bad "ttm fix: script output or the patched copy"
+            fi
+            if command -v objdump >/dev/null; then
+                before="$(objdump -d --disassemble=ttm_bo_vm_open "$work/android/$ttm_path" | grep -c -E '\sjne\s' || true)"
+                after="$(objdump -d --disassemble=ttm_bo_vm_open "$work/android/porty-ttm.ko" | grep -c -E '\sjne\s' || true)"
+                echo "    ttm_bo_vm_open in the patched copy:"
+                objdump -d --disassemble=ttm_bo_vm_open "$work/android/porty-ttm.ko" | sed -n '/<ttm_bo_vm_open>:/,/^$/p' | sed 's/^/        /'
+                if [[ "$before" == 1 && "$after" == 0 ]]; then
+                    pass "ttm fix: ttm_bo_vm_open no longer branches to its WARN_ON (jne: $before before, $after after)"
+                else
+                    bad "ttm fix: jne in ttm_bo_vm_open: $before before, $after after"
+                fi
+            else
+                echo "SKIP  ttm fix: no objdump to disassemble ttm_bo_vm_open"
+            fi
         else
             echo "    no system.img inside system.sfs; build.prop not inspected"
         fi

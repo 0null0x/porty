@@ -5,7 +5,7 @@ import { MIB, chooseWasmMemoryMb, fallbackLadder, requiredWasmMemoryMb } from '.
 import { buildKernelCmdline, buildQemuArgs } from './qemu-args.js';
 import { WASM_PAGE, findMemoryImport, setMemoryImportPages } from './wasm-patch.js';
 import { Display } from './display.js';
-import { applyBootDiet, dietProps } from './boot-diet.js';
+import { applyBootDiet, dietFixes, dietProps } from './boot-diet.js';
 import {
     SNAPSHOT_DIR, SNAP_DONE, SNAP_FAILED, STAGE_RESUMING, checkSnapshot, describeResume, readSnapshotStats,
     snapshotArgs, snapshotConfig, snapshotIndex,
@@ -274,12 +274,19 @@ export class Emulator {
         // (After the memory is settled: a resume uses the snapshot's settings,
         // so that the initrd is the one the saved machine was started with.)
         const props = dietProps(this.cfg);
-        blobs.initrd = applyBootDiet(blobs.initrd, props);
+        const fixes = dietFixes(this.cfg);
+        blobs.initrd = applyBootDiet(blobs.initrd, props, fixes);
         this.notes.push(props.length
             ? `Android properties set at boot: ${props.map((p) => p.join('=')).join(', ')}.`
             : 'No Android properties set at boot (diet=0).');
         if (this.cfg.propsRejected) {
             this.notes.push(`${this.cfg.propsRejected} entries of ?props= were ignored (not key=value of letters, digits, . _ -).`);
+        }
+        if (fixes.ttm) {
+            this.notes.push('The kernel module ttm.ko is replaced at boot by a copy without the WARN_ON in ' +
+                'ttm_bo_vm_open (this kernel panics on it when Android collects stack traces); ttmfix=0 leaves it.');
+        } else if (this.cfg.gfx !== 'vesa') {
+            this.notes.push('ttmfix=0: ttm.ko is left as shipped; the guest panics when surfaceflinger forks.');
         }
 
         // --- QEMU ---------------------------------------------------------------

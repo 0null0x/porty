@@ -67,6 +67,7 @@ export const PARAM_HELP = [
     ['fps', 'canvas refresh cap (default 30).'],
     ['diet', 'Android properties that shorten the boot: 1 (default) no boot animation and no first-boot app verification, 0 none, 2 also a 64-bit-only Android (experiment).'],
     ['props', 'more Android properties, key=value,key=value (letters, digits, . _ -); they override diet.'],
+    ['ttmfix', '0 leaves the kernel module ttm.ko as shipped: the guest then panics when Android collects stack traces (for diagnosis).'],
     ['resume', '1 resumes the saved Android even with other settings in the address; 0 always boots.'],
 ];
 
@@ -167,6 +168,8 @@ export function parseConfig(search, env = {}) {
         diet: intParam(params, 'diet', 1, 0, 2),
         props: parseProps(params.get('props')).props,
         propsRejected: parseProps(params.get('props')).rejected,
+        // false: no patched ttm.ko (boot-diet.js, TTM_FIX).
+        ttmfix: boolParam(params, 'ttmfix', true),
     };
     return cfg;
 }

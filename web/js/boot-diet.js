@@ -14,6 +14,10 @@
 //
 // Sources for each property are AOSP pie-release; measurements are from
 // Porty's boot tests of 2026-11-16 (docs/PLAN.md).
+//
+// The same script also replaces one kernel module, ttm.ko, with a copy in
+// which two bytes differ (TTM_FIX below): without that the guest's kernel
+// panics as soon as Android collects stack traces.
 // Pure functions (no DOM).
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -57,6 +61,52 @@ export const DIET_LEVELS = [
     ],
 ];
 
+// The kernel fix.  Android-x86 9.0-r2 draws through the fbdev emulation of
+// bochs-drm: surfaceflinger maps /dev/graphics/fb0, and that mapping
+// (bochsfb_mmap -> ttm_fbdev_mmap) uses TTM's vm_ops on a file that is not
+// the DRM device.  When such a process forks, ttm_bo_vm_open() runs
+//     WARN_ON(bo->bdev->dev_mapping != vma->vm_file->f_mapping);
+// which is always true for an fbdev mapping.  Anywhere else that is a line
+// in the log.  This kernel's do_invalid_op() was replaced by an SSE4/POPCNT
+// emulator that never calls fixup_bug(), so the WARN's ud2 is an "invalid
+// opcode" oops, and Android's init has set kernel.panic_on_oops=1: "Kernel
+// panic - not syncing: Fatal exception", reboot.  surfaceflinger forks
+// whenever debuggerd dumps its stack, which ActivityManager asks for after
+// every "not responding" app and the Watchdog after 30 s: all the time in a
+// guest that runs 50-100 times slower than a phone.
+//
+// The fix turns the WARN_ON's conditional jump into a 2-byte NOP, so that
+// ttm_bo_vm_open() only takes its reference:
+//     65c6: 48 39 8a e0 06 00 00   cmp  %rcx,0x6e0(%rdx)
+//     65cd: 75 11                  jne  65e0   ->   66 90  (nop)
+//     65cf: f0 ff 43 28            lock incl 0x28(%rbx)
+// (.text starts at 0x70 in the file.)  /init has mounted the system image
+// at /android/system when it sources the script and loads modules only
+// afterwards (load_modules, later Android's own modprobe), so the copy,
+// bind-mounted over the file, is the module the kernel gets.  The script
+// touches nothing unless the file is exactly the one known here.
+// Checked against the image by tests/boot-diet-image.sh --system, and by
+// booting in .github/workflows/ttm-panic.yml.
+export const TTM_FIX = {
+    module: 'system/lib/modules/4.19.110-android-x86_64-g066cc1d/kernel/drivers/gpu/drm/ttm/ttm.ko',
+    sha256: '25e53cd13eb8af090f0aef504085413ff3213da485337229d482ccb3d72d6536',
+    offset: 0x70 + 0x65cd,
+    bytes: [0x66, 0x90],
+    patchedSha256: '1958d6138042f15e0b83369914962e7d0d041ac0e831ec44cadb8908b3166408',
+};
+
+const FIX_PATH = /^[A-Za-z0-9._/-]{1,200}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+
+/**
+ * Which kernel fixes a config gets: { ttm: false | TTM_FIX }.  Not with
+ * gfx=vesa (nomodeset: bochs-drm never drives the screen, nothing maps a
+ * TTM buffer) and not with ttmfix=0.
+ */
+export function dietFixes(cfg) {
+    return { ttm: cfg.ttmfix !== false && cfg.gfx !== 'vesa' ? TTM_FIX : false };
+}
+
 /** "k=v,k=v" from the URL -> { props: [[k, v]...], rejected: n }. */
 export function parseProps(raw) {
     const props = [];
@@ -92,28 +142,21 @@ export function dietProps(cfg) {
     return [...merged];
 }
 
-/** For the configuration line: " props: k=v k=v". */
+/** For the configuration line: " props: k=v k=v" and the kernel fix. */
 export function describeDiet(cfg) {
     const props = dietProps(cfg);
-    return props.length ? ` props: ${props.map((p) => p.join('=')).join(' ')}` : ' props: none';
+    return (props.length ? ` props: ${props.map((p) => p.join('=')).join(' ')}` : ' props: none')
+        + (dietFixes(cfg).ttm ? ' ttmfix' : '');
 }
 
-/**
- * The script for the initrd (busybox ash, sourced by /init from /android).
- * Lines for the same keys are removed first: init keeps the first value of
- * a "ro." property and the last of any other.
- */
-export function dietScript(props) {
-    for (const [key, value] of props) {
-        if (!KEY.test(key) || !VALUE.test(value)) {
-            throw new Error(`dietScript: bad property ${JSON.stringify([key, value])}`);
-        }
+/** Shell lines that set the properties (empty: none to set). */
+function propLines(props) {
+    if (!props.length) {
+        return [];
     }
     const drop = props.map(([key]) => `-e '/^${key.replace(/\./g, '\\.')}=/d'`).join(' ');
     const zygote64 = props.some(([key, value]) => key === 'ro.zygote' && value === 'zygote64');
     return [
-        '# Porty boot diet, written by the web page (web/js/boot-diet.js).',
-        '# Sourced by /init in /android after ramdisk.img was unpacked there.',
         'porty_diet()',
         '{',
         '\tporty_f=default.prop',
@@ -142,19 +185,84 @@ export function dietScript(props) {
         `\techo "porty: boot diet, ${props.length} properties in $porty_f"`,
         '}',
         'porty_diet',
+    ];
+}
+
+/**
+ * Shell lines that put a patched copy of a kernel module in its place (see
+ * TTM_FIX).  The copy lives in the root tmpfs; every step is checked by
+ * hash, and the original stays in place when anything is not as expected.
+ */
+function moduleFixLines(fix) {
+    if (!fix) {
+        return [];
+    }
+    const ok = FIX_PATH.test(fix.module) && !fix.module.includes('..') && SHA256.test(fix.sha256)
+        && SHA256.test(fix.patchedSha256) && Number.isSafeInteger(fix.offset) && fix.offset >= 0
+        && Array.isArray(fix.bytes) && fix.bytes.length > 0 && fix.bytes.length <= 16
+        && fix.bytes.every((b) => Number.isInteger(b) && b >= 0 && b <= 255);
+    if (!ok) {
+        throw new Error(`dietScript: bad module fix ${JSON.stringify(fix)}`);
+    }
+    const name = fix.module.split('/').pop();
+    const octal = fix.bytes.map((b) => `\\${b.toString(8).padStart(3, '0')}`).join('');
+    return [
+        'porty_module()',
+        '{',
+        `\tporty_m=${fix.module}`,
+        '\tif [ ! -f $porty_m ]; then',
+        `\t\techo "porty: no ${name}, nothing to fix"`,
+        '\t\treturn',
+        '\tfi',
+        `\tif [ "$(sha256sum < $porty_m | cut -c1-64)" != ${fix.sha256} ]; then`,
+        `\t\techo "porty: ${name} is not the one known, left alone"`,
+        '\t\treturn',
+        '\tfi',
+        `\tcat $porty_m > porty-${name}`,
+        `\tprintf '${octal}' | dd of=porty-${name} bs=1 seek=${fix.offset} conv=notrunc 2>/dev/null`,
+        `\tif [ "$(sha256sum < porty-${name} | cut -c1-64)" = ${fix.patchedSha256} ] \\`,
+        `\t\t&& mount --bind porty-${name} $porty_m; then`,
+        `\t\techo "porty: ${name} fixed (${fix.bytes.length} bytes at ${fix.offset})"`,
+        '\telse',
+        `\t\trm -f porty-${name}`,
+        `\t\techo "porty: ${name} could not be fixed, left alone"`,
+        '\tfi',
+        '}',
+        'porty_module',
+    ];
+}
+
+/**
+ * The script for the initrd (busybox ash, sourced by /init from /android).
+ * Lines for the same keys are removed first: init keeps the first value of
+ * a "ro." property and the last of any other.
+ * @param props  [[key, value]...]
+ * @param fixes  { ttm: false | a module fix like TTM_FIX }
+ */
+export function dietScript(props, fixes = {}) {
+    for (const [key, value] of props) {
+        if (!KEY.test(key) || !VALUE.test(value)) {
+            throw new Error(`dietScript: bad property ${JSON.stringify([key, value])}`);
+        }
+    }
+    return [
+        '# Porty boot diet, written by the web page (web/js/boot-diet.js).',
+        '# Sourced by /init in /android after ramdisk.img was unpacked there.',
+        ...propLines(props),
+        ...moduleFixLines(fixes.ttm),
         '',
     ].join('\n');
 }
 
 /** The archive the page appends: /scripts (in case it is missing) and the script. */
-export function dietArchive(props) {
+export function dietArchive(props, fixes = {}) {
     return newcArchive([
         { name: 'scripts', mode: 0o040755 },
-        { name: DIET_SCRIPT, mode: 0o100644, data: dietScript(props) },
+        { name: DIET_SCRIPT, mode: 0o100644, data: dietScript(props, fixes) },
     ]);
 }
 
-/** initrd.img with the diet script appended; unchanged when there is nothing to set. */
-export function applyBootDiet(initrd, props) {
-    return props.length ? appendInitramfs(initrd, dietArchive(props)) : initrd;
+/** initrd.img with the diet script appended; unchanged when there is nothing to do. */
+export function applyBootDiet(initrd, props, fixes = {}) {
+    return props.length || fixes.ttm ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
 }
