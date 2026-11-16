@@ -116,6 +116,9 @@ Run locally, without the WebAssembly build:
 | The page in headless Chrome with a fake QEMU module: service-worker isolation, start-up, canvas, input, console | `tests/ui/run.sh /tmp/ui` |
 | Resuming a snapshot, QEMU side: a native QEMU built from the patched tree saves a small Linux guest with `migrate file:`, the stream is packed as published, and a second QEMU resumes it through `-incoming porty:`; damaged snapshots are refused (Branch check: `porty/check native`) | `tests/snapshot-native.sh` |
 | Resuming a snapshot, in the browser: the same guest, saved natively, resumed by the page in the branch's QEMU-Wasm build in headless Chrome (Branch check: `porty/check resume`) | `tests/snapshot-browser.sh` |
+| The disk cache: both halves against fake Cache Storage (part of the unit tests), and in headless Chrome on a first visit, a second visit, with `diskcache=0`, deleted and at its limit | `node tests/diskcache.test.mjs`, `tests/ui/run.sh /tmp/ui` (`ui-diskcache-test.mjs`) |
+| The disk cache in WebKit and Firefox: synchronous XHR from workers through the service worker (workflow "Disk cache probe", Playwright) | `tests/ui/diskcache-probe.mjs` |
+| A branch's page with the real QEMU-Wasm and Android, before it is merged: the site is assembled from the caches, served on the runner and booted in headless Chrome, for one or more visits in one browser profile (workflow "Branch boot test") | `gh workflow run branch-boot-test.yml --ref <branch>` |
 | Workflow and scripts | `actionlint`, `shellcheck -x` |
 
 These local checks do not cover the Emscripten build itself, QEMU-Wasm

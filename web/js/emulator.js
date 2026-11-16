@@ -200,7 +200,13 @@ export class Emulator {
         if (this.diskCache) {
             // Before QEMU's threads exist: they inherit the service worker
             // that answers their chunk requests from the device.
-            const note = await this.diskCache.prepare(manifest.disk).catch((e) => `No disk cache (${e}).`);
+            // Never in the way of a start: a browser that leaves a storage
+            // call unanswered boots without the cache's say.
+            const note = await Promise.race([
+                this.diskCache.prepare(manifest.disk).catch((e) => `No disk cache (${e}).`),
+                new Promise((resolve) => setTimeout(() => resolve(
+                    `The disk cache did not get ready in 12 s (at "${this.diskCache.step}"); starting without waiting for it.`), 12000)),
+            ]);
             if (note) {
                 this.notes.push(note);
             }

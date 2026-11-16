@@ -71,8 +71,10 @@ async function probe() {
     const image = await json('image/manifest.json');
     const snap = await json('snapshot/manifest.json');
     const dc = new DiskCache({ search: location.search, baseUrl: base });
-    step('prepare (service worker control, settings, persist)');
+    step('prepare');
+    const watch = setInterval(() => step(`prepare: ${dc.step}`), 200);
     result.note = await dc.prepare(image.disk);
+    clearInterval(watch);
     result.controlled = !!navigator.serviceWorker.controller;
     result.persisted = dc.persisted;
     const count = Math.min(3, Math.ceil(image.disk.size / image.disk.chunk_size));

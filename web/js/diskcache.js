@@ -102,6 +102,7 @@ export class DiskCache {
         this.noWorker = /[?&]nocoi=1/.test(search);
         this.supported = !!(this.caches && this.sw) && !this.noWorker;
         this.persisted = null;
+        this.step = '';        // where prepare() is, for diagnosis
         // Counters of every service worker instance seen (it restarts when
         // idle), and where the one of this visit's start stood then.
         this.epochs = new Map();
@@ -131,6 +132,7 @@ export class DiskCache {
             return this.noWorker ? '' : 'No disk cache: this browser has no Cache Storage or no service worker.';
         }
         const config = this.config(disk);
+        this.step = 'settings';
         try {
             const meta = await this.caches.open(META_CACHE);
             await meta.put(new URL(CONFIG_PATH, this.baseUrl).href, new Response(JSON.stringify(config), {
@@ -144,16 +146,26 @@ export class DiskCache {
             this.post({ type: 'portyDiskCacheConfig', config });
             return 'diskcache=0: chunks are not stored on this device.';
         }
+        this.step = 'service worker';
         const controlled = await this.control();
         this.post({ type: 'portyDiskCacheConfig', config });
         if (!controlled) {
             return 'No disk cache: the service worker does not control this page.';
         }
-        this.persisted = await this.persist();
+        // A browser may ask the visitor (Firefox does); the start does not
+        // wait for the answer.
+        this.step = 'persistent storage';
+        const asked = this.persist().then((kept) => {
+            this.persisted = kept;
+            return kept;
+        });
+        const kept = await Promise.race([asked, new Promise((resolve) => setTimeout(() => resolve(null), 1500))]);
         // Count from here: the worker may have served earlier visits.
+        this.step = 'counters';
         await this.stats(2000, true);
+        this.step = 'ready';
         return `Downloaded chunks are stored on this device (up to ${this.setting.capMb} MB` +
-            `${this.persisted ? ', kept until deleted' : ', the browser may clear them when space is short'}).`;
+            `${kept ? ', kept until deleted' : kept === false ? ', the browser may clear them when space is short' : ''}).`;
     }
 
     post(message, transfer = []) {

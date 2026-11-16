@@ -214,7 +214,11 @@ jobs:
         run: |
           CHROME="$(command -v google-chrome || command -v chromium)"
           export CHROME SITE_URL="http://127.0.0.1:8080/"
-          nproc
+          # Runner CPUs differ (an EPYC 7763 runs the guest about half as
+          # fast as a Xeon 6975P-C): every visit's line names the CPU, and
+          # visits are only comparable within one job.
+          cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || true)"
+          echo "runner CPU: ${cpu:-unknown}, $(nproc) threads"
           free -m
           "$CHROME" --version
           work="$RUNNER_TEMP/branch-boot"
@@ -252,8 +256,8 @@ jobs:
             node tests/boot/boot-test.mjs 2>&1 | tee "$work/visit-$visit.log" || true
             tail -n "+$((before + 1))" "$work/server.log" > "$work/server-$visit.log"
             echo "::endgroup::"
-            python3 -I tests/boot/visit-report.py "visit $visit" "$work/visit-$visit.log" "$work/server-$visit.log" \
-              | tee -a "$work/report.txt"
+            line="$(python3 -I tests/boot/visit-report.py "visit $visit" "$work/visit-$visit.log" "$work/server-$visit.log" || true)"
+            echo "${line:-visit $visit|error|no report}; runner CPU: ${cpu:-unknown}" | tee -a "$work/report.txt"
             du -sh "$USER_DATA_DIR" || true
           done
           kill "$server" 2>/dev/null || true
