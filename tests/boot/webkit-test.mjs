@@ -143,26 +143,46 @@ function isContentProcess(p) {
     return /WebProcess/.test(p.name) || /WebProcess( |$)|--type=renderer/.test(p.cmd.join(' '));
 }
 
-/** Resident kB inside mappings of 1 GiB or more: the WebAssembly memory. */
-function bigMappings(pid) {
+/**
+ * Where the resident memory of a process is, from /proc/<pid>/smaps (kB):
+ * mappings of 1 GiB or more (the WebAssembly memory; in WebKit also its
+ * cage for buffers and its pool for compiled code), other anonymous
+ * executable mappings (compiled code), files, and the rest (the heaps).
+ */
+function mappings(pid) {
     try {
-        let size = 0;
-        let big = { n: 0, sizeKb: 0, rssKb: 0 };
+        const out = { giant: [], giantRss: 0, codeRss: 0, fileRss: 0, heapRss: 0 };
+        let cur = null;
+        const close = () => {
+            if (!cur) {
+                return;
+            }
+            if (cur.size >= 1048576) {
+                out.giant.push(cur);
+                out.giantRss += cur.rss;
+            } else if (cur.path.startsWith('/')) {
+                out.fileRss += cur.rss;
+            } else if (cur.perms.includes('x')) {
+                out.codeRss += cur.rss;
+            } else {
+                out.heapRss += cur.rss;
+            }
+        };
         for (const line of readFileSync(`/proc/${pid}/smaps`, 'utf8').split('\n')) {
-            const m = /^(Size|Rss):\s+(\d+) kB/.exec(line);
-            if (!m) {
+            const head = /^[0-9a-f]+-[0-9a-f]+ (\S+) \S+ \S+ \S+\s*(.*)$/.exec(line);
+            if (head) {
+                close();
+                cur = { perms: head[1], path: head[2], size: 0, rss: 0 };
                 continue;
             }
-            if (m[1] === 'Size') {
-                size = Number(m[2]);
-                if (size >= 1048576) {
-                    big = { ...big, n: big.n + 1, sizeKb: big.sizeKb + size };
-                }
-            } else if (size >= 1048576) {
-                big.rssKb += Number(m[2]);
+            const m = /^(Size|Rss):\s+(\d+) kB/.exec(line);
+            if (m && cur) {
+                cur[m[1] === 'Size' ? 'size' : 'rss'] = Number(m[2]);
             }
         }
-        return big;
+        close();
+        out.giant.sort((x, y) => y.rss - x.rss);
+        return out;
     } catch (e) {
         return null;
     }
@@ -186,18 +206,21 @@ function memorySample(withMaps = false) {
         content: mb(content.reduce((sum, p) => sum + p.rss, 0)),
     };
     if (withMaps) {
-        const big = bigMappings(top.pid);
-        if (big) {
-            out.bigMaps = big.n;
-            out.bigRss = mb(big.rssKb);
+        const maps = mappings(top.pid);
+        if (maps) {
+            out.bigRss = mb(maps.giantRss);
+            out.code = mb(maps.codeRss);
+            out.heaps = mb(maps.heapRss);
             out.rest = out.rss - out.bigRss;
+            out.giant = maps.giant.filter((g) => g.rss >= 1024).slice(0, 5)
+                .map((g) => `${mb(g.size)}M:${mb(g.rss)}M ${g.perms}${g.path ? ` ${g.path.slice(0, 24)}` : ''}`).join(', ');
         }
     }
     return out;
 }
 
 const describeMemory = (m) => (m ? `${m.name}[${m.pid}] rss=${m.rss} anon=${m.anon} file=${m.file} shmem=${m.shmem}` +
-    (m.bigRss !== undefined ? ` wasm-mapped=${m.bigRss} rest=${m.rest}` : '') +
+    (m.bigRss !== undefined ? ` giant=${m.bigRss} [${m.giant}] code=${m.code} heaps=${m.heaps}` : '') +
     ` threads=${m.threads}; content processes ${m.content} MiB, all ${m.count} processes ${m.total} MiB` : 'no browser process found');
 
 // -------------------------------------------------------------- browser ---
@@ -954,7 +977,7 @@ async function sample(label, every = 10000) {
         diskMb: s.disk ? Math.round(s.disk.megabytes) : undefined,
         rss: m ? m.rss : undefined, anon: m ? m.anon : undefined, shmem: m ? m.shmem : undefined,
         total: m ? m.total : undefined,
-        ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest } : {}),
+        ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest, code: m.code, heaps: m.heaps, giant: m.giant } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
@@ -1411,10 +1434,10 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         ] : []),
         ...(result.errors.length ? ['- Errors:', ...result.errors.map((e) => `  - \`${e.replace(/`/g, "'").split('\n')[0]}\``)] : []),
         '',
-        '| s | phase | JIT alive | compiled | QEMU heap MiB | RSS MiB | anon | shmem | wasm mapping | rest |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+        '| s | phase | JIT alive | compiled | QEMU heap MiB | RSS MiB | anon | shmem | mappings of 1 GiB+ | rest | of it heaps |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows.map((r) => `| ${r.t} | ${r.label} | ${r.alive ?? ''} | ${r.compiled ?? ''} | ${r.heapUsed ?? ''} | ` +
-            `${r.rss ?? ''} | ${r.anon ?? ''} | ${r.shmem ?? ''} | ${r.wasmRss ?? ''} | ${r.rest ?? ''} |`),
+            `${r.rss ?? ''} | ${r.anon ?? ''} | ${r.shmem ?? ''} | ${r.wasmRss ?? ''} | ${r.rest ?? ''} | ${r.heaps ?? ''} |`),
         '',
     ].join('\n'));
 }
