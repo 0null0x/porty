@@ -361,6 +361,7 @@ def do_save(opts, argv):
                  ("android_found", re.compile(rb"found at /dev/")),
                  ("shell", PROMPT))
         shell = False
+        awake = False
         booted = None
         last_probe = 0.0
         last_report = 0.0
@@ -384,6 +385,16 @@ def do_save(opts, argv):
                 if status is not None:
                     shell = True
                     marks.setdefault("shell", round(now, 1))
+                    if not awake:
+                        # Android-x86 suspends the machine (ACPI S3) when the
+                        # screen times out, one minute after boot.  A kernel
+                        # wake lock prevents that from the first moment, and
+                        # stays in the saved machine: nobody is there to
+                        # press a power button in the browser.
+                        awake = True
+                        code, out = vm.sh("echo porty > /sys/power/wake_lock && cat /sys/power/wake_lock", 30)
+                        result["wake_lock"] = out if code == 0 else f"[status {code}] {out}"
+                        log(f"wake lock: {result['wake_lock']}")
                 if status == 0 and text == "1":
                     booted = vm.elapsed()
                     break
@@ -430,6 +441,27 @@ def do_save(opts, argv):
         run("screen_timeout", "settings put system screen_off_timeout 2147483647")
         run("stay_on", "svc power stayon true")
 
+        # A device that is not provisioned has no home screen: the launcher
+        # is not allowed to start until the setup wizard has finished.  With
+        # SETUPWIZARD=0 the wizard should finish by itself; if it has not
+        # (the slim image's wizard crashes without Google's services), do
+        # its job here, so that the saved machine shows a home screen.
+        run("provisioned", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
+        run("setup_crash", "logcat -b crash -d | grep -m1 -A6 'Process: com.google.android.setupwizard' | cut -c1-200", 180)
+        run("home_candidates", "cmd package query-activities --brief -a android.intent.action.MAIN"
+                               " -c android.intent.category.HOME | grep /", 180)
+        if opts.provision and guest["provisioned"].split() != ["1", "1"]:
+            guest["provision_workaround"] = True
+            run("provision_1", "settings put global device_provisioned 1; settings put secure user_setup_complete 1", 180)
+            run("provision_2", "pm disable-user --user 0 com.google.android.setupwizard", 180)
+            launcher = [line.strip() for line in guest["home_candidates"].split("\n")
+                        if "launcher3" in line.lower()]
+            if launcher:
+                run("provision_3", f"cmd package set-home-activity {launcher[0]}", 180)
+            run("provision_4", "am start -a android.intent.action.MAIN -c android.intent.category.HOME", 180)
+        else:
+            guest["provision_workaround"] = False
+
         settle_end = time.monotonic() + opts.settle
         while time.monotonic() < settle_end and vm.alive():
             vm.pump(2.0)
@@ -467,7 +499,10 @@ def do_save(opts, argv):
         run("focus", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
         run("crashes", "logcat -b crash -d -t 30 | cut -c1-220", 180)
         run("home", "cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN", 180)
-        run("provisioned", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
+        run("provisioned_after", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
+        run("suspends", "dmesg | grep -c 'PM: suspend entry'; dmesg | grep 'PM: suspend' | tail -4", 60)
+        run("zygote_crashes", "logcat -b crash -d | grep -c 'No region space mem map';"
+                              " getprop init.svc.zygote; getprop init.svc.zygote_secondary; getprop ro.zygote", 180)
         for i, command in enumerate(opts.guest_command):
             run(f"extra_{i}", command, 600)
         if opts.guest_command:
@@ -623,6 +658,8 @@ def main():
     ap.add_argument("--runstate", choices=("running", "paused"), default="running",
                     help="running: the resumed guest starts by itself; paused: it waits for 'cont'")
     ap.add_argument("--zero-free", type=int, default=1, help="1: zero the guest's free memory before saving")
+    ap.add_argument("--provision", type=int, default=1,
+                    help="1: if Android's setup wizard did not finish, mark the device provisioned and start the launcher")
     ap.add_argument("--guest-command", action="append", default=[],
                     help="extra shell command to run in the guest before the save (repeatable)")
     ap.add_argument("--zero-reserve", type=int, default=96, help="MiB of free memory to leave alone")
