@@ -11,7 +11,7 @@ argument vector and reports, per boot, whether the kernel panicked
   * by itself, within --observe seconds of sys.boot_completed (Android dumps
     surfaceflinger's stack when an app does not respond, or when
     system_server's Watchdog fires), or
-  * after one of the --provoke steps:
+  * after one of the --provoke steps (a step may be given more than once):
       anr        stop the focused app and send it key events, so that
                  ActivityManager declares it "not responding" and collects
                  stack traces (the natural trigger, made on purpose)
@@ -38,6 +38,8 @@ SNAPSHOT = os.path.join(HERE, "..", "scripts", "snapshot", "make-snapshot.py")
 PANIC = re.compile(rb"Kernel panic - not syncing[^\r\n]*")
 TTM = re.compile(rb"RIP: 0010:ttm_bo_vm_open")
 OOPS = re.compile(rb"invalid opcode: 0000 \[#\d+\]")
+# What the page's initrd script said about ttm.ko (web/js/boot-diet.js).
+FIX = re.compile(rb"porty: (?:no )?ttm\.ko[^\r\n]*")
 
 # What the first boot of a variant is asked, for the report.
 DIAGNOSTICS = (
@@ -52,9 +54,8 @@ DIAGNOSTICS = (
     ("sf_fb_maps", "grep -e graphics/fb -e dri/ -e ' /dev/fb' /proc/$(pidof surfaceflinger)/maps | head -8"),
     ("fb_mappers", "grep -l -s -e graphics/fb /proc/[0-9]*/maps | head -12"),
     ("modules", "grep -e ttm -e bochs -e drm -e vesa /proc/modules | cut -c1-90"),
-    ("ttm_ko", "ls -l /system/lib/modules/$(uname -r)/kernel/drivers/gpu/drm/ttm/ttm.ko;"
-               " sha256sum /system/lib/modules/$(uname -r)/kernel/drivers/gpu/drm/ttm/ttm.ko;"
-               " grep -c . /proc/mounts; grep -e ttm -e prop /proc/mounts"),
+    ("ttm_ko", "sha256sum /system/lib/modules/$(uname -r)/kernel/drivers/gpu/drm/ttm/ttm.ko | cut -c1-64;"
+               " grep -e ttm /proc/mounts; ls -l /porty-ttm.ko 2>&1"),
     ("ttm_text", "cat /sys/module/ttm/sections/.text 2>/dev/null; grep -e ' ttm_bo_vm_open' -e ' ttm_fbdev_mmap' /proc/kallsyms"),
     ("kconfig", "zcat /proc/config.gz 2>/dev/null | grep -e '^CONFIG_BUG=' -e GENERIC_BUG= -e PANIC_ON_OOPS -e PANIC_TIMEOUT"
                 " -e DEBUG_BUGVERBOSE -e 'DRM_BOCHS' -e DRM_VIRTIO_GPU -e 'FB_VESA' -e FB_UVESA -e MODULE_SIG -e MODVERSIONS"),
@@ -186,6 +187,9 @@ class Boot:
                 if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
                     self.booted_at = vm.elapsed()
                     self.result["booted"] = True
+                    fix = FIX.search(vm.out)
+                    self.result["ttm_ko"] = fix.group(0).decode("utf-8", "replace") if fix else "nothing said (ttmfix=0 or gfx=vesa)"
+                    self.result["system_server"] = self.sh("pidof system_server", 30)[1].strip()
                     self.result["booted_seconds"] = round(self.booted_at, 1)
                     self.log(f"sys.boot_completed=1 after {self.booted_at:.0f} s")
                     return True
@@ -269,8 +273,13 @@ class Boot:
                                " (debuggerd -b $(pidof surfaceflinger) > /data/local/tmp/porty-sf.txt 2>&1 &);"
                                " sleep 10; head -6 /data/local/tmp/porty-sf.txt | cut -c1-160;"
                                " echo lines=$(grep -c . /data/local/tmp/porty-sf.txt) sf=$(pidof surfaceflinger)", 90)
+        n = sum(1 for k in self.result["steps"] if k.startswith(key))
+        key = key if n == 0 else f"{key}_{n + 1}"
         self.result["steps"][key] = text if status == 0 else f"[status {status}] {text}"
         self.log(f"{key}: {self.result['steps'][key][:900]}")
+        m = re.search(r"lines=(\d+)", text)
+        if m and int(m.group(1)) > 3:
+            self.result["sf_dumps"] = self.result.get("sf_dumps", 0) + 1
         self.wait(12)
 
     def provoke_nopanic(self):
@@ -326,7 +335,13 @@ class Boot:
                     return
                 self.phase = step
                 getattr(self, "provoke_" + step)()
-            self.panicked()
+            if not self.panicked() and self.vm.alive():
+                # Is Android still the one that booted?
+                self.run("health", "echo boot_completed=$(getprop sys.boot_completed) sf=$(pidof surfaceflinger)"
+                                   " system_server=$(pidof system_server) uptime=$(cut -d' ' -f1 /proc/uptime);"
+                                   " logcat -d -b events -s am_anr watchdog | grep -c -e am_anr -e watchdog", 120)
+                now = self.sh("pidof system_server", 30)[1].strip()
+                self.result["system_server_restarted"] = bool(now) and now != self.result.get("system_server")
             self.result["screen"] = self.vm.screenshot(f"screen-{self.opts.name}-{self.index}",
                                                        show=self.index == 1 and self.opts.show_screen)
         except Exception as e:  # a harness problem is a result, not a failed run
@@ -356,6 +371,12 @@ def summarise(name, boots):
         line += f" ({phases}; ttm_bo_vm_open in {ttm})"
     if booted != len(boots):
         line += f"; {booted} reached sys.boot_completed"
+    dumps = sum(b.get("sf_dumps", 0) for b in boots)
+    if dumps:
+        line += f"; {dumps} stack dumps of surfaceflinger survived"
+    fixed = sum(1 for b in boots if "fixed" in b.get("ttm_ko", ""))
+    if fixed:
+        line += f"; ttm.ko fixed in {fixed}"
     return line
 
 

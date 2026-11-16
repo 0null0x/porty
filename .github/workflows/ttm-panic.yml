@@ -21,6 +21,8 @@ on:
     paths:
       - .github/workflows/ttm-panic.yml
       - tests/ttm-panic.py
+      - tests/apply-boot-diet.mjs
+      - tests/print-qemu-args.mjs
       - scripts/snapshot/make-snapshot.py
       - web/js/qemu-args.js
       - web/js/config.js
@@ -201,11 +203,6 @@ jobs:
             objdump -d -r --disassemble=ttm_bo_vm_open "$work/ttm.ko" | sed -n '/<ttm_bo_vm_open>:/,$p'
             echo "--- modinfo ---"
             strings "$work/ttm.ko" | grep -e '^vermagic=' -e '^depends=' -e '^srcversion='
-            base64 -w 200 "$work/ttm.ko" > "$work/ttm.b64"
-            echo "ttm.ko as base64: $(wc -l < "$work/ttm.b64") lines"
-            echo "-----BEGIN TTM KO-----"
-            cat "$work/ttm.b64"
-            echo "-----END TTM KO-----"
           fi
           echo "--- initrd ---"
           initrd="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["initrd"]["file"])' out/image/manifest.json)"
@@ -255,24 +252,49 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # expect: "panic" (the fault, shown), "clean" (a remedy: not one
-        # panic, every boot reaches sys.boot_completed) or "info".
+        # "nofix" is the page's argv with ttmfix=0 (ttm.ko as shipped), the
+        # "fix-*" jobs are the page as it is, "vesa" is gfx=vesa (no
+        # bochs-drm).  expect: "panic" (the fault, shown), "clean" (not
+        # one panic, every boot reaches sys.boot_completed) or "info".
         # device: "" is the page's own argv; the others change the display
-        # device after the page built it (experiments the page cannot do).
+        # device after the page built it (experiments the page cannot do
+        # today): "bochs-display-vesa" gives a VESA framebuffer of the
+        # phone's own size, which "-vga std" has no VBE mode for.
         include:
-          - name: base
-            query: ''
+          - name: nofix
+            query: '&ttmfix=0'
             boots: 4
-            observe: 150
+            observe: 120
             provoke: anr,debuggerd
             expect: panic
             device: ''
-          - name: nopanic
+          - name: fix-1
             query: ''
-            boots: 2
-            observe: 10
-            provoke: nopanic
-            expect: info
+            boots: 4
+            observe: 150
+            provoke: anr,debuggerd,debuggerd
+            expect: clean
+            device: ''
+          - name: fix-2
+            query: ''
+            boots: 4
+            observe: 150
+            provoke: anr,debuggerd,debuggerd
+            expect: clean
+            device: ''
+          - name: fix-3
+            query: ''
+            boots: 4
+            observe: 150
+            provoke: debuggerd,anr,debuggerd
+            expect: clean
+            device: ''
+          - name: fix-long
+            query: ''
+            boots: 1
+            observe: 900
+            provoke: debuggerd,anr,debuggerd,debuggerd
+            expect: clean
             device: ''
           - name: vesa
             query: '&gfx=vesa'
@@ -283,18 +305,11 @@ jobs:
             device: ''
           - name: bochs-display-vesa
             query: '&gfx=vesa'
-            boots: 3
-            observe: 120
-            provoke: anr,debuggerd
-            expect: info
-            device: bochs-display-vesa
-          - name: virtio-vga
-            query: '&append=HWACCEL=0'
             boots: 2
             observe: 120
             provoke: anr,debuggerd
             expect: info
-            device: virtio-vga
+            device: bochs-display-vesa
     env:
       NAME: ${{ matrix.name }}
       QUERY_EXTRA: ${{ matrix.query }}
@@ -496,11 +511,12 @@ jobs:
           print(state)
           print(line)
           print()
-          print("| boot | sys.boot_completed | panic | phase | s after boot | guest uptime |")
-          print("|---|---|---|---|---|---|")
+          print("| boot | sys.boot_completed | panic | phase | s after boot | guest uptime | ttm.ko | dumps of surfaceflinger | system_server restarted |")
+          print("|---|---|---|---|---|---|---|---|---|")
           for b in boots:
               print(f"| {b.get('boot')} | {b.get('booted_seconds', 'no')} | {b.get('panic') or 'none'} | {b.get('panic_phase') or ''} "
-                    f"| {b.get('panic_after_boot_seconds', '')} | {b.get('panic_guest_uptime') or ''} |")
+                    f"| {b.get('panic_after_boot_seconds', '')} | {b.get('panic_guest_uptime') or ''} | {b.get('ttm_ko', '')} "
+                    f"| {b.get('sf_dumps', 0)} | {b.get('system_server_restarted', '')} |")
           for b in boots[:1]:
               for title, block in (("Diagnostics (boot 1)", b.get("diagnostics") or {}), ("Steps (boot 1)", b.get("steps") or {})):
                   print(f"\n<details><summary>{title}</summary>\n")
