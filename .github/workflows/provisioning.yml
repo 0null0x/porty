@@ -220,11 +220,12 @@ jobs:
         continue-on-error: true
         timeout-minutes: 60
         run: |
+          read -r -a extra <<<"$EXTRA_ARGS"
           python3 -I tests/provision-native.py \
             --qemu out/native-qemu/qemu-system-x86_64 \
             --argv-file out/prov/argv-native.txt \
             --work out/prov/boot \
-            --boot-timeout 2400 --settle 75 $EXTRA_ARGS | cut -c1-2000
+            --boot-timeout 2400 --settle 75 "${extra[@]}"
 
       - name: Upload the logs
         if: ${{ always() }}
