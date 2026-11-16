@@ -67,6 +67,9 @@ env:
   QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
   RUNSTATE: ${{ inputs.runstate || 'running' }}
   GUEST_COMMAND: ${{ inputs.guest_command || '' }}
+  # 1: kernel and Android shutdown messages on the serial console.  For
+  # finding out why a guest restarts; such a snapshot is not for publishing.
+  TRACE_REBOOT: '1'
   BOOT_TIMEOUT_MIN: ${{ inputs.boot_timeout_min || '180' }}
 
 jobs:
@@ -255,6 +258,7 @@ jobs:
             --runstate "$RUNSTATE" \
             --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))" \
             --settle 300 \
+            --trace-reboot "$TRACE_REBOOT" \
             "${extra[@]}"
 
       - name: Cut the stream into compressed chunks

@@ -188,6 +188,7 @@ class Machine:
             raise
         self.out = b""          # everything the guest printed
         self.boots = 0
+        self.rearm = False      # set after a reboot: the guest lost what was set up
         self.reboots = []       # seconds after start at which the guest came up again
         self.total = 0
         self.counter = 0
@@ -227,6 +228,7 @@ class Machine:
             for line in before.replace("\r", "").split("\n")[-120:]:
                 print("    | " + line[:300], flush=True)
             self.reboots.append(round(self.elapsed(), 1))
+            self.rearm = True
             self.show_debug()
             if len(self.reboots) >= 3:
                 raise RuntimeError(f"the guest keeps rebooting by itself, {self.reboots} s after start")
@@ -425,6 +427,9 @@ def do_save(opts, argv):
                 if status is not None:
                     shell = True
                     marks.setdefault("shell", round(now, 1))
+                    if vm.rearm:
+                        vm.rearm = False
+                        awake = False
                     if not awake:
                         # Android-x86 suspends the machine (ACPI S3) when the
                         # screen times out, one minute after boot.  A kernel
@@ -435,7 +440,15 @@ def do_save(opts, argv):
                         code, out = vm.sh("echo porty > /sys/power/wake_lock && cat /sys/power/wake_lock", 30)
                         result["wake_lock"] = out if code == 0 else f"[status {code}] {out}"
                         log(f"wake lock: {result['wake_lock']}")
-                if status == 0 and text == "1":
+                        if opts.trace_reboot:
+                            # Diagnosis only (it interleaves with the answers
+                            # read here): kernel and Android messages about
+                            # shutting down, on the serial console.
+                            vm.sh("echo 8 > /proc/sys/kernel/printk; (logcat -b all -v time -s RescueParty:* "
+                                  "ShutdownThread:* PowerManagerService:* AndroidRuntime:E init:* Zygote:* "
+                                  "SystemServer:E ActivityManager:E BootReceiver:* Watchdog:* DEBUG:F "
+                                  "> /dev/kmsg 2>&1 &)", 30)
+                if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
                     booted = vm.elapsed()
                     break
             if now - last_shot >= 300:
@@ -707,6 +720,8 @@ def main():
     ap.add_argument("--runstate", choices=("running", "paused"), default="running",
                     help="running: the resumed guest starts by itself; paused: it waits for 'cont'")
     ap.add_argument("--zero-free", type=int, default=1, help="1: zero the guest's free memory before saving")
+    ap.add_argument("--trace-reboot", type=int, default=0,
+                    help="1: show kernel and Android shutdown messages on the console (diagnosis; do not publish)")
     ap.add_argument("--provision", type=int, default=1,
                     help="1: if Android's setup wizard did not finish, mark the device provisioned and start the launcher")
     ap.add_argument("--guest-command", action="append", default=[],
