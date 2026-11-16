@@ -93,7 +93,7 @@ def boot(vm, opts, result):
                 if vm.rearm:
                     vm.rearm = False
                     awake = False
-                if not awake:
+                if not awake and opts.wake_lock:
                     awake = True
                     vm.sh("echo porty > /sys/power/wake_lock", 30)
             if status == 0 and "1" in [line.strip() for line in text.split("\n")]:
@@ -155,6 +155,13 @@ def run_checks(vm, opts, result):
 
     for i, command in enumerate(opts.guest_command):
         run(f"extra_{i}", command, 600)
+    if opts.idle > 0:
+        wait(vm, opts.idle)
+        idle = result["screen_idle"] = vm.screenshot("screen-idle", show=True)
+        log(f"screen after {opts.idle:.0f} s without input: {idle}")
+        run("power", "dumpsys power | grep -e mWakefulness= -e mScreenOffTimeoutSetting -e mStayOn -e 'mIsPowered'"
+                     "; settings get system screen_off_timeout; dmesg | grep -c 'PM: suspend entry'")
+        run("focus_idle", "dumpsys window | grep -e mCurrentFocus -e mFocusedApp")
     return all(c["ok"] for c in checks.values())
 
 
@@ -165,6 +172,10 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--boot-timeout", type=float, default=1800, help="seconds to wait for sys.boot_completed")
     ap.add_argument("--settle", type=float, default=60, help="seconds between sys.boot_completed=1 and the checks")
+    ap.add_argument("--wake-lock", type=int, default=1,
+                    help="1: take a kernel wake lock as soon as the shell answers, so the machine cannot suspend")
+    ap.add_argument("--idle", type=float, default=0,
+                    help="seconds to leave the guest alone after the checks, then look at the screen again")
     ap.add_argument("--min-lit", type=float, default=20.0, help="percent of the screen that must not be black")
     ap.add_argument("--guest-command", action="append", default=[],
                     help="extra shell command to run in the guest after the checks (repeatable)")

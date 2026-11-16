@@ -42,13 +42,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: baseline
-            context: porty/check provisioning
-            experiment: ''
+          - name: hide-wizard
+            context: porty/check provisioning x1
+            experiment: hide-wizard
+            args: --idle 200
+          - name: hide-wizard-taskbar
+            context: porty/check provisioning x2
+            experiment: hide-wizard-taskbar
+            args: --idle 200 --wake-lock 0
     env:
       QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
       STATUS_CONTEXT: ${{ matrix.context }}
       EXPERIMENT: ${{ matrix.experiment }}
+      EXTRA_ARGS: ${{ matrix.args }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -214,7 +220,7 @@ jobs:
             --qemu out/native-qemu/qemu-system-x86_64 \
             --argv-file out/prov/argv-native.txt \
             --work out/prov/boot \
-            --boot-timeout 2400 --settle 75
+            --boot-timeout 2400 --settle 75 $EXTRA_ARGS
 
       - name: Upload the logs
         if: ${{ always() }}
