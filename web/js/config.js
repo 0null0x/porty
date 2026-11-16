@@ -5,10 +5,11 @@
 export const MIB = 1024 * 1024;
 export const WASM_PAGE = 65536;
 
-// Memory QEMU itself needs on top of guest RAM and the TCG code buffer:
-// VGA memory, the chunk cache, BIOS/option ROMs, glib/QEMU heaps and
-// thread stacks.  Deliberately generous.
-export const QEMU_OVERHEAD_MB = 288;
+// Memory QEMU itself needs on top of guest RAM, the TCG code buffer and the
+// disk chunk cache: VGA memory, BIOS/option ROMs, glib/QEMU heaps, thread
+// and coroutine stacks. Measured with porty_heap_stats() and dlmalloc:
+// about 290 MiB through Android's boot (2026-11-16); 352 leaves room.
+export const QEMU_OVERHEAD_MB = 352;
 
 const DEFAULTS = {
     // 1536 MiB ran QEMU-Wasm out of its 2300 MiB at the virtio disk probe
@@ -16,7 +17,7 @@ const DEFAULTS = {
     // cache: 2 MiB disk chunks kept in RAM. With 16, a boot re-downloaded
     // 1.25 GB for a 943 MB image and reached each stage later than with 64.
     desktop: { mem: 1024, tb: 384, cache: 64 },
-    mobile: { mem: 1024, tb: 256, cache: 32 },
+    mobile: { mem: 1024, tb: 192, cache: 32 },
 };
 
 export const PARAM_HELP = [

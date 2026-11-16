@@ -139,7 +139,7 @@ and say how far it got.
 | --- | --- | --- |
 | `mem` | 1024 | Guest RAM in MiB (512 to 3072; 1536 runs QEMU-Wasm out of memory) |
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
-| `tb` | 384 (phones: 256) | TCG translation cache in MiB |
+| `tb` | 384 (phones: 192) | TCG translation cache in MiB |
 | `smp` | 1 | Guest CPUs, 1 to 4 (`smp=2` crashes QEMU-Wasm with this guest today) |
 | `usb` | on | `0` leaves out the USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
