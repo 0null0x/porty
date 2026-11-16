@@ -50,6 +50,7 @@ import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
 import path from 'node:path';
+import { PCPU_FUNCTION, cpuDelta, describeCpu, parseCpuLine } from './cpu-probe.mjs';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
 const puppeteer = require('puppeteer-core');
@@ -437,6 +438,13 @@ async function dumpFiles() {
  * the search bar with the mouse, and reports what the page saw, what has
  * the focus, and screenshots after each.
  */
+// Where the guest's CPU goes during the launch (tests/boot/cpu-probe.mjs):
+// a snapshot before the tap, one every PROBE_CPU_EVERY rounds of guest
+// samples (default 2, about every minute) and one at the end; PROBE_CPU=0
+// takes none.
+const probeCpu = process.env.PROBE_CPU !== '0';
+const probeCpuEvery = num('PROBE_CPU_EVERY', 2, 1, 100);
+
 async function inputProbe() {
     const send = (cmd) => page.evaluate((c) => globalThis.__send(c), cmd);
     // Print the serial output as it comes, so that it lands between the
@@ -444,7 +452,7 @@ async function inputProbe() {
     let lastFocus = '';
     // Marker lines of the guest, newest of each kind (the output of the
     // commands, never their echo: an echo has "$(" after the colon).
-    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map(), top: [] };
+    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map(), top: [], cpu: new Map() };
     let pendingLine = '';
     let logDone = 0;
     const sleep = async (ms) => {
@@ -453,6 +461,10 @@ async function inputProbe() {
         const lines = (pendingLine + stripAnsi(text)).split('\n');
         pendingLine = lines.pop();
         for (const line of lines) {
+            // The CPU lines are many; they are reported, not echoed.
+            if (parseCpuLine(line.replace(/\r$/, ''), marks.cpu)) {
+                continue;
+            }
             if (line.trim()) {
                 console.log(`serial| ${line.replace(/\r$/, '')}`);
             }
@@ -688,6 +700,27 @@ async function inputProbe() {
     }
     log(`INPUT PROBE: the event log ${logDone ? 'answered' : 'did not answer in 180 s'} before the tap`);
     logDone = 0;
+    // A pcpu snapshot: wait for its end marker (or give up after `ms`).
+    const cpuSnap = async (tag, threads, ms) => {
+        if (!probeCpu) {
+            return null;
+        }
+        const t = Date.now();
+        await send(`pcpu ${tag}${threads ? ' threads' : ''}\r`);
+        while (!(marks.cpu.get(tag) || {}).done && Date.now() - t < ms) {
+            await sleep(2000);
+        }
+        const s = marks.cpu.get(tag);
+        log(`INPUT PROBE: cpu snapshot ${tag}: ${s && s.done ? `${s.procs.size} processes, ${s.threads.size} threads, ` +
+            `sf frames ${s.frames}, in ${Math.round((Date.now() - t) / 1000)} s` : `incomplete after ${Math.round(ms / 1000)} s`}`);
+        return s && s.done ? s : null;
+    };
+    if (probeCpu) {
+        await send(`${PCPU_FUNCTION}\r`);
+        await sleep(3000);
+    }
+    const cpuBefore = await cpuSnap('before', true, 180000);
+    const cpuTags = cpuBefore ? ['before'] : [];
     let prevSt = marks.st;
     let prevPs = marks.ps;
     const before = await pageSample(true);
@@ -715,7 +748,13 @@ async function inputProbe() {
     while (Date.now() - tapAt < probeWaitMs) {
         if (guestEveryMs && Date.now() >= nextGuest) {
             nextGuest = Date.now() + guestEveryMs;
-            await send(`${guestSample}${guestRound++ % 2 === 1 ? `; ${guestTop}` : ''}\r`);
+            const round = guestRound++;
+            // Every PROBE_CPU_EVERY-th round a CPU snapshot instead of top.
+            const cpuTag = cpuBefore && round % probeCpuEvery === probeCpuEvery - 1 ? `t${since()}` : '';
+            if (cpuTag) {
+                cpuTags.push(cpuTag);
+            }
+            await send(`${guestSample}${cpuTag ? `; pcpu ${cpuTag}` : (round % 2 === 1 ? `; ${guestTop}` : '')}\r`);
         }
         await sleep(5000);
         let now;
@@ -799,6 +838,31 @@ async function inputProbe() {
     log(`INPUT PROBE: how much of the screen differed from the home screen, when it changed: ${result.screenTimeline || 'never'}`);
     for (const line of marks.top) {
         log(`INPUT PROBE: top| ${line}`);
+    }
+    // Where the guest's CPU went: from the tap to now, and between the
+    // snapshots taken during the launch.
+    const cpuEnd = cpuBefore ? await cpuSnap('end', true, 240000) : null;
+    if (cpuEnd) {
+        cpuTags.push('end');
+        const whole = cpuDelta(cpuBefore, cpuEnd);
+        log(`INPUT PROBE: CPU from the tap to the end: ${describeCpu(whole, 16)}`);
+        const pct = (v) => `${Math.round((1000 * v) / Math.max(1, whole.busy)) / 10}%`;
+        for (const p of whole.procs.slice(0, 30)) {
+            log(`INPUT PROBE: cpu| process ${p.comm}${p.isNew ? ' (new)' : ''} pid ${p.pid}: ${p.ticks} ticks, ${pct(p.ticks)}`);
+        }
+        for (const t of whole.threads.slice(0, 40)) {
+            log(`INPUT PROBE: cpu| thread ${t.proc}/${t.comm} tid ${t.tid} (nice ${t.nice}, policy ${t.policy}): ${t.ticks} ticks, ${pct(t.ticks)}`);
+        }
+        const done = cpuTags.map((tag) => marks.cpu.get(tag)).filter((s) => s && s.done && s.stat);
+        for (let i = 1; i < done.length; i++) {
+            log(`INPUT PROBE: cpu ${done[i - 1].tag} -> ${done[i].tag}: ${describeCpu(cpuDelta(done[i - 1], done[i]), 6)}`);
+        }
+        result.cpu = {
+            busy: whole.busy, total: whole.total, user: whole.user, system: whole.system, guestSeconds: whole.guestSeconds,
+            sfFrames: whole.frames, uncounted: whole.uncounted,
+            top: whole.procs.slice(0, 10).map((p) => [p.comm, p.ticks]),
+            threads: whole.threads.slice(0, 12).map((t) => [`${t.proc}/${t.comm}`, t.ticks]),
+        };
     }
     // The event log's own account, in guest time since the tap.
     const clock1 = await guestClock();
