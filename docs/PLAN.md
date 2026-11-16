@@ -739,7 +739,11 @@ publishes the slim image (2.8), with the boot diet on by default.
   screen lit (86.8%) within the first two minutes, heap 1002/1026 MB, load
   average 0.38, the shell answering. It was saved with "System UI isn't
   responding" in front; `make-snapshot.py` now ends the process behind
-  such a dialog before saving (c5cc6cd).
+  such a dialog before saving (c5cc6cd). The third snapshot (run
+  43850120500, on 4931022; 727 MB of state, 200 MB compressed, no dialog
+  that time) is published since 10:48; the site is 1,003,446,896 bytes.
+  Resumed (43852162737, phone budget, and 43852056036, desktop): the home
+  screen without a dialog, 94% lit, heap 1006/1021 MB, load average 0.37.
 - The snapshot cache key now also covers the page code that shapes the
   guest (`qemu-args.js`, `config.js`, `boot-diet.js`, `initramfs.js`) and
   `scripts/snapshot`, so a guest booted or saved by older code is never
