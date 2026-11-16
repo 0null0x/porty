@@ -3,18 +3,20 @@
   "base": "mem=768&tb=128&cache=16",
   "run": [
     "base",
-    "lowram",
-    "lmk-minfree",
+    "lmk-200",
     "lmk-cached",
-    "lowram-minfree",
-    "heap"
+    "mem1024"
   ],
-  "boots": 2,
+  "boots": 3,
   "apps": [
     "com.android.gallery3d/.app.GalleryActivity",
     "com.android.settings",
     "com.android.calculator2",
-    "com.android.deskclock"
+    "com.android.deskclock",
+    "com.android.contacts",
+    "com.android.calendar",
+    "com.android.documentsui",
+    "com.android.dialer"
   ],
   "variants": {
     "base": {
@@ -27,13 +29,22 @@
       "query": "props=ro.lmk.use_minfree_levels=true"
     },
     "lmk-cached": {
-      "query": "props=ro.lmk.medium=1001,ro.lmk.critical=900"
+      "query": "props=ro.lmk.medium=1001,ro.lmk.critical=900",
+      "boots": 2
     },
     "lowram-minfree": {
       "query": "props=ro.config.low_ram=true,ro.lmk.use_minfree_levels=true"
     },
     "heap": {
       "query": "props=dalvik.vm.heapstartsize=8m,dalvik.vm.heapgrowthlimit=128m,dalvik.vm.heapsize=256m"
+    },
+    "lmk-200": {
+      "query": "props=ro.lmk.medium=1001,ro.lmk.critical=200"
+    },
+    "mem1024": {
+      "base": "mem=1024&tb=128&cache=16",
+      "query": "",
+      "boots": 2
     }
   }
 }

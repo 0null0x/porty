@@ -63,7 +63,8 @@ jobs:
           names = [n for n in names if n in plan["variants"]]
           boots = os.environ.get("BOOTS", "")
           boots = max(1, min(4, int(boots))) if boots.isdigit() else plan["boots"]
-          include = [{"variant": n, "boot": b} for n in names for b in range(1, boots + 1)]
+          include = [{"variant": n, "boot": b} for n in names
+                     for b in range(1, plan["variants"][n].get("boots", boots) + 1)]
           print("matrix=" + json.dumps({"include": include[:20]}))
           ' tests/guest-memory-variants.json | tee -a "$GITHUB_OUTPUT"
 
@@ -202,7 +203,7 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p out/gm
-          QUERY="$(python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])); q = p["variants"][sys.argv[2]].get("query", ""); print(p["base"] + ("&" + q if q else ""))' tests/guest-memory-variants.json "$VARIANT")"
+          QUERY="$(python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])); v = p["variants"][sys.argv[2]]; q = v.get("query", ""); print(v.get("base", p["base"]) + ("&" + q if q else ""))' tests/guest-memory-variants.json "$VARIANT")"
           echo "query: $QUERY"
           echo "query=$QUERY" >> "$GITHUB_OUTPUT"
           node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/gm/initrd-page.img" "?$QUERY"

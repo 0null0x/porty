@@ -61,7 +61,7 @@ FACTS = (
     ("am_config", "dumpsys activity settings | grep -e max_cached -e low_ram -e CUR_MAX -e trim; dumpsys activity oom | head -24"),
     ("packages", "pm list packages | sort | tr '\\n' ' '"),
     ("meminfo_boot", "cat /proc/meminfo | head -24"),
-    ("kmodules", "cat /proc/version; zcat /proc/config.gz | grep -e MODVERSIONS -e MODULE_SIG -e MODULE_FORCE -e 'CONFIG_CMA' -e LOCALVERSION"
+    ("kmodules", "sed 's/^Linux version/kernel/' /proc/version; zcat /proc/config.gz | grep -e MODVERSIONS -e MODULE_SIG -e MODULE_FORCE -e 'CONFIG_CMA' -e LOCALVERSION"
                  " -e RANDSTRUCT -e RETPOLINE -e CONFIG_CC_ -e CONFIG_GCC -e CONFIG_CLANG -e CONFIG_BLK_DEV_RAM -e CONFIG_CRYPTO_LZO"
                  " -e CONFIG_ZBUD -e CONFIG_Z3FOLD -e MODULE_UNLOAD -e CONFIG_TRIM_UNUSED; modinfo /system/lib/modules/*/kernel/crypto/lz4.ko"),
     ("dexopt", "dumpsys package dexopt | grep -A3 -e 'gallery3d\\]' -e 'settings\\]' -e 'calculator2\\]' -e 'deskclock\\]' -e 'systemui\\]'"
