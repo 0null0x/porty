@@ -16,14 +16,39 @@
 //                  second run is a second visit (service worker, Cache
 //                  Storage and HTTP cache of the first are there)
 //   CHROME_ARGS    more Chrome flags, space separated
+//   CPU_THROTTLE   slow the page and QEMU's threads down this many times,
+//                  e.g. 3 or 6 for a phone.  CDP's
+//                  Emulation.setCPUThrottlingRate only slows a page's main
+//                  thread (workers refuse it: "only supported for pages"),
+//                  and the guest's CPU runs in a worker, so the test stops
+//                  and continues Chrome's renderer processes instead
+//                  (SIGSTOP/SIGCONT, 10 ms on, 10 x (rate - 1) ms off).
+//                  CPU_THROTTLE_MODE=cdp uses CDP on the page alone.
+//   NO_HTTP_CACHE  1: the browser's HTTP cache is off (CDP
+//                  Network.setCacheDisabled on the page, the workers and
+//                  the service worker), so a disk chunk QEMU dropped is
+//                  downloaded again, as on a browser that does not cache
+//                  such files
+//   NET_MBPS       download speed limit in Mbit/s (CDP
+//                  Network.emulateNetworkConditions; with NET_LATENCY_MS)
+//   PROBE_WAIT     seconds the input probe waits for Gallery (default 240;
+//                  the later steps wait half and three quarters of it)
+//   PROBE_STEPS    "launch": the input probe ends after the Gallery launch
+//   PROBE_GUEST_EVERY  seconds between the guest's samples during the
+//                  launch (default 30).  0: none, to see how much the
+//                  sampling itself slows the launch; the page's counters
+//                  and the event log at the end still give the times
+//   RESUME_SETTLE  seconds between "Android resumed" and the first check
+//                  for the shell (default 120; a normal boot waits 8 min)
 //
 // Exit status: 0 whatever happened to Android (the verdict is in the log,
 // the job summary and a warning annotation: a red run would e-mail the
 // repository owner for every experiment); 1 only with BOOT_TEST_STRICT=1
 // when the page or QEMU failed; 2 on bad usage.
 // SPDX-License-Identifier: GPL-2.0-or-later
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { cpus } from 'node:os';
 import path from 'node:path';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
@@ -40,6 +65,27 @@ const params = new URLSearchParams((process.env.QUERY || '').trim().replace(/^\?
 const shellInit = (process.env.SHELL_INIT || '').trim();
 params.set('serial', '1');
 const url = `${siteUrl}?${params}`;
+const num = (name, fallback, min, max) => {
+    const v = Number(process.env[name]);
+    return Number.isFinite(v) && process.env[name] !== undefined && process.env[name] !== ''
+        ? Math.min(max, Math.max(min, v)) : fallback;
+};
+// Phone-like conditions (see the usage above).
+const cpuThrottle = num('CPU_THROTTLE', 1, 1, 50);
+const cpuThrottleCdp = process.env.CPU_THROTTLE_MODE === 'cdp';
+const noHttpCache = /^(1|true|on)$/.test(process.env.NO_HTTP_CACHE || '');
+const netMbps = num('NET_MBPS', 0, 0, 10000);
+const netLatencyMs = num('NET_LATENCY_MS', 0, 0, 5000);
+const probeWaitMs = num('PROBE_WAIT', 240, 30, 7200) * 1000;
+const launchOnly = (process.env.PROBE_STEPS || '') === 'launch';
+const resumeSettleMs = num('RESUME_SETTLE', 120, 0, 3600) * 1000;
+const guestEveryMs = num('PROBE_GUEST_EVERY', 30, 0, 600) * 1000;
+const conditions = [
+    cpuThrottle > 1 ? `cpu/${cpuThrottle}${cpuThrottleCdp ? 'cdp' : ''}` : '',
+    noHttpCache ? 'nocache' : '',
+    netMbps ? `net${netMbps}Mbit` : '',
+    guestEveryMs ? '' : 'quiet',
+].filter(Boolean).join(' ') || 'plain';
 
 const t0 = Date.now();
 const elapsed = () => {
@@ -51,12 +97,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // eslint-disable-next-line no-control-regex
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b[()][A-Z0-9]/g, '');
 
+// Runners differ by more than 2x; compare times only on the same model.
+const hostCpu = `${(cpus()[0] || {}).model || 'unknown CPU'} x${cpus().length}`.replace(/\s+/g, ' ');
+log(`host CPU: ${hostCpu}`);
 const browser = await puppeteer.launch({
     executablePath: process.env.CHROME || '/usr/bin/google-chrome',
     headless: true,
     protocolTimeout: 300000,
     ...(process.env.USER_DATA_DIR ? { userDataDir: process.env.USER_DATA_DIR } : {}),
     args: [
+        // Without a disk cache the service worker's own fetches cannot be
+        // served from it either, whatever CDP reaches.
+        ...(noHttpCache ? ['--disk-cache-size=1', '--media-cache-size=1'] : []),
         '--no-sandbox', '--disable-gpu', '--window-size=480,900',
         '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
         '--disable-backgrounding-occluded-windows',
@@ -92,10 +144,170 @@ page.on('console', async (m) => {
         log(`console.warn: ${m.text()}`);
     }
 });
+// The conditions apply to every target that runs or fetches for the guest:
+// the page, QEMU's threads (Web Workers: the CPU thread is one, and the
+// disk chunks are fetched by others) and the service worker all requests
+// pass through.  `net` counts what the Network domain reports.
+const net = { responses: 0, fromDiskCache: 0, fromServiceWorker: 0, chunkMs: [], pending: new Map() };
+const applied = {};
+async function applyConditions(client, kind) {
+    const note = (what, e) => {
+        const k = `${kind} ${what}: ${e ? `failed (${e.message.split('\n')[0]})` : 'ok'}`;
+        applied[k] = (applied[k] || 0) + 1;
+        if (applied[k] === 1) {
+            log(`conditions: ${k}`);
+        }
+    };
+    if (cpuThrottle > 1 && cpuThrottleCdp && kind === 'page') {
+        await client.send('Emulation.setCPUThrottlingRate', { rate: cpuThrottle })
+            .then(() => note(`cpu throttle ${cpuThrottle}x`), (e) => note(`cpu throttle ${cpuThrottle}x`, e));
+    }
+    if (noHttpCache || netMbps) {
+        await client.send('Network.enable').then(() => {}, (e) => note('Network.enable', e));
+    }
+    if (noHttpCache) {
+        await client.send('Network.setCacheDisabled', { cacheDisabled: true })
+            .then(() => note('no HTTP cache'), (e) => note('no HTTP cache', e));
+    }
+    if (netMbps) {
+        await client.send('Network.emulateNetworkConditions', {
+            offline: false,
+            latency: netLatencyMs,
+            downloadThroughput: Math.round((netMbps * 1e6) / 8),
+            uploadThroughput: Math.round((netMbps * 1e6) / 8),
+        }).then(() => note(`network ${netMbps} Mbit/s`), (e) => note(`network ${netMbps} Mbit/s`, e));
+    }
+}
+/** Count responses and time the disk chunks on a session with Network on. */
+function watchNetwork(client) {
+    client.on('Network.requestWillBeSent', (ev) => {
+        if (/\/image\//.test(ev.request.url)) {
+            net.pending.set(ev.requestId, ev.timestamp);
+        }
+    });
+    client.on('Network.responseReceived', (ev) => {
+        net.responses++;
+        net.fromDiskCache += ev.response.fromDiskCache ? 1 : 0;
+        net.fromServiceWorker += ev.response.fromServiceWorker ? 1 : 0;
+    });
+    client.on('Network.loadingFinished', (ev) => {
+        const t = net.pending.get(ev.requestId);
+        if (t !== undefined) {
+            net.pending.delete(ev.requestId);
+            net.chunkMs.push(Math.round((ev.timestamp - t) * 1000));
+        }
+    });
+}
+const netSummary = () => {
+    const ms = net.chunkMs.slice().sort((a, b) => a - b);
+    const at = (q) => (ms.length ? ms[Math.min(ms.length - 1, Math.floor(q * ms.length))] : 0);
+    return `${net.responses} responses, ${net.fromDiskCache} from the HTTP cache, ` +
+        `${net.fromServiceWorker} through the service worker; ${ms.length} disk chunks timed` +
+        (ms.length ? `: median ${at(0.5)} ms, p90 ${at(0.9)} ms, max ${ms[ms.length - 1]} ms, ` +
+            `sum ${Math.round(ms.reduce((a, b) => a + b, 0) / 1000)} s` : '');
+};
+
+/** Chrome's renderer processes: descendants of the browser process. */
+function rendererPids() {
+    const root = browser.process() && browser.process().pid;
+    const parent = new Map();
+    const renderers = [];
+    for (const d of readdirSync('/proc')) {
+        if (!/^\d+$/.test(d)) {
+            continue;
+        }
+        try {
+            const stat = readFileSync(`/proc/${d}/stat`, 'utf8');
+            parent.set(Number(d), Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]));
+            if (/--type=renderer/.test(readFileSync(`/proc/${d}/cmdline`, 'utf8'))) {
+                renderers.push(Number(d));
+            }
+        } catch (e) {
+            // the process ended meanwhile
+        }
+    }
+    return renderers.filter((pid) => {
+        for (let p = pid, n = 0; p > 1 && n < 12; p = parent.get(p) || 0, n++) {
+            if (p === root) {
+                return true;
+            }
+        }
+        return false;
+    });
+}
+// The slow CPU: every thread of the renderers runs 10 ms, then stands
+// still for 10 x (rate - 1) ms.  Clocks go on, as on a slower device.
+const throttle = { on: false, stopped: false, pids: [], scanned: 0, timer: null };
+function throttleTick() {
+    if (!throttle.on) {
+        return;
+    }
+    if (!throttle.stopped && Date.now() - throttle.scanned > 3000) {
+        throttle.scanned = Date.now();
+        try {
+            throttle.pids = rendererPids();
+        } catch (e) {
+            throttle.pids = [];
+        }
+    }
+    for (const pid of throttle.pids) {
+        try {
+            process.kill(pid, throttle.stopped ? 'SIGCONT' : 'SIGSTOP');
+        } catch (e) {
+            // gone
+        }
+    }
+    throttle.stopped = !throttle.stopped;
+    throttle.timer = setTimeout(throttleTick, throttle.stopped ? 10 * (cpuThrottle - 1) : 10);
+}
+function stopThrottle() {
+    throttle.on = false;
+    clearTimeout(throttle.timer);
+    for (const pid of throttle.pids) {
+        try {
+            process.kill(pid, 'SIGCONT');
+        } catch (e) {
+            // gone
+        }
+    }
+    throttle.stopped = false;
+}
+function startThrottle() {
+    if (cpuThrottle > 1 && !cpuThrottleCdp && !throttle.on) {
+        throttle.on = true;
+        throttleTick();
+        log(`conditions: renderer processes ${rendererPids().join(', ')} run 10 ms in every ${10 * cpuThrottle} ms`);
+    }
+}
+const pageClient = await page.createCDPSession();
+await applyConditions(pageClient, 'page');
+await pageClient.send('Network.enable').catch(() => {});
+watchNetwork(pageClient);
+const seenTargets = new WeakSet();
+const adoptServiceWorker = async (target) => {
+    if (target.type() !== 'service_worker' || seenTargets.has(target)) {
+        return;
+    }
+    seenTargets.add(target);
+    try {
+        const client = await target.createCDPSession();
+        await applyConditions(client, 'service worker');
+        await client.send('Network.enable').catch(() => {});
+        watchNetwork(client);
+    } catch (e) {
+        log(`conditions: service worker: ${e.message}`);
+    }
+};
+browser.on('targetcreated', adoptServiceWorker);
+let workerCount = 0;
 // Uncaught exceptions inside QEMU's threads (Web Workers), with their wasm
 // stacks: the page itself only gets "worker sent an error!" and a line number.
 page.on('workercreated', (worker) => {
     const name = worker.url().split('/').pop().split('?')[0];
+    workerCount++;
+    applyConditions(worker.client, 'worker').then(() => {
+        worker.client.send('Network.enable').then(() => watchNetwork(worker.client), () => {});
+    });
     worker.client.on('Runtime.exceptionThrown', ({ exceptionDetails: d }) => {
         log(`worker exception (${name}): ${(d.exception && d.exception.description) || d.text}`);
         // A thrown value without a stack (Emscripten's longjmp throws
@@ -132,6 +344,7 @@ async function postStatus(state, description) {
             body: JSON.stringify({
                 state,
                 context: (`porty/boot ${(process.env.QUERY || '').trim() || 'defaults'}` +
+                    (conditions !== 'plain' ? ` [${conditions}]` : '') +
                     (shellInit ? ` sh:${shellInit}` : '')).slice(0, 100),
                 description: description.replace(/\s+/g, ' ').slice(0, 139),
                 target_url: `${server}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID || ''}`,
@@ -225,21 +438,99 @@ async function dumpFiles() {
  * the focus, and screenshots after each.
  */
 async function inputProbe() {
-    const send = (cmd) => page.evaluate((c) => globalThis.__porty.serial.send(c), cmd);
+    const send = (cmd) => page.evaluate((c) => globalThis.__send(c), cmd);
     // Print the serial output as it comes, so that it lands between the
     // probe's own lines (the main loop is not reading it meanwhile).
     let lastFocus = '';
+    // Marker lines of the guest, newest of each kind (the output of the
+    // commands, never their echo: an echo has "$(" after the colon).
+    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map(), top: [] };
+    let pendingLine = '';
+    let logDone = 0;
     const sleep = async (ms) => {
         await new Promise((resolve) => setTimeout(resolve, ms));
         const text = await page.evaluate(() => (globalThis.__cap ? globalThis.__cap.splice(0).join('') : ''));
-        for (const line of stripAnsi(text).split('\n')) {
+        const lines = (pendingLine + stripAnsi(text)).split('\n');
+        pendingLine = lines.pop();
+        for (const line of lines) {
             if (line.trim()) {
                 console.log(`serial| ${line.replace(/\r$/, '')}`);
             }
-            // The output of the marker command, not its echo.
-            const m = line.match(/FOCUS:\s*(mCurrentFocus[^\r\n]*):END/);
+            let m = line.match(/FOCUS:\s*(mCurrentFocus[^\r\n]*):END/);
             if (m) {
                 lastFocus = m[1];
+            }
+            m = line.match(/ST:cpu ([\d ]+):(.*):END/);
+            if (m) {
+                const [user, nice, system, idle, iowait, irq, softirq] = m[1].trim().split(/\s+/).map(Number);
+                const rest = m[2];
+                const pick = (re) => {
+                    const r = re.exec(rest);
+                    return r ? Number(r[1]) : -1;
+                };
+                marks.st = {
+                    at: Date.now(),
+                    user: user + nice,
+                    system: system + irq + softirq,
+                    idle,
+                    iowait,
+                    majfault: pick(/pgmajfault (\d+)/),
+                    swapin: pick(/pswpin (\d+)/),
+                    swapout: pick(/pswpout (\d+)/),
+                    memFreeMb: Math.round(pick(/MemFree: (\d+)/) / 1024),
+                    memAvailMb: Math.round(pick(/MemAvailable: (\d+)/) / 1024),
+                    swapFreeMb: Math.round(pick(/SwapFree: (\d+)/) / 1024),
+                    swapTotalMb: Math.round(pick(/SwapTotal: (\d+)/) / 1024),
+                    load: (/:(\d+\.\d+) \d+\.\d+ \d+\.\d+ \d+\/\d+/.exec(rest) || [])[1] || '?',
+                };
+            }
+            m = line.match(/PS:(.*):END/);
+            if (m && !m[1].includes('$(')) {
+                marks.ps = { at: Date.now(), ticks: {} };
+                for (const part of m[1].trim().split(/\s+/)) {
+                    const r = /^([^/]+)\/(\d+)\+(\d+)$/.exec(part);
+                    if (r) {
+                        marks.ps.ticks[r[1]] = (marks.ps.ticks[r[1]] || 0) + Number(r[2]) + Number(r[3]);
+                    }
+                }
+            }
+            m = line.match(/LMK:(\d+):(\d+):(\d+):END/);
+            if (m) {
+                marks.lmk = { ...(marks.lmk || { events: -1, anr: -1 }), kernel: Number(m[1]) };
+            }
+            m = line.match(/AMC:(\d+):(\d+):END/);
+            if (m) {
+                marks.lmk = { ...(marks.lmk || { kernel: -1 }), events: Number(m[1]), anr: Number(m[2]) };
+            }
+            if (/TOP\|/.test(line) && !line.includes('sed "s')) {
+                marks.top.push(line.replace(/^.*TOP\|/, '').replace(/\r$/, ''));
+            }
+            if (/LOGDONE:2:END/.test(line)) {
+                logDone = Date.now();
+            }
+            if (/CALDONE:\d+:END/.test(line) && !marks.cal) {
+                marks.cal = Date.now();
+            }
+            // The log's own clock: the time stamp of a line we just wrote.
+            m = line.match(/GCLK:\s*\d\d-\d\d (\d\d):(\d\d):(\d\d)\.(\d+)\s*:END/);
+            if (m) {
+                marks.clock = {
+                    at: Date.now(),
+                    tod: Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(`0.${m[4]}`),
+                };
+            }
+            // Event log lines: "EV|11-16 12:00:00.000  1234  1234 I am_...: [..]"
+            m = line.match(/EV\|\s*(\d\d-\d\d) (\d\d):(\d\d):(\d\d)\.(\d+)\s.*?(am_\w+)\s*:\s*(.*)$/);
+            if (m) {
+                const key = `${m[1]} ${m[2]}:${m[3]}:${m[4]}.${m[5]} ${m[6]} ${m[7].trim()}`;
+                if (!marks.events.has(key)) {
+                    marks.events.set(key, {
+                        seen: Date.now(),
+                        tod: Number(m[2]) * 3600 + Number(m[3]) * 60 + Number(m[4]) + Number(`0.${m[5]}`),
+                        tag: m[6],
+                        text: m[7].trim().replace(/\r$/, ''),
+                    });
+                }
             }
         }
     };
@@ -288,18 +579,296 @@ async function inputProbe() {
         log(`INPUT PROBE: ${label}: not within ${Math.round(ms / 1000)} s`);
         return false;
     };
+    // --- the launch, measured -------------------------------------------
+    // What the page knows: the disk and JIT counters, the frame rate, and
+    // how much of the screen differs from the one before the tap (48x80
+    // samples; the arrow cursor and the clock are below 2%).
+    const pageSample = (setBase) => page.evaluate((base) => {
+        const e = globalThis.__porty;
+        const c = document.getElementById('screen');
+        let diff = -1;
+        try {
+            const t = document.createElement('canvas');
+            t.width = 48;
+            t.height = 80;
+            const g = t.getContext('2d');
+            g.drawImage(c, 0, 0, 48, 80);
+            const px = g.getImageData(0, 0, 48, 80).data;
+            if (base || !globalThis.__portyBase) {
+                globalThis.__portyBase = px;
+            }
+            const b = globalThis.__portyBase;
+            let n = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                n += Math.abs(px[i] - b[i]) + Math.abs(px[i + 1] - b[i + 1]) + Math.abs(px[i + 2] - b[i + 2]) > 48 ? 1 : 0;
+            }
+            diff = Math.round((1000 * n) / (48 * 80)) / 10;
+        } catch (err) {
+            diff = -1;
+        }
+        const stats = document.getElementById('stats');
+        return {
+            diff,
+            fps: Number((/^(\d+) fps/.exec(stats ? stats.textContent : '') || [])[1] || -1),
+            disk: e && e.diskStats ? e.diskStats() : null,
+            heap: e && e.heapStats ? e.heapStats() : null,
+            timescale: e && e.cfg ? e.cfg.timescale : 0,
+            exited: e ? !!e.exited : false,
+        };
+    }, setBase);
+    // One line of markers from the guest; see the parser in sleep().
+    // During the launch only what /proc answers by itself: logcat waits for
+    // logd's reader, which runs at background priority, and dumpsys for
+    // system_server; with the CPU this busy neither came back for ten
+    // minutes and the shell hung on them (run 43903544035).
+    const EVENTS = 'am_proc_start|am_proc_died|am_kill|am_activity_launch_time|am_low_memory|am_anr|' +
+        'am_proc_bound|am_restart_activity|am_on_resume_called|am_create_activity|am_focused_stack';
+    const guestSample = [
+        'echo ST:$(head -1 /proc/stat):$(grep -E "^(pgmajfault|pswpin|pswpout) " /proc/vmstat)' +
+            ':$(cat /proc/loadavg):$(grep -E "^(MemFree|MemAvailable|SwapTotal|SwapFree):" /proc/meminfo):END',
+        'echo PS:$(for n in system_server surfaceflinger com.android.gallery3d com.android.launcher3 ' +
+            'com.android.systemui zygote64 zygote logd; do for p in $(pidof $n); do ' +
+            'echo $n/$(cut -d" " -f14-15 /proc/$p/stat | tr " " +); done; done):END',
+        'echo LMK:$(dmesg | grep -c -i -E "lowmemorykiller|out of memory|killed process"):0:0:END',
+    ].join('; ');
+    // Before the tap and after the launch: the activity manager's events
+    // and the focused window.
+    const guestLog = [
+        `logcat -b events -d | grep -E "${EVENTS}" > /data/local/tmp/porty-am.txt`,
+        'echo AMC:$(grep -c -E "am_low_memory|am_kill" /data/local/tmp/porty-am.txt)' +
+            ':$(grep -c am_anr /data/local/tmp/porty-am.txt):END',
+        'tail -24 /data/local/tmp/porty-am.txt | cut -c1-170 | sed "s/^/EV|/"',
+        'echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END',
+    ].join('; ');
+    // The busiest threads over one second of the guest's time.
+    const guestTop = 'top -b -H -n 1 -d 1 -m 14 -s 1 -o %CPU,PID,TID,PR,S,CMD,NAME 2>&1 | tail -15 | cut -c1-110 | sed "s/^/TOP|/"';
+    // How fast the guest runs a hot loop now: seconds for 20000 rounds of
+    // the shell's arithmetic.  Comparable between runs and conditions.
+    const calibrate = async (label) => {
+        marks.cal = 0;
+        const t = Date.now();
+        await send('i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo CALDONE:$i:END\r');
+        while (!marks.cal && Date.now() - t < 300000) {
+            await sleep(1000);
+        }
+        const s = marks.cal ? (marks.cal - t) / 1000 : -1;
+        log(`INPUT PROBE: guest speed ${label}: ${s < 0 ? 'no answer in 300 s' : `${s.toFixed(1)} s for 20000 shell loop rounds`}`);
+        return s;
+    };
+    // During a launch the guest's one CPU is busy with ten runnable threads
+    // and an ordinary shell did not answer for minutes (run 43900085582).
+    // With the highest priority its samples come back; they cost the launch
+    // a little, which the "quiet" option shows.
+    await send('renice -n -20 -p $$ > /dev/null; echo NICE:$(cut -d" " -f19 /proc/$$/stat):END\r');
+    await sleep(4000);
+    const result = { conditions, query: String(params), hostCpu, calibrationS: await calibrate('before the tap') };
+    // The guest's clock against ours, for the times in the event log: a
+    // line written to the log now carries the log's time stamp.  The line
+    // is written within moments of the send; reading it back takes longer.
+    const guestClock = async () => {
+        marks.clock = null;
+        const sent = Date.now();
+        await send('log -t PORTYCLK now; echo GCLK:$(logcat -d -s PORTYCLK:V | tail -1 | cut -c1-18):END\r');
+        for (let i = 0; i < 30 && !marks.clock; i++) {
+            await sleep(2000);
+        }
+        return marks.clock ? { sent, at: marks.clock.at, tod: marks.clock.tod } : null;
+    };
+    const clock0 = await guestClock();
+    log(`INPUT PROBE: guest clock ${clock0 ? `${clock0.tod.toFixed(3)} s of its day, read back in ${clock0.at - clock0.sent} ms` : 'not read'}`);
+    // surfaceflinger's scheduling: policy 1 is SCHED_FIFO, which the kernel
+    // lets have sched_rt_runtime_us of every second before anything else.
+    await send(`${guestSample}; echo SFSCHED:$(for t in /proc/$(pidof surfaceflinger)/task/*; do ` +
+        'cut -d" " -f2,40,41 $t/stat; done | sort | uniq -c | tr "\n" ";")' +
+        `:rt_runtime $(cat /proc/sys/kernel/sched_rt_runtime_us):END; ${guestLog}; echo LOGDONE:$((1+1)):END\r`);
+    // The event log must have answered before the tap, or the shell is
+    // still waiting for it during the launch.
+    for (let i = 0; i < 36 && !logDone; i++) {
+        await sleep(5000);
+    }
+    log(`INPUT PROBE: the event log ${logDone ? 'answered' : 'did not answer in 180 s'} before the tap`);
+    logDone = 0;
+    let prevSt = marks.st;
+    let prevPs = marks.ps;
+    const before = await pageSample(true);
+    let prevPage = before;
+    log(`INPUT PROBE: before the tap: ${JSON.stringify({ ...before, st: prevSt, lmk: marks.lmk })}`);
+    const eventsBefore = new Set(marks.events.keys());
+
     const [gx, gy] = at(150, 565 * (r.ch || 800) / 800);
     log(`INPUT PROBE: finger tap at ${gx.toFixed(0)},${gy.toFixed(0)} (the Gallery icon)`);
     await page.touchscreen.tap(gx, gy);
-    await sleep(15000);
-    await shot('after-touch', true);
-    await focusWait('Gallery in front', /gallery/i, 240000);
+    const tapAt = Date.now();
+    const since = () => Math.round((Date.now() - tapAt) / 1000);
+    let nextGuest = tapAt + 20000;
+    let nextLine = tapAt + 30000;
+    let shotDone = false;
+    let guestRound = 0;
+    let lastSeenSt = prevSt;
+    let lastSeenPs = prevPs;
+    let peakInFlight = 0;
+    result.firstChangeS = -1;   // 10% of the screen differs: the starting window
+    result.screenChangedS = -1; // 40%: another window covers the launcher
+    const samples = [];
+    const timeline = [];
+    let lastDiff = 0;
+    while (Date.now() - tapAt < probeWaitMs) {
+        if (guestEveryMs && Date.now() >= nextGuest) {
+            nextGuest = Date.now() + guestEveryMs;
+            await send(`${guestSample}${guestRound++ % 2 === 1 ? `; ${guestTop}` : ''}\r`);
+        }
+        await sleep(5000);
+        let now;
+        try {
+            now = await pageSample(false);
+        } catch (e) {
+            log(`INPUT PROBE: page did not answer: ${e.message}`);
+            continue;
+        }
+        peakInFlight = Math.max(peakInFlight, now.disk ? now.disk.inFlight : 0);
+        if (Math.abs(now.diff - lastDiff) >= 1) {
+            lastDiff = now.diff;
+            timeline.push(`${since()}s:${now.diff}%`);
+        }
+        if (result.firstChangeS < 0 && now.diff >= 10) {
+            result.firstChangeS = since();
+            log(`INPUT PROBE: launch t+${since()} s: ${now.diff}% of the screen changed`);
+        }
+        if (result.screenChangedS < 0 && now.diff >= 40) {
+            result.screenChangedS = since();
+            log(`INPUT PROBE: launch t+${since()} s: ${now.diff}% of the screen changed`);
+            await shot(`launch-changed-t${since()}s`);
+        }
+        if (!shotDone && since() >= 15) {
+            shotDone = true;
+            await shot('after-touch', true);
+        }
+        if (Date.now() >= nextLine || now.exited) {
+            nextLine = Date.now() + 30000;
+            // Guest ticks are 1/100 s of the guest's own, dilated time.
+            const st = marks.st;
+            let cpu = 'guest: no new sample';
+            if (st && lastSeenSt && st !== lastSeenSt) {
+                const d = (k) => st[k] - lastSeenSt[k];
+                const total = Math.max(1, d('user') + d('system') + d('idle') + d('iowait'));
+                const pct = (k) => Math.round((100 * d(k)) / total);
+                cpu = `guest cpu over ${Math.round((st.at - lastSeenSt.at) / 1000)} s: user ${pct('user')}% ` +
+                    `system ${pct('system')}% iowait ${pct('iowait')}% idle ${pct('idle')}% (${total} ticks), ` +
+                    `majfault +${d('majfault')}, swap in/out +${d('swapin')}/+${d('swapout')}, ` +
+                    `free ${st.memFreeMb} MB, available ${st.memAvailMb} MB, ` +
+                    `swap ${st.swapTotalMb - st.swapFreeMb}/${st.swapTotalMb} MB, load ${st.load}`;
+                samples.push({ t: since(), user: pct('user'), system: pct('system'), iowait: pct('iowait'),
+                    idle: pct('idle'), ticks: total, majfault: d('majfault'), wallS: (st.at - lastSeenSt.at) / 1000 });
+                lastSeenSt = st;
+            }
+            let procs = '';
+            if (marks.ps && lastSeenPs && marks.ps !== lastSeenPs) {
+                procs = '; ticks by process: ' + Object.keys(marks.ps.ticks)
+                    .map((k) => [k.replace(/^com\.android\./, ''), marks.ps.ticks[k] - (lastSeenPs.ticks[k] || 0)])
+                    .filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', ');
+                lastSeenPs = marks.ps;
+            } else if (marks.ps && !lastSeenPs) {
+                lastSeenPs = marks.ps;
+            }
+            const dk = now.disk || {};
+            const pk = prevPage.disk || {};
+            const hp = now.heap || {};
+            const ph = prevPage.heap || {};
+            log(`INPUT PROBE: launch t+${since()} s: screen diff ${now.diff}%, ${now.fps} fps; ` +
+                `disk fetched ${dk.chunksFetched} (+${dk.chunksFetched - pk.chunksFetched}), ` +
+                `cache hits ${dk.cacheHits} (+${dk.cacheHits - pk.cacheHits}), in flight ${dk.inFlight} ` +
+                `(peak ${peakInFlight}), errors ${dk.errors}; ` +
+                `jit alive ${hp.jitAlive}/${hp.jitCap}, compiled ${hp.jitCompiled} (+${hp.jitCompiled - ph.jitCompiled}); ` +
+                `heap ${hp.used}/${hp.brk} MB; ${cpu}${procs}; ` +
+                `lmk ${marks.lmk ? `${marks.lmk.kernel} kernel, ${marks.lmk.events} am_kill/low_memory, ${marks.lmk.anr} anr` : '?'}; ` +
+                `focus ${lastFocus.replace(/^mCurrentFocus=/, '').slice(0, 70) || '?'}`);
+            prevPage = now;
+            peakInFlight = 0;
+        }
+        if (now.exited) {
+            log('INPUT PROBE: QEMU exited during the launch');
+            break;
+        }
+        // Done: Gallery has the focus and its window is on the screen; one
+        // more round of samples for the event log's launch time.
+        if (!launchOnly && result.screenChangedS >= 0 && since() - result.screenChangedS >= 35) {
+            break;
+        }
+    }
+    result.screenTimeline = timeline.join(' ');
+    log(`INPUT PROBE: how much of the screen differed from the home screen, when it changed: ${result.screenTimeline || 'never'}`);
+    for (const line of marks.top) {
+        log(`INPUT PROBE: top| ${line}`);
+    }
+    // The event log's own account, in guest time since the tap.
+    const clock1 = await guestClock();
+    lastFocus = '';
+    await send(`${guestLog}; ` +
+        'logcat -d -b main -b system | grep -E "Displayed |ANR in |Skipped [0-9]+ frames|lowmemorykiller|Low on memory" ' +
+        '| tail -12 | cut -c1-170; echo LOGDONE:$((1+1)):END\r');
+    // These wait for logd and system_server, which may be starved.
+    for (let i = 0; i < 36 && !logDone; i++) {
+        await sleep(5000);
+    }
+    result.logAnsweredS = logDone ? Math.round((logDone - tapAt) / 1000) : -1;
+    result.focusedAtEnd = /gallery/i.test(lastFocus);
+    result.focusAtEnd = lastFocus.replace(/^mCurrentFocus=/, '').slice(0, 80);
+    const ts = before.timescale || 8;
+    const day = (d) => (d < -43200 ? d + 86400 : d);
+    if (clock0 && clock1) {
+        result.guestClockRate = Math.round((1000 * day(clock1.tod - clock0.tod)) / ((clock1.sent - clock0.sent) / 1000)) / 1000;
+        log(`INPUT PROBE: the guest's clock ran at ${result.guestClockRate} of real time (timescale ${ts}: ${(1 / ts).toFixed(3)})`);
+    }
+    const fresh = [...marks.events.entries()].filter(([k]) => !eventsBefore.has(k)).map(([, v]) => v)
+        .sort((a, b) => a.tod - b.tod);
+    // Guest time of day at the tap, from the clock sample before it, at
+    // the rate the guest's clock really ran (else the timescale's).
+    const rate = result.guestClockRate > 0 ? result.guestClockRate : 1 / ts;
+    const tapTod = clock0 ? clock0.tod + ((tapAt - clock0.sent) / 1000) * rate : -1;
+    const wall = (ev) => Math.round(day(ev.tod - tapTod) / rate);
+    for (const ev of fresh) {
+        log(`INPUT PROBE: event t+${tapTod >= 0 ? wall(ev) : '?'} s: ${ev.tag} ${ev.text.slice(0, 120)}`);
+    }
+    const count = (tag) => fresh.filter((ev) => ev.tag === tag).length;
+    const launched = fresh.find((ev) => ev.tag === 'am_activity_launch_time' && /gallery/i.test(ev.text));
+    result.firstFrameS = launched && tapTod >= 0 ? wall(launched) : -1;
+    const lt = launched && /,(\d+),(\d+)\]/.exec(launched.text);
+    result.launchTimeGuestMs = lt ? Number(lt[2]) : -1;
+    result.launchTimeWallS = lt ? Math.round(Number(lt[2]) / 1000 / rate) : -1;
+    const procStart = fresh.find((ev) => ev.tag === 'am_proc_start' && /gallery/i.test(ev.text));
+    result.procStartS = procStart && tapTod >= 0 ? wall(procStart) : -1;
+    result.events = { procStart: count('am_proc_start'), procDied: count('am_proc_died'), kill: count('am_kill'),
+        lowMemory: count('am_low_memory'), anr: count('am_anr') };
+    result.lmk = marks.lmk;
+    const end = await pageSample(false).catch(() => null);
+    if (end && end.disk && before.disk) {
+        result.disk = { fetched: end.disk.chunksFetched - before.disk.chunksFetched,
+            cacheHits: end.disk.cacheHits - before.disk.cacheHits, errors: end.disk.errors - before.disk.errors };
+        result.jit = { alive: end.heap && end.heap.jitAlive, cap: end.heap && end.heap.jitCap,
+            compiled: end.heap && before.heap ? end.heap.jitCompiled - before.heap.jitCompiled : -1 };
+    }
+    const sum = (k) => samples.reduce((a, x) => a + x[k] * x.ticks, 0);
+    const ticks = Math.max(1, samples.reduce((a, x) => a + x.ticks, 0));
+    result.guestCpu = { user: Math.round(sum('user') / ticks), system: Math.round(sum('system') / ticks),
+        iowait: Math.round(sum('iowait') / ticks), idle: Math.round(sum('idle') / ticks),
+        majfault: samples.reduce((a, x) => a + x.majfault, 0) };
+    result.waitedS = since();
+    result.network = netSummary();
+    launchResult = result;
+    log(`LAUNCH RESULT: ${JSON.stringify(result)}`);
+    log(`INPUT PROBE: network: ${result.network}`);
     log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
     await shot('after-touch-wait', true);
+    if (launchOnly) {
+        await send('\rpkill getevent\r');
+        await sleep(3000);
+        log('INPUT PROBE: done (launch only)');
+        return;
+    }
 
     log('INPUT PROBE: the page\'s Home button');
     await page.click('#nav-home').catch((e) => log(`INPUT PROBE: no Home button (${e.message})`));
-    await focusWait('launcher in front', /launcher/i, 120000);
+    await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
 
     const [sx, sy] = at((r.cw || 480) / 2, 91 * (r.ch || 800) / 800);
     log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the search bar)`);
@@ -308,7 +877,7 @@ async function inputProbe() {
     await page.mouse.down();
     await sleep(150);
     await page.mouse.up();
-    await focusWait('search in front', /search|quicksearchbox|googlequicksearchbox/i, 180000);
+    await focusWait('search in front', /search|quicksearchbox|googlequicksearchbox/i, (probeWaitMs * 3) / 4);
     log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
     await shot('after-mouse', true);
 
@@ -327,6 +896,7 @@ function emit(name, info, b64) {
 }
 
 let exitCode = 0;
+let launchResult = null;
 let booted = false;
 let finalState = '';
 let lastSnap = null;
@@ -351,6 +921,11 @@ try {
         }
     }
     log('page is cross-origin isolated and ready');
+    for (const target of browser.targets()) {
+        await adoptServiceWorker(target);
+    }
+    log(`conditions: ${conditions}`);
+    startThrottle();
     log(`precheck: ${await page.$eval('#precheck', (e) => e.textContent.replace(/\s+/g, ' ').trim())}`);
     log(`build: ${await page.$eval('#buildid', (e) => e.textContent.replace(/\s+/g, ' ').trim()).catch(() => '?')}`);
 
@@ -359,6 +934,13 @@ try {
     await page.evaluate(() => {
         globalThis.__cap = [];
         const serial = globalThis.__porty && globalThis.__porty.serial;
+        // xterm-pty registers one handler for both typed text and binary
+        // input, and the page's serial.send() calls every registration: a
+        // command sent that way reaches the guest twice and runs twice.
+        // Send to each handler once.
+        globalThis.__send = (text) => {
+            new Set(serial ? serial.inputHandlers : []).forEach((h) => h(text));
+        };
         if (serial) {
             const forward = serial.onText;
             serial.onText = (text) => {
@@ -382,6 +964,7 @@ try {
     let recent = '';
     let probeAt = t0 + 8 * 60000;
     let appsListed = false;
+    let resumedSeen = false;
     let shellSent = !shellInit;
     let bootedAt = 0;
     let lastStatusLine = '';
@@ -516,21 +1099,27 @@ try {
         }
 
         // Ask the serial shell (if Android-x86 runs one) whether boot finished.
+        // A resumed Android is on its home screen at once: no eight minutes.
+        if (!resumedSeen && /resumed/i.test(snap.stage)) {
+            resumedSeen = true;
+            log(`resumed; the first check for the shell in ${Math.round(resumeSettleMs / 1000)} s`);
+            probeAt = Math.min(probeAt, Date.now() + resumeSettleMs);
+        }
         if (!shellSent && /console:\/ #/.test(stripAnsi(recent))) {
             shellSent = true;
             log(`SHELL INIT: ${shellInit}`);
-            await page.evaluate((cmd) => globalThis.__porty.serial.send(`\r${cmd}\r`), shellInit);
+            await page.evaluate((cmd) => globalThis.__send(`\r${cmd}\r`), shellInit);
             await sleep(3000);
         }
         if (!booted && snap.state === 'running' && Date.now() >= probeAt) {
             probeAt = Date.now() + 120000;
             // Where the guest's time goes: cumulative user/nice/system/idle/
             // iowait ticks, and from 14 minutes the busiest processes.
-            await page.evaluate(() => globalThis.__porty.serial.send(
+            await page.evaluate(() => globalThis.__send(
                 '\rhead -1 /proc/stat; cat /proc/loadavg\r'));
             await sleep(2000);
             if (Date.now() - t0 > 14 * 60000) {
-                await page.evaluate(() => globalThis.__porty.serial.send(
+                await page.evaluate(() => globalThis.__send(
                     'top -b -n 2 -d 2 -m 8 2>/dev/null | tail -9 | cut -c1-110\r'));
                 await sleep(8000);
             }
@@ -538,18 +1127,18 @@ try {
                 // Once: which Google packages the system image ships (the
                 // README says none; the boot log mentions Play services).
                 appsListed = true;
-                await page.evaluate(() => globalThis.__porty.serial.send(
+                await page.evaluate(() => globalThis.__send(
                     '\rls /system/priv-app /system/app 2>/dev/null | grep -i -E "gms|google|vending|phonesky|gsf" | tr "\\n" " "; echo\r'));
                 await sleep(3000);
             }
             // Progress first (informational), then the line the regex below reads.
-            await page.evaluate(() => globalThis.__porty.serial.send(
+            await page.evaluate(() => globalThis.__send(
                 '\rgetprop init.svc.zygote; getprop init.svc.surfaceflinger; getprop init.svc.bootanim\r'));
             await sleep(3000);
             // From 20 minutes on, also the newest Android log lines (what
             // system_server is busy with); they land in the job log.
             if (Date.now() - t0 > 20 * 60000) {
-                await page.evaluate(() => globalThis.__porty.serial.send(
+                await page.evaluate(() => globalThis.__send(
                     'logcat -d -b main -b system -t 12 2>/dev/null | cut -c1-150\r'));
                 await sleep(5000);
             }
@@ -557,7 +1146,7 @@ try {
             // shows "$(getprop ...)", only the output shows the value.  A
             // bare "getprop sys.boot_completed" followed by a "1" matched
             // once when another command's output landed after the echo.
-            await page.evaluate(() => globalThis.__porty.serial.send(
+            await page.evaluate(() => globalThis.__send(
                 'echo BOOTCHK:$(getprop sys.boot_completed):END\r'));
         }
         if (!booted && /BOOTCHK:1:END/.test(stripAnsi(recent))) {
@@ -595,9 +1184,19 @@ try {
     exitCode = 1;
 }
 
+stopThrottle();
 const verdict = exitCode ? 'failed' : (booted ? 'booted' : 'still booting at the deadline');
-log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}`);
-await postStatus(exitCode ? 'failure' : (booted ? 'success' : 'error'), `${verdict} after ${elapsed()}`);
+const secs = (v) => (v >= 0 ? `${v} s` : 'not seen');
+const launchLine = launchResult
+    ? `Gallery: screen changed ${secs(launchResult.screenChangedS)} (${launchResult.screenTimeline}), ` +
+        `first frame by the event log ${secs(launchResult.firstFrameS)}, ` +
+        `${launchResult.focusedAtEnd ? 'focused' : 'not focused'} at ${secs(launchResult.logAnsweredS)} ` +
+        `(${launchResult.conditions})`
+    : '';
+log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}${launchLine ? `; ${launchLine}` : ''}`);
+log(`network: ${netSummary()}; ${workerCount} workers`);
+await postStatus(exitCode ? 'failure' : (booted ? 'success' : 'error'),
+    `${verdict} after ${elapsed()}${launchLine ? `; ${launchLine}` : ''}`);
 if (exitCode) {
     const why = lastSnap && lastSnap.failure ? lastSnap.failure.slice(0, 200) : 'see the log';
     console.log(`::warning title=Porty boot test failed::${params} - ${why}`);
@@ -613,6 +1212,8 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         `- Result: **${verdict}** after ${elapsed()} (page state \`${finalState}\`)`,
         `- Screen: ${s.screen || 'n/a'}; last stage: ${s.stage || 'n/a'} ${s.detail || ''}`,
         `- ${s.memory || ''}`,
+        `- Conditions: ${conditions}; host CPU: ${hostCpu}`,
+        ...(launchResult ? [`- ${launchLine}`, '', '```json', JSON.stringify(launchResult, null, 1), '```'] : []),
         '',
         'Last serial lines:',
         '',

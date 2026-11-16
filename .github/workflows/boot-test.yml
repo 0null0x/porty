@@ -31,6 +31,26 @@ on:
         description: Commands to type into Android's root shell once it is up (experiments, e.g. setprop)
         type: string
         default: ''
+      cpu_throttle:
+        description: Slow Chrome's renderer down this many times (e.g. 3 or 6 for a phone; 1 = off)
+        type: number
+        default: 1
+      no_http_cache:
+        description: Turn the browser's HTTP cache off (dropped disk chunks are downloaded again)
+        type: boolean
+        default: false
+      net_mbps:
+        description: Download speed limit in Mbit/s (0 = none)
+        type: number
+        default: 0
+      probe_wait:
+        description: Seconds the input probe waits for Gallery to open
+        type: number
+        default: 240
+      probe:
+        description: 'Input probe options, comma separated: launch (stop after the Gallery launch), quiet (no guest sampling during it)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -39,7 +59,7 @@ permissions:
 # A new deployment cancels the boot test of the previous one; hand-started
 # runs with different parameters run side by side.
 concurrency:
-  group: boot-test-${{ github.event_name }}-${{ inputs.query }}-${{ inputs.control }}-${{ inputs.shell }}
+  group: boot-test-${{ github.event_name }}-${{ inputs.query }}-${{ inputs.control }}-${{ inputs.shell }}-${{ inputs.cpu_throttle }}-${{ inputs.no_http_cache }}-${{ inputs.net_mbps }}-${{ inputs.probe }}
   cancel-in-progress: true
 
 defaults:
@@ -74,12 +94,22 @@ jobs:
           DUMP_FILES: ${{ inputs.dump }}
           CONTROL: ${{ inputs.control }}
           SHELL_INIT: ${{ inputs.shell }}
+          CPU_THROTTLE: ${{ inputs.cpu_throttle }}
+          NO_HTTP_CACHE: ${{ inputs.no_http_cache }}
+          NET_MBPS: ${{ inputs.net_mbps }}
+          PROBE_WAIT: ${{ inputs.probe_wait }}
+          PROBE_OPTIONS: ${{ inputs.probe }}
         run: |
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
           CHROME="$(command -v google-chrome || command -v chromium)"
           export SITE_URL CHROME
           export MINUTES="${MINUTES:-100}"
+          # Phone-like conditions and input probe options (boot-test.mjs).
+          export CPU_THROTTLE="${CPU_THROTTLE:-1}" NET_MBPS="${NET_MBPS:-0}" PROBE_WAIT="${PROBE_WAIT:-240}"
+          [[ "${NO_HTTP_CACHE:-false}" == true ]] && export NO_HTTP_CACHE=1 || export NO_HTTP_CACHE=0
+          [[ ",${PROBE_OPTIONS:-}," == *,launch,* ]] && export PROBE_STEPS=launch
+          [[ ",${PROBE_OPTIONS:-}," == *,quiet,* ]] && export PROBE_GUEST_EVERY=0
           nproc
           free -m
           "$CHROME" --version
