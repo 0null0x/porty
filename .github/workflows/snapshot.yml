@@ -53,8 +53,8 @@ permissions:
   statuses: write
 
 concurrency:
-  group: snapshot-${{ github.ref }}
-  cancel-in-progress: true
+  group: snapshot-${{ github.sha }}
+  cancel-in-progress: false
 
 defaults:
   run:
