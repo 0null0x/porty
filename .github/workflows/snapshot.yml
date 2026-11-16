@@ -29,9 +29,13 @@ on:
       - build/pc-bios.list
       - patches/qemu-wasm/**
       - scripts/prepare-image.sh
+      - scripts/slim-system.py
       - tests/print-qemu-args.mjs
+      - tests/apply-boot-diet.mjs
       - web/js/qemu-args.js
       - web/js/config.js
+      - web/js/boot-diet.js
+      - web/js/initramfs.js
   workflow_dispatch:
     inputs:
       query:
@@ -92,8 +96,8 @@ jobs:
         continue-on-error: true
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso ninja-build pkg-config \
-            libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
 
       # --- native QEMU from the patched QEMU-Wasm tree ---------------------
       - name: Restore cached native QEMU
@@ -188,9 +192,17 @@ jobs:
             *mem=*tb=*cache=*|*mem=*cache=*tb=*|*tb=*mem=*cache=*|*tb=*cache=*mem=*|*cache=*mem=*tb=*|*cache=*tb=*mem=*) ;;
             *) echo "::warning::query '$QUERY' does not set mem, tb and cache; print-qemu-args.mjs would use the desktop defaults" ;;
           esac
+          # The page changes initrd.img in memory before QEMU starts (boot
+          # diet, web/js/boot-diet.js); the native boot uses the same bytes.
+          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/snap/initrd-page.img" "?$QUERY" \
+            | tee out/artifact/logs/boot-diet.txt
+          sha256sum out/image/initrd.img out/snap/initrd-page.img | tee -a out/artifact/logs/boot-diet.txt
           # Natively: local paths.
           node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
-            "$PWD/out/native-qemu/pc-bios" "?$QUERY" > out/snap/argv-native.txt
+            "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
+            | awk -v initrd="$PWD/out/snap/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+            > out/snap/argv-native.txt
+          grep -qxF "$PWD/out/snap/initrd-page.img" out/snap/argv-native.txt
           # For the manifest: the paths web/js/emulator.js uses.  The disk URL
           # depends on where the site is served; emulator.js builds it as
           # `${base}image/<disk dir>`, and that text stands in for it here.
