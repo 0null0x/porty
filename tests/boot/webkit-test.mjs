@@ -633,6 +633,80 @@ function startJitModel() {
     globalThis.__jitModelStop = () => worker.terminate();
 }
 
+/**
+ * What costs memory before QEMU runs a single instruction: is a shared
+ * WebAssembly memory resident as soon as it exists, and what does a Worker
+ * cost (every QEMU thread is one)?
+ */
+async function fixedCosts() {
+    const costs = {};
+    result.fixed = costs;
+    const content = () => (memorySample() || { content: 0 }).content;
+    await sleep(1500);
+    const m0 = content();
+    await page.evaluate(() => {
+        globalThis.__held = new WebAssembly.Memory({ initial: 1280 * 16, maximum: 1280 * 16, shared: true });
+    });
+    await sleep(1500);
+    const m1 = content();
+    costs.sharedMemory1280Untouched = m1 - m0;
+    // Touch a quarter of it: does resident memory follow what is used?
+    await page.evaluate(() => {
+        const b = new Uint8Array(globalThis.__held.buffer);
+        for (let i = 0; i < 320 * 1048576; i += 4096) {
+            b[i] = 1;
+        }
+    });
+    await sleep(1500);
+    const m2 = content();
+    costs.after320MiBTouched = m2 - m1;
+    await page.evaluate(() => {
+        globalThis.__held = null;
+    });
+    await sleep(3000);
+    const m3 = content();
+    costs.afterDropping = m3 - m0;
+    log(`FIXED COSTS: a 1280 MiB shared memory adds ${costs.sharedMemory1280Untouched} MiB untouched, ` +
+        `${costs.after320MiBTouched} MiB more after 320 MiB were written; ${costs.afterDropping} MiB stay after dropping it`);
+    // Workers: idle, then each with a 256 KiB stack-like buffer and a small
+    // WebAssembly instance, roughly what an Emscripten thread starts with.
+    for (const [name, body] of [
+        ['idle', 'self.onmessage = () => self.postMessage(1);'],
+        ['with a WebAssembly instance', `self.onmessage = () => {
+            self.keep = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(
+                [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 5, 1, 0x60, 0, 1, 0x7f, 3, 2, 1, 0, 7, 5, 1, 1, 0x66, 0, 0, 10, 6, 1, 4, 0, 0x41, 7, 0x0b])));
+            self.keep.exports.f();
+            self.postMessage(1);
+        };`],
+    ]) {
+        const before = content();
+        const threadsBefore = (memorySample() || {}).threads;
+        const started = await page.evaluate(async (source) => {
+            globalThis.__workers = [];
+            const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+            await Promise.all(Array.from({ length: 20 }, () => new Promise((resolve) => {
+                const w = new Worker(url);
+                globalThis.__workers.push(w);
+                w.onmessage = resolve;
+                w.onerror = resolve;
+                w.postMessage(0);
+            })));
+            return globalThis.__workers.length;
+        }, body);
+        await sleep(2000);
+        const after = content();
+        const threadsAfter = (memorySample() || {}).threads;
+        await page.evaluate(() => {
+            globalThis.__workers.forEach((w) => w.terminate());
+            globalThis.__workers = null;
+        });
+        await sleep(2000);
+        costs[`worker ${name}`] = Math.round(((after - before) / started) * 10) / 10;
+        log(`FIXED COSTS: ${started} workers ${name}: ${after - before} MiB, ${costs[`worker ${name}`]} MiB each ` +
+            `(threads ${threadsBefore} -> ${threadsAfter}); ${content() - before} MiB stay after terminating them`);
+    }
+}
+
 async function jitBench() {
     const call = async (command) => {
         const r = await page.evaluate((c) => globalThis.__jitModel(c), command);
@@ -1401,6 +1475,11 @@ try {
 
     if (benchMode !== '0') {
         try {
+            await fixedCosts();
+        } catch (e) {
+            note(`fixed-cost probe failed: ${String(e.message || e).split('\n')[0]}`);
+        }
+        try {
             await jitBench();
         } catch (e) {
             note(`JIT MODEL failed: ${String(e.message || e).split('\n')[0]}`);
@@ -1443,6 +1522,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         `- QEMU module: ${JSON.stringify(result.qemu || {}).slice(0, 900)}`,
         ...(tableGrow ? [`- Experiment: table grows by ${tableGrow} (${result.tableGrowHits || 0} places rewritten in ${result.tableGrowLoads || 0} loads of out.js)`] : []),
         `- Compiled blocks in the code buffer: ${JSON.stringify(result.blocks || {})}`,
+        ...(result.fixed ? [`- Fixed costs (MiB): ${JSON.stringify(result.fixed)}`] : []),
         `- Boot: ${JSON.stringify(result.boot)}`,
         `- Probe: ${JSON.stringify(result.probe)}`,
         ...(be.make ? [
