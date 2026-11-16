@@ -351,7 +351,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/artifact/snapshot
-          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}-${{ hashFiles('web/js/qemu-args.js', 'web/js/config.js', 'web/js/boot-diet.js', 'web/js/initramfs.js') }}
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}-${{ hashFiles('web/js/qemu-args.js', 'web/js/config.js', 'web/js/boot-diet.js', 'web/js/initramfs.js', 'scripts/snapshot/**') }}
 
       - name: Collect logs
         if: ${{ always() }}
