@@ -558,6 +558,18 @@ def do_save(opts, argv):
                 log(f"guest load: {guest.get('loadavg')}")
                 run("top", "top -b -n 1 -m 14 | head -22 | cut -c1-150", 240)
                 run("log_tail", "logcat -d -t 25 | cut -c1-200", 180)
+                if opts.require_ready:
+                    # Still this busy after the settle: in such boots
+                    # system_server's Watchdog fired later (run 43867426731),
+                    # and what would be saved is Android restarting.  Give up
+                    # and let the caller boot again.
+                    try:
+                        busy = float(guest.get("loadavg", "").split()[0]) >= opts.busy_load
+                    except (ValueError, IndexError):
+                        busy = True
+                    if busy:
+                        result["error"] = f"guest still busy after settling (load {guest.get('loadavg', '?').strip()})"
+                        return result
 
                 # An "isn't responding" dialog would be saved with the
                 # machine, and natively SystemUI often stops responding in the
@@ -649,6 +661,28 @@ def do_save(opts, argv):
                 result["stable_seconds"] = round(vm.elapsed() - booted, 1)
                 if not vm.alive():
                     result["error"] = f"QEMU exited with status {vm.proc.returncode} before the save"
+                    return result
+
+                # Only an Android that shows its home screen and answers is
+                # worth publishing: system_server alive, the launcher the
+                # focused app, no dialog for an app that stopped responding
+                # (focused or not), and the screen lit.
+                status, windows = vm.sh("dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp"
+                                        " -e 'Application Not Responding' | cut -c1-160", 180)
+                guest["ready_windows"] = windows
+                problems = []
+                if status != 0 or "Can't find service" in windows:
+                    problems.append("no window manager (system_server restarting?)")
+                if not re.search(r"mFocusedApp=.*launcher", windows, re.IGNORECASE):
+                    problems.append("the launcher is not the focused app")
+                if "Application Not Responding" in windows:
+                    problems.append("a dialog for an app that is not responding")
+                lit = (result.get("screen") or {}).get("lit_percent", 0) or 0
+                if lit < opts.min_lit:
+                    problems.append(f"the screen is {lit}% lit")
+                result["ready_problems"] = problems
+                if problems and opts.require_ready:
+                    result["error"] = "guest not ready to save: " + "; ".join(problems)
                     return result
 
             except Rebooted:
@@ -785,6 +819,13 @@ def main():
     ap.add_argument("--guest-command", action="append", default=[],
                     help="extra shell command to run in the guest before the save (repeatable)")
     ap.add_argument("--zero-reserve", type=int, default=96, help="MiB of free memory to leave alone")
+    ap.add_argument("--require-ready", type=int, default=1,
+                    help="1: save only an idle guest on its home screen (launcher focused, no 'not responding'"
+                         " dialog, screen lit); otherwise fail so that the caller can boot again")
+    ap.add_argument("--busy-load", type=float, default=4.0,
+                    help="with --require-ready: give up if the load average is still this high after settling")
+    ap.add_argument("--min-lit", type=float, default=50.0,
+                    help="with --require-ready: lowest share of lit pixels (%%) on the screen to save")
     opts = ap.parse_args()
 
     os.makedirs(opts.work, exist_ok=True)

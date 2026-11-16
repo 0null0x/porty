@@ -292,16 +292,27 @@ jobs:
           trap 'kill "$reporter" 2>/dev/null || true' EXIT
           extra=()
           [[ -z "$GUEST_COMMAND" ]] || extra=(--guest-command "$GUEST_COMMAND")
-          python3 -I scripts/snapshot/make-snapshot.py save \
-            --qemu out/native-qemu/qemu-system-x86_64 \
-            --argv-file out/snap/argv-native.txt \
-            --work out/snap/save \
-            --state "$RUNNER_TEMP/vm.state" \
-            --runstate "$RUNSTATE" \
-            --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))" \
-            --settle 300 \
-            --trace-reboot "$TRACE_REBOOT" \
-            "${extra[@]}"
+          # make-snapshot.py saves only an idle Android on its home screen;
+          # some native boots end busy (system_server's Watchdog fired in run
+          # 43867426731), so boot again, up to three times.
+          for attempt in 1 2 3; do
+            if python3 -I scripts/snapshot/make-snapshot.py save \
+              --qemu out/native-qemu/qemu-system-x86_64 \
+              --argv-file out/snap/argv-native.txt \
+              --work out/snap/save \
+              --state "$RUNNER_TEMP/vm.state" \
+              --runstate "$RUNSTATE" \
+              --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))" \
+              --settle 300 \
+              --trace-reboot "$TRACE_REBOOT" \
+              "${extra[@]}"; then
+              exit 0
+            fi
+            why="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("error", "?"))' out/snap/save/result.json 2>/dev/null || echo '?')"
+            echo "::warning title=Snapshot attempt $attempt::$why"
+            cp out/snap/save/result.json "out/snap/save/result-attempt-$attempt.json" 2>/dev/null || true
+          done
+          exit 1
 
       - name: Cut the stream into compressed chunks
         id: pack
