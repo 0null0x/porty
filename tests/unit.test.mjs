@@ -268,6 +268,16 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     u32[(INFO >> 2)] = 0x31424650;
     const bad = new Display(canvas, memory, () => { poll(); u32[(INFO >> 2) + 2] = (1 << 20) - 8; return INFO; });
     assert.equal(bad.update(0), false);
+
+    // hasContent(): a black picture (no boot animation) keeps the overlay up
+    assert.equal(new Display(canvas, memory, poll).hasContent(), false, 'nothing drawn yet');
+    assert.equal(display.hasContent(), true);
+    display.out.fill(0xff000000);
+    assert.equal(display.hasContent(), false, 'opaque black is no content');
+    display.out[Math.floor(H / 2) * W + Math.floor(W / 2)] = 0xff000000 | 0x10;
+    assert.equal(typeof display.hasContent(), 'boolean');
+    display.out.fill(0xff102030);
+    assert.equal(display.hasContent(), true);
 }
 
 // --- input ----------------------------------------------------------------------------------

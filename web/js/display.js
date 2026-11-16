@@ -117,4 +117,26 @@ export class Display {
         this.frames++;
         return true;
     }
+
+    /**
+     * Whether the last picture has anything but black in it, from a coarse
+     * grid of samples.  Without a boot animation (?diet=, the default) the
+     * screen stays black from the switch to graphics mode until Android's
+     * launcher draws, which can be an hour or more.
+     */
+    hasContent() {
+        const out = this.out;
+        if (!out || !this.width || !this.height) {
+            return false;
+        }
+        const step = Math.max(1, Math.floor(Math.min(this.width, this.height) / 40));
+        for (let y = step >> 1; y < this.height; y += step) {
+            for (let x = step >> 1, i = y * this.width + x; x < this.width; x += step, i += step) {
+                if ((out[i] & 0xffffff) !== 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 }

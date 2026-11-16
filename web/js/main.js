@@ -216,6 +216,8 @@ function renderLoop() {
     let frames = 0;
     let lastBeat = -1;
     let beatAt = performance.now();
+    let darkScreen = false;
+    let lastContentCheck = 0;
     let lastLogged = 0;
 
     const tick = (now) => {
@@ -231,10 +233,17 @@ function renderLoop() {
         if (display.update(now)) {
             frames++;
         }
-        if (!graphicsSeen && display.width && !(display.width === 720 && display.height === 400) &&
-            !(display.width === 640 && display.height === 480)) {
-            // The guest left VGA text mode: Android's graphics stack is up.
-            hideOverlay();
+        // Once the guest leaves VGA text mode, hide the overlay as soon as
+        // Android draws something.  Until then (no boot animation by
+        // default) the black screen alone would look like a hang.
+        const textMode = (display.width === 720 && display.height === 400) ||
+            (display.width === 640 && display.height === 480);
+        if (!graphicsSeen && display.width && !textMode && now - lastContentCheck >= 250) {
+            lastContentCheck = now;
+            darkScreen = !display.hasContent();
+            if (!darkScreen) {
+                hideOverlay();
+            }
         }
         if (now - lastStats >= 1000) {
             const disk = emulator.diskStats();
@@ -261,9 +270,13 @@ function renderLoop() {
                 (disk.inFlight ? ` (${disk.inFlight} loading)` : '') +
                 (disk.errors ? `, ${disk.errors} retries` : '');
             if (!graphicsSeen) {
+                if (darkScreen) {
+                    $('stage-text').textContent = 'Android is starting';
+                }
                 $('stage-detail').textContent =
                     `${disk.megabytes.toFixed(0)} MB of the system image read so far` +
-                    (disk.errors ? `, ${disk.errors} download retries` : '');
+                    (disk.errors ? `, ${disk.errors} download retries` : '') +
+                    (darkScreen ? '. The screen stays dark until the home screen appears.' : '');
             }
             frames = 0;
             lastStats = now;
