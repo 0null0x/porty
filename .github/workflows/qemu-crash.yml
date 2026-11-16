@@ -53,7 +53,7 @@ on:
         type: number
         default: 45
       trace:
-        description: Instrument the glue to print where an uncaught longjmp was thrown (1 or 0)
+        description: 'Instrument the glue: 0 off, 1 report an uncaught longjmp, 2 also the last 8 longjmps'
         type: string
         default: '1'
 
@@ -104,7 +104,7 @@ jobs:
           print('reps=' + json.dumps(json.loads(os.environ['I_REPS'])))
           print('minutes=%d' % int(float(os.environ['I_MINUTES'] or 70)))
           print('stress_minutes=%d' % int(float(os.environ['I_STRESS'] or 45)))
-          print('trace=' + ('1' if os.environ['I_TRACE'] in ('1', 'true') else '0'))
+          print('trace=%d' % (int(os.environ['I_TRACE']) if os.environ['I_TRACE'].isdigit() else 0))
           EOF
           else
             python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
@@ -115,7 +115,7 @@ jobs:
           print('reps=' + json.dumps(c.get('reps', [1])))
           print('minutes=%d' % int(c.get('minutes', 70)))
           print('stress_minutes=%d' % int(c.get('stress_minutes', 45)))
-          print('trace=' + ('1' if c.get('trace', True) else '0'))
+          print('trace=%d' % int(c.get('trace', 1)))
           EOF
           fi
           cat "$GITHUB_OUTPUT"
@@ -161,3 +161,190 @@ jobs:
             gzip -9c "$f" | base64 -w 50000
             echo "-----END PORTY FILE-----"
           done
+
+  stress:
+    name: ${{ matrix.variant }} ${{ matrix.rep }}
+    needs: setup
+    if: needs.setup.outputs.mode == 'stress'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        variant: ${{ fromJSON(needs.setup.outputs.variants) }}
+        rep: ${{ fromJSON(needs.setup.outputs.reps) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        continue-on-error: true
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The keys of branch-boot-test.yml.
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        if: steps.versions.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Restore the prepared Android image
+        id: image-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore the resume snapshot
+        id: snapshot-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && startsWith(matrix.variant, 'resume')
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/artifact/snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}-${{ hashFiles('web/js/qemu-args.js', 'web/js/config.js', 'web/js/boot-diet.js', 'web/js/initramfs.js', 'scripts/snapshot/**') }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        with:
+          node-version: 22
+
+      - name: Assemble the site
+        id: site
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && steps.image-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        env:
+          HAVE_SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          SHA: ${{ steps.versions.outputs.sha }}
+          TRACE: ${{ needs.setup.outputs.trace }}
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
+          extra=()
+          if [[ "$HAVE_SNAPSHOT" == true ]]; then
+            extra=(--snapshot out/artifact/snapshot)
+          fi
+          scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$SHA" "${extra[@]}"
+          if [[ "$TRACE" != 0 ]]; then
+            # A copy: dist/qemu may hold hard links into out/qemu.
+            cp dist/qemu/out.js "$RUNNER_TEMP/out.js"
+            rm dist/qemu/out.js
+            cp "$RUNNER_TEMP/out.js" dist/qemu/out.js
+            node tests/boot/longjmp-trace.mjs dist/qemu/out.js "$TRACE"
+          fi
+          sha256sum dist/qemu/out.js dist/qemu/qemu-system-x86_64.wasm
+
+      - name: Boot and stress
+        id: boot
+        if: steps.site.outcome == 'success'
+        continue-on-error: true
+        env:
+          PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+          VARIANT: ${{ matrix.variant }}
+          REP: ${{ matrix.rep }}
+          MINUTES: ${{ needs.setup.outputs.minutes }}
+          STRESS: ${{ needs.setup.outputs.stress_minutes }}
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium)"
+          export CHROME SITE_URL="http://127.0.0.1:8080/"
+          cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || true)"
+          echo "runner CPU: ${cpu:-unknown}, $(nproc) threads"
+          "$CHROME" --version
+          kind="${VARIANT%%:*}"
+          extra=""
+          [[ "$VARIANT" == *:* ]] && extra="${VARIANT#*:}"
+          case "$kind" in
+            full-*) query="resume=0" ;;
+            *) query="" ;;
+          esac
+          [[ -n "$extra" ]] && query="${query:+$query&}$extra"
+          export QUERY="$query" STRESS_MINUTES="$STRESS" STRESS_SEED="$REP" INPUT_PROBE=0 RESUME_SETTLE=60
+          case "$kind" in
+            *-quiet) export STRESS_INPUT=0 ;;
+            *) export STRESS_INPUT=1 ;;
+          esac
+          echo "variant $VARIANT rep $REP: QUERY='$QUERY' STRESS_MINUTES=$STRESS_MINUTES STRESS_INPUT=$STRESS_INPUT MINUTES=$MINUTES"
+          work="$RUNNER_TEMP/stress"
+          mkdir -p "$work"
+          python3 tests/ui/serve.py dist 8080 "--log=$work/server.log" --isolate &
+          server=$!
+          for _ in $(seq 50); do
+            curl -fsS -o /dev/null "${SITE_URL}index.html" 2>/dev/null && break
+            sleep 0.2
+          done
+          node tests/boot/boot-test.mjs 2>&1 | tee "$work/boot.log" || true
+          kill "$server" 2>/dev/null || true
+          grep -a "RUN RESULT:" "$work/boot.log" | tail -1 | sed 's/^.*RUN RESULT: //' > "$work/result.json" || true
+          echo "cpu=${cpu:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.versions.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VARIANT: ${{ matrix.variant }}
+          REP: ${{ matrix.rep }}
+          SITE: ${{ steps.site.outcome }}
+          SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          CPU: ${{ steps.boot.outputs.cpu }}
+        run: |
+          result="$RUNNER_TEMP/stress/result.json"
+          state=error
+          if [[ "$SITE" != success ]]; then text="site not assembled"
+          elif [[ ! -s "$result" ]]; then text="no result"
+          else
+            text="$(python3 -I - "$result" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          s = r.get('stress') or {}
+          errs = r.get('workerErrors') or []
+          parts = ['booted' if r.get('booted') else 'not booted', '%s min' % r.get('minutes')]
+          if errs:
+              parts.append('DIED at %d s: %s' % (errs[0]['atS'], errs[0]['text'][:60]))
+          else:
+              parts.append('no worker exception')
+          if s:
+              parts.append('stress %s min, %d actions' % (s.get('minutes'), sum((s.get('actions') or {}).values())))
+          print(', '.join(parts))
+          EOF
+          )"
+            state=success
+            grep -q DIED <<< "$text" && state=failure
+          fi
+          [[ "$SNAPSHOT" == true ]] && text="$text (resumed snapshot)"
+          echo "$state: $text; CPU $CPU"
+          {
+            echo "## $VARIANT $REP"
+            echo
+            echo "- $text"
+            echo "- runner CPU: $CPU"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "${SHA:-}" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" -f state="$state" \
+              -f context="$(printf 'porty/crash %s %s' "$VARIANT" "$REP" | cut -c1-100)" \
+              -f description="$(printf '%s' "$text" | cut -c1-139)" -f target_url="$RUN_URL" >/dev/null || true
+          fi
+          exit 0

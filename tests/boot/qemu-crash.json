@@ -1,3 +1,8 @@
 {
-  "mode": "glue"
+  "mode": "stress",
+  "variants": ["full-input", "full-quiet", "resume-input", "resume-quiet"],
+  "reps": [1, 2],
+  "minutes": 75,
+  "stress_minutes": 50,
+  "trace": 2
 }

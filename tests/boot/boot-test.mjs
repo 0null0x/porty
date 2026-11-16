@@ -40,6 +40,14 @@
 //                  and the event log at the end still give the times
 //   RESUME_SETTLE  seconds between "Android resumed" and the first check
 //                  for the shell (default 120; a normal boot waits 8 min)
+//   STRESS_MINUTES after the boot, instead of the input probe: this many
+//                  minutes of random finger taps, swipes, mouse moves and
+//                  clicks, the Home, Back and Recents buttons and key
+//                  presses (STRESS_INPUT=0: the same time without input),
+//                  with a liveness check of the guest's shell every minute.
+//                  Worker exceptions end it; the result is a line
+//                  "STRESS RESULT: {...}"
+//   STRESS_SEED    seed of the random actions (default 1)
 //
 // Exit status: 0 whatever happened to Android (the verdict is in the log,
 // the job summary and a warning annotation: a red run would e-mail the
@@ -80,6 +88,9 @@ const probeWaitMs = num('PROBE_WAIT', 240, 30, 7200) * 1000;
 const launchOnly = (process.env.PROBE_STEPS || '') === 'launch';
 const resumeSettleMs = num('RESUME_SETTLE', 120, 0, 3600) * 1000;
 const guestEveryMs = num('PROBE_GUEST_EVERY', 30, 0, 600) * 1000;
+const stressMs = num('STRESS_MINUTES', 0, 0, 600) * 60000;
+const stressInput = process.env.STRESS_INPUT !== '0';
+const stressSeed = num('STRESS_SEED', 1, 0, 2 ** 31);
 const conditions = [
     cpuThrottle > 1 ? `cpu/${cpuThrottle}${cpuThrottleCdp ? 'cdp' : ''}` : '',
     noHttpCache ? 'nocache' : '',
@@ -300,6 +311,8 @@ const adoptServiceWorker = async (target) => {
 };
 browser.on('targetcreated', adoptServiceWorker);
 let workerCount = 0;
+// Worker exceptions, as they happen (the stress loop ends on the first).
+const workerErrors = [];
 // Uncaught exceptions inside QEMU's threads (Web Workers), with their wasm
 // stacks: the page itself only gets "worker sent an error!" and a line number.
 page.on('workercreated', (worker) => {
@@ -308,7 +321,15 @@ page.on('workercreated', (worker) => {
     applyConditions(worker.client, 'worker').then(() => {
         worker.client.send('Network.enable').then(() => watchNetwork(worker.client), () => {});
     });
+    // tests/boot/longjmp-trace.mjs reports through the worker's console.
+    worker.client.on('Runtime.consoleAPICalled', (ev) => {
+        const text = (ev.args || []).map((a) => (a.value !== undefined ? String(a.value) : a.description || '')).join(' ');
+        if (/^PORTY-/.test(text)) {
+            log(`worker console (${name}): ${text}`);
+        }
+    });
     worker.client.on('Runtime.exceptionThrown', ({ exceptionDetails: d }) => {
+        workerErrors.push({ at: Date.now(), text: String((d.exception && d.exception.description) || d.text).slice(0, 300) });
         log(`worker exception (${name}): ${(d.exception && d.exception.description) || d.text}`);
         // A thrown value without a stack (Emscripten's longjmp throws
         // Infinity): where it was thrown from, as far as V8 knows.
@@ -886,6 +907,177 @@ async function inputProbe() {
     log('INPUT PROBE: done');
 }
 
+/**
+ * STRESS_MINUTES: random input (or none) after the boot, until the time is
+ * up or a QEMU thread dies.  Every minute the guest's shell must echo a
+ * marker; a guest that stops answering after a worker exception is dead.
+ */
+let stressResult = null;
+let wasResumed = false;
+async function stressLoop() {
+    const send = (cmd) => page.evaluate((c) => globalThis.__send(c), cmd);
+    let seed = stressSeed >>> 0 || 1;
+    const rand = () => {
+        seed = (seed * 1103515245 + 12345) >>> 0;
+        return seed / 4294967296;
+    };
+    let pendingLine = '';
+    let alive = 0;
+    const drain = async () => {
+        const text = await page.evaluate(() => (globalThis.__cap ? globalThis.__cap.splice(0).join('') : ''));
+        const lines = (pendingLine + stripAnsi(text)).split('\n');
+        pendingLine = lines.pop();
+        for (const line of lines) {
+            if (line.trim()) {
+                console.log(`serial| ${line.replace(/\r$/, '')}`);
+            }
+            const m = line.match(/ALIVE:(\d+):END/);
+            if (m) {
+                alive = Date.now();
+            }
+        }
+    };
+    const r = await page.$eval('#screen', (e) => {
+        const b = e.getBoundingClientRect();
+        return { x: b.left, y: b.top, w: b.width, h: b.height };
+    });
+    const pt = () => [r.x + 4 + rand() * (r.w - 8), r.y + 4 + rand() * (r.h - 8)];
+    const counts = {};
+    const t0s = Date.now();
+    const errorsBefore = workerErrors.length;
+    let nextAlive = Date.now();
+    let nextLine = Date.now() + 60000;
+    let nextShot = Date.now() + 300000;
+    let aliveAsked = 0;
+    let lastAliveOk = Date.now();
+    let crash = null;
+    log(`STRESS: ${stressInput ? 'input' : 'no input'} for ${Math.round(stressMs / 60000)} min, seed ${stressSeed}, canvas ${JSON.stringify(r)}`);
+    const act = async () => {
+        const k = rand();
+        let name;
+        if (k < 0.30) {
+            name = 'tap';
+            const [x, y] = pt();
+            await page.touchscreen.tap(x, y);
+        } else if (k < 0.42) {
+            name = 'swipe';
+            const [x0, y0] = pt();
+            const [x1, y1] = pt();
+            await page.touchscreen.touchStart(x0, y0);
+            for (let i = 1; i <= 6; i++) {
+                await page.touchscreen.touchMove(x0 + ((x1 - x0) * i) / 6, y0 + ((y1 - y0) * i) / 6);
+                await sleep(20);
+            }
+            await page.touchscreen.touchEnd();
+        } else if (k < 0.52) {
+            name = 'long-press';
+            const [x, y] = pt();
+            await page.touchscreen.touchStart(x, y);
+            await sleep(600 + rand() * 900);
+            await page.touchscreen.touchEnd();
+        } else if (k < 0.64) {
+            name = 'mouse-move';
+            for (let i = 0; i < 4; i++) {
+                const [x, y] = pt();
+                await page.mouse.move(x, y, { steps: 5 });
+            }
+        } else if (k < 0.76) {
+            name = 'click';
+            const [x, y] = pt();
+            await page.mouse.move(x, y, { steps: 3 });
+            await page.mouse.down();
+            await sleep(60 + rand() * 120);
+            await page.mouse.up();
+        } else if (k < 0.84) {
+            name = 'home';
+            await page.click('#nav-home');
+        } else if (k < 0.92) {
+            name = 'back';
+            await page.click('#nav-back');
+        } else if (k < 0.95) {
+            name = 'recents';
+            await page.click('#nav-recents');
+        } else {
+            name = 'keys';
+            await page.focus('#screen').catch(() => {});
+            for (const key of ['a', 'b', 'Enter', 'ArrowDown', 'Backspace'].slice(0, 1 + Math.floor(rand() * 5))) {
+                await page.keyboard.press(key);
+            }
+        }
+        counts[name] = (counts[name] || 0) + 1;
+    };
+    while (Date.now() - t0s < stressMs) {
+        if (workerErrors.length > errorsBefore && !crash) {
+            crash = { ...workerErrors[errorsBefore], afterS: Math.round((workerErrors[errorsBefore].at - t0s) / 1000) };
+            log(`STRESS: worker exception ${crash.afterS} s into the stress phase: ${crash.text}`);
+            // Is the guest still there?  Two more liveness rounds.
+            nextAlive = Date.now();
+            const until = Date.now() + 150000;
+            while (Date.now() < until) {
+                if (Date.now() >= nextAlive) {
+                    nextAlive = Date.now() + 60000;
+                    aliveAsked = Date.now();
+                    await send('\recho ALIVE:$((6*7)):END\r').catch(() => {});
+                }
+                await sleep(5000);
+                await drain().catch(() => {});
+            }
+            crash.guestAnswered = alive > crash.at;
+            break;
+        }
+        if (Date.now() >= nextAlive) {
+            nextAlive = Date.now() + 60000;
+            if (alive >= aliveAsked && aliveAsked) {
+                lastAliveOk = alive;
+            }
+            aliveAsked = Date.now();
+            await send('\recho ALIVE:$((6*7)):END\r').catch(() => {});
+        }
+        if (stressInput) {
+            try {
+                await act();
+            } catch (e) {
+                counts.failed = (counts.failed || 0) + 1;
+            }
+            await sleep(300 + rand() * 2700);
+        } else {
+            await sleep(5000);
+        }
+        await drain().catch(() => {});
+        if (Date.now() >= nextLine) {
+            nextLine = Date.now() + 60000;
+            const st = await page.evaluate(() => {
+                const e = globalThis.__porty;
+                return { heap: e && e.heapStats ? e.heapStats() : null, exited: e ? !!e.exited : false };
+            }).catch(() => ({}));
+            log(`STRESS: ${Math.round((Date.now() - t0s) / 1000)} s, actions ${JSON.stringify(counts)}, ` +
+                `guest answered ${Math.round((Date.now() - (alive || t0s)) / 1000)} s ago, heap ${JSON.stringify(st.heap)}`);
+            if (st.exited) {
+                crash = { at: Date.now(), text: 'QEMU exited', afterS: Math.round((Date.now() - t0s) / 1000) };
+                break;
+            }
+        }
+        if (Date.now() >= nextShot) {
+            nextShot = Date.now() + 300000;
+            await shot(`stress-t${Math.round((Date.now() - t0s) / 60000)}m`);
+        }
+    }
+    stressResult = {
+        input: stressInput,
+        seed: stressSeed,
+        minutes: Math.round((Date.now() - t0s) / 6000) / 10,
+        actions: counts,
+        crashed: !!crash,
+        crash,
+        lastAliveS: Math.round((Date.now() - (lastAliveOk || t0s)) / 1000),
+        workerErrors: workerErrors.length,
+        hostCpu,
+        query: String(params),
+    };
+    log(`STRESS RESULT: ${JSON.stringify(stressResult)}`);
+    await shot('stress-end', true);
+}
+
 function emit(name, info, b64) {
     log(`screenshot ${name}: ${info}, ${b64.length} base64 chars`);
     console.log(`-----BEGIN PORTY SCREENSHOT ${name.replace(/\s+/g, '_')} ${info}-----`);
@@ -1102,6 +1294,7 @@ try {
         // A resumed Android is on its home screen at once: no eight minutes.
         if (!resumedSeen && /resumed/i.test(snap.stage)) {
             resumedSeen = true;
+            wasResumed = true;
             log(`resumed; the first check for the shell in ${Math.round(resumeSettleMs / 1000)} s`);
             probeAt = Math.min(probeAt, Date.now() + resumeSettleMs);
         }
@@ -1154,12 +1347,22 @@ try {
             bootedAt = Date.now();
             log('ANDROID BOOT COMPLETED (sys.boot_completed=1)');
             await shot('boot-completed', true);
+            if (stressMs) {
+                await stressLoop();
+                break;
+            }
             if (process.env.INPUT_PROBE !== '0') {
                 await inputProbe();
                 bootedAt = Date.now();
             }
         }
         if (booted && Date.now() - bootedAt > 90000) {
+            break;
+        }
+        // A QEMU thread died before the boot finished: the guest will not
+        // finish it either.  A few more minutes of log, then stop.
+        if (stressMs && workerErrors.length && Date.now() - workerErrors[0].at > 180000) {
+            log('a QEMU thread died during the boot; stopping');
             break;
         }
     }
@@ -1194,6 +1397,18 @@ const launchLine = launchResult
         `(${launchResult.conditions})`
     : '';
 log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}${launchLine ? `; ${launchLine}` : ''}`);
+if (stressMs) {
+    // One line for tests/boot/crash-report.py: what died, and when.
+    log(`RUN RESULT: ${JSON.stringify({
+        query: String(params),
+        hostCpu,
+        booted,
+        resumed: wasResumed,
+        minutes: Math.round((Date.now() - t0) / 6000) / 10,
+        workerErrors: workerErrors.map((e) => ({ atS: Math.round((e.at - t0) / 1000), text: e.text.slice(0, 120) })),
+        stress: stressResult,
+    })}`);
+}
 log(`network: ${netSummary()}; ${workerCount} workers`);
 await postStatus(exitCode ? 'failure' : (booted ? 'success' : 'error'),
     `${verdict} after ${elapsed()}${launchLine ? `; ${launchLine}` : ''}`);
