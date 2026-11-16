@@ -551,6 +551,47 @@ without the page bug first.
   reclaimed them, and until then new hot code runs in the interpreter. Not
   waiting for the collector may be a large speed-up; next experiment.
 
+**Seventh round: where the boot time goes (2026-11-16).** Boot tests on
+4-vCPU GitHub runners, one run each unless noted; runners differ by up to
+2x, so small differences mean nothing.
+
+- The guest is CPU-bound from start to end: consecutive `/proc/stat`
+  samples show 0% idle and 0% iowait. System time is 35-60% of the first
+  30 minutes (squashfs inflating in `[loop0]`, page cache), user time
+  70-90% later.
+- Busiest processes (toybox `top`, %CPU summed over the probes): with the
+  boot animation, `surfaceflinger` and `bootanimation` lead everything,
+  then `[loop0]`, `dex2oat` and `system_server`. Without it, `dex2oat`
+  leads, then `system_server`, `[loop0]` and `[rcu_preempt]`.
+- No boot animation (`setprop debug.sf.nobootanimation 1` at the shell, or
+  `androidboot.quiescent=1`): first-boot dexopt starts at 36-40 minutes
+  instead of 51-53, and SecondaryZygotePreload (the 32-bit zygote preloading
+  classes) takes about 9 minutes instead of 17-18. `mitigations=off` on top
+  gave nothing visible.
+- Interpreter only (`jit=2147483647`): still before Android's init after
+  60 minutes, against the root shell at 8 minutes with the JIT. The
+  TCG-to-Wasm JIT is worth at least 7x.
+- `smp=2` no longer crashes (after 0005/0006 and dlmalloc) but crawls:
+  54 s of guest time in 40 minutes, the kernel stuck in
+  `quirk_usb_early_handoff` for 36 s of guest time. Not usable.
+- Boot diet (`diet=1`, now the default): dex2oat runs with
+  `--compiler-filter=extract`; dexopt at 33 minutes, SecondaryZygotePreload
+  done at 37 (537 s). The system_server Watchdog still fired at 61 minutes
+  ("sysrq: Show Blocked State") and killed system_server at 84 ("WATCHDOG
+  KILLING SYSTEM PROCESS").
+- Time dilation (`timescale=4` and `8`, without the diet): two hours each
+  without the Watchdog firing; the guest clock ran 4x and 8x slower (logcat
+  times); SecondaryZygotePreload took 225 s and 141 s of guest time. Both
+  were still in first-boot dexopt of Google's apps (GmsCore, Chrome, with
+  `quicken`) at two hours.
+- The image did ship Google's apps (GmsCore, Phonesky, Velvet, Chrome,
+  Gmail and companions; see 2.8); dex2oat spent most of an hour on them.
+  The slim image removes them.
+- The boot test reported a 10-minute "boot" once: a typed
+  `getprop sys.boot_completed` echoed before the shell had finished the
+  previous command, whose output was "1". It now checks
+  `echo BOOTCHK:$(getprop sys.boot_completed):END`.
+
 **Next steps, in order of cost:**
 
 1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly
