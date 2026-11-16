@@ -1,0 +1,801 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 04:30:00 +0000
+Subject: [PATCH] migration: add porty-snapshot, an incoming stream fetched as
+ zlib chunk files
+
+Booting Android in the browser takes hours, so Porty resumes a machine
+that was saved on a native QEMU with "migrate file:" instead, as
+QEMU-Wasm's examples/migration does.  That example preloads the whole
+state file into Emscripten's in-memory filesystem, which lives outside
+the WebAssembly memory; a few hundred MB there is more than an iPhone
+tab can afford on top of the guest.
+
+"-incoming porty:<index file>" reads the stream from chunk files instead
+(each the zlib compression of the next chunk-size bytes), listed with
+their sizes and SHA-256 hashes in a small local index.  A dedicated
+thread fetches, verifies and inflates one chunk at a time into one of two
+buffers while the migration coroutine reads from the other, so the cost
+is two inflated chunks and one compressed chunk whatever the size of the
+snapshot, and the download overlaps with loading the state.
+
+Under Emscripten the thread fetches with a synchronous XMLHttpRequest
+(it is a pthread, hence a Web Worker, as in block/porty.c); native
+builds read the chunk files from a directory, which lets
+tests/snapshot-native.sh run the same code outside the browser.  A
+failed download, a wrong size or hash, corrupt data or a short stream
+fail the read with a message that names the chunk.
+porty_snapshot_stats() exports progress counters for the page.
+---
+ migration/meson.build      |   1 +
+ migration/migration.c      |  10 +
+ migration/porty-snapshot.c | 697 +++++++++++++++++++++++++++++++++++++++++++++
+ migration/porty-snapshot.h |  18 ++
+ 4 files changed, 726 insertions(+)
+
+diff --git a/migration/meson.build b/migration/meson.build
+index 92b1cc4297..447a570706 100644
+--- a/migration/meson.build
++++ b/migration/meson.build
+@@ -24,6 +24,7 @@ system_ss.add(files(
+   'multifd-zlib.c',
+   'ram-compress.c',
+   'options.c',
++  'porty-snapshot.c',
+   'postcopy-ram.c',
+   'savevm.c',
+   'socket.c',
+diff --git a/migration/migration.c b/migration/migration.c
+index 3ce04b2aaf..b12c420cd7 100644
+--- a/migration/migration.c
++++ b/migration/migration.c
+@@ -21,6 +21,7 @@
+ #include "exec.h"
+ #include "fd.h"
+ #include "file.h"
++#include "porty-snapshot.h"
+ #include "socket.h"
+ #include "sysemu/runstate.h"
+ #include "sysemu/sysemu.h"
+@@ -519,6 +520,15 @@ static void qemu_start_incoming_migration(const char *uri, bool has_channels,
+     g_autoptr(MigrationChannel) channel = NULL;
+     MigrationAddress *addr = NULL;
+     MigrationIncomingState *mis = migration_incoming_get_current();
++    const char *porty_index;
++
++    /* Porty: a snapshot streamed from chunk files (porty-snapshot.c). */
++    if (uri && !has_channels && strstart(uri, "porty:", &porty_index)) {
++        migrate_set_state(&mis->state, MIGRATION_STATUS_NONE,
++                          MIGRATION_STATUS_SETUP);
++        porty_snapshot_start_incoming_migration(porty_index, errp);
++        return;
++    }
+ 
+     /*
+      * Having preliminary checks for uri and channel
+diff --git a/migration/porty-snapshot.c b/migration/porty-snapshot.c
+new file mode 100644
+index 0000000000..9a46fd4f74
+--- /dev/null
++++ b/migration/porty-snapshot.c
+@@ -0,0 +1,697 @@
++/*
++ * Porty snapshot source: an incoming migration stream published as
++ * zlib-compressed chunk files ("-incoming porty:<index file>").
++ *
++ * Copyright (c) 2026 The Porty contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * A machine saved with "migrate file:<path>" is published as
++ *
++ *     <url>/000000.zz, <url>/000001.zz, ...
++ *
++ * where every file is the zlib (RFC 1950) compression of the next
++ * chunk-size bytes of the migration stream (the last chunk may be short).
++ * A small text index, a local file, lists them:
++ *
++ *     porty-snapshot 1
++ *     url <base URL or directory>     (optional: the index's directory)
++ *     chunk-size <bytes>
++ *     size <bytes of the uncompressed stream>
++ *     chunk <compressed bytes> <sha256 of the compressed file, or -> <file>
++ *     chunk ...                       (one line per chunk, in order)
++ *
++ * The stream is never held as a whole.  A dedicated thread fetches one
++ * chunk at a time, checks its size and hash and inflates it into one of
++ * two chunk-sized buffers; the migration code reads from the other.  So
++ * the cost is two inflated chunks plus one compressed chunk, whatever the
++ * size of the snapshot, and the download overlaps with loading the state.
++ *
++ *  - Emscripten: chunks are fetched with a synchronous XMLHttpRequest.
++ *    The fetching thread is a pthread, hence a Web Worker, where that is
++ *    allowed (as in block/porty.c).  Incoming migration itself runs in a
++ *    coroutine of QEMU's main loop thread, which PROXY_TO_PTHREAD also
++ *    makes a Worker; it blocks on a condition variable while it waits for
++ *    a chunk, never on the network.
++ *  - native builds: <url> is a directory and chunks are read from it, so
++ *    the same code is tested outside the browser.
++ *
++ * Any failure (HTTP error, wrong size or hash, corrupt or short data)
++ * fails the read with a message naming the chunk, and with it the
++ * incoming migration.
++ */
++
++#include "qemu/osdep.h"
++#include <zlib.h>
++#include "qapi/error.h"
++#include "qemu/atomic.h"
++#include "qemu/cutils.h"
++#include "qemu/error-report.h"
++#include "qemu/iov.h"
++#include "qemu/main-loop.h"
++#include "qemu/memalign.h"
++#include "qemu/thread.h"
++#include "qom/object.h"
++#include "io/channel.h"
++#include "block/aio.h"
++#include "channel.h"
++#include "porty-snapshot.h"
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#define PORTY_EXPORT EMSCRIPTEN_KEEPALIVE
++#else
++#define PORTY_EXPORT __attribute__((used, visibility("default")))
++#endif
++
++#define PORTY_SNAP_MAGIC       "porty-snapshot 1"
++#define PORTY_SNAP_SLOTS       2
++#define PORTY_SNAP_MIN_CHUNK   4096
++#define PORTY_SNAP_MAX_CHUNK   (64 * 1024 * 1024)
++#define PORTY_SNAP_MAX_CHUNKS  65536
++#define PORTY_SNAP_ATTEMPTS    4
++
++/*
++ * Progress, shared with web/js/emulator.js (8 x uint32_t, ABI: only
++ * append).  Written with atomics by the fetching thread and by the reader,
++ * read by the browser main thread through porty_snapshot_stats().
++ */
++enum {
++    PORTY_SNAP_IDLE = 0,     /* no snapshot source was opened */
++    PORTY_SNAP_LOADING = 1,
++    PORTY_SNAP_DONE = 2,     /* the stream was closed without an error */
++    PORTY_SNAP_FAILED = 3,
++};
++
++typedef struct PortySnapshotStats {
++    uint32_t state;          /* 0: PORTY_SNAP_* */
++    uint32_t chunks_total;   /* 1 */
++    uint32_t chunks_fetched; /* 2: fetched, verified and inflated */
++    uint32_t fetched_kb;     /* 3: compressed KiB downloaded */
++    uint32_t compressed_kb;  /* 4: compressed KiB in the whole snapshot */
++    uint32_t consumed_kb;    /* 5: stream KiB handed to the migration code */
++    uint32_t total_kb;       /* 6: stream KiB in the whole snapshot */
++    uint32_t errors;         /* 7: failed fetch attempts */
++} PortySnapshotStats;
++
++QEMU_BUILD_BUG_ON(sizeof(PortySnapshotStats) != 8 * sizeof(uint32_t));
++
++static PortySnapshotStats porty_snap_stats;
++
++PORTY_EXPORT uint32_t *porty_snapshot_stats(void);
++uint32_t *porty_snapshot_stats(void)
++{
++    return (uint32_t *)&porty_snap_stats;
++}
++
++#define TYPE_QIO_CHANNEL_PORTY_SNAPSHOT "qio-channel-porty-snapshot"
++OBJECT_DECLARE_SIMPLE_TYPE(QIOChannelPortySnapshot, QIO_CHANNEL_PORTY_SNAPSHOT)
++
++typedef struct PortySnapChunk {
++    char *name;
++    char *sha256;            /* lower-case hex, or NULL: not checked */
++    uint32_t csize;          /* size of the compressed file */
++} PortySnapChunk;
++
++struct QIOChannelPortySnapshot {
++    QIOChannel parent;
++
++    char *base;              /* URL or directory, without trailing slash */
++    PortySnapChunk *chunks;
++    uint32_t nb_chunks;
++    uint32_t chunk_size;
++    uint64_t size;           /* of the uncompressed stream */
++
++    uint8_t *slot[PORTY_SNAP_SLOTS]; /* chunk i is inflated into slot i % 2 */
++    uint8_t *zbuf;           /* the compressed chunk being fetched */
++    size_t zbuf_size;
++
++    QemuThread thread;
++    bool thread_started;
++    bool started;            /* the index was accepted */
++    bool closed;
++
++    /* Protected by lock */
++    QemuMutex lock;
++    QemuCond cond;
++    uint32_t produced;       /* chunks inflated so far */
++    uint32_t cur;            /* chunk the reader is in */
++    bool holding;            /* the reader has claimed chunk cur */
++    bool stop;
++    char *error;             /* set once by the fetching thread */
++
++    /* Reader only */
++    size_t cur_pos;
++    size_t cur_len;
++    uint64_t consumed;
++    bool failed;
++};
++
++/* ------------------------------------------------------------------ */
++/* Fetching one chunk (runs in the fetching thread)                    */
++/* ------------------------------------------------------------------ */
++
++#ifdef __EMSCRIPTEN__
++/*
++ * Returns the number of bytes stored at dst, or a negative number:
++ * -(HTTP status) for HTTP errors, -1 for network errors / exceptions and
++ * -2 when the body was larger than the buffer.
++ */
++EM_JS(int, porty_js_snapshot_fetch, (const char *url, uint8_t *dst, int cap), {
++    /* Note: only double-quoted strings in here (C preprocessor tokens). */
++    try {
++        var xhr = new XMLHttpRequest();
++        xhr.open("GET", UTF8ToString(url), false);
++        xhr.responseType = "arraybuffer";
++        xhr.send(null);
++        if (xhr.status !== 200) {
++            return xhr.status >= 100 ? -xhr.status : -1;
++        }
++        var body = new Uint8Array(xhr.response);
++        if (body.length > cap) {
++            return -2;
++        }
++        HEAPU8.set(body, dst >>> 0);
++        return body.length;
++    } catch (e) {
++        return -1;
++    }
++})
++
++static int porty_snap_fetch_once(const char *path, uint8_t *buf, size_t cap,
++                                 char **why)
++{
++    int n = porty_js_snapshot_fetch(path, buf, (int)cap);
++
++    if (n <= -100) {
++        *why = g_strdup_printf("HTTP %d", -n);
++    } else if (n == -2) {
++        *why = g_strdup("the file is larger than the index says");
++    } else if (n < 0) {
++        *why = g_strdup("network error");
++    }
++    return n;
++}
++#else
++static int porty_snap_fetch_once(const char *path, uint8_t *buf, size_t cap,
++                                 char **why)
++{
++    size_t done = 0;
++    int fd = open(path, O_RDONLY);
++
++    if (fd < 0) {
++        *why = g_strdup(strerror(errno));
++        return -1;
++    }
++    while (done < cap) {
++        ssize_t n = read(fd, buf + done, cap - done);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            *why = g_strdup(strerror(errno));
++            close(fd);
++            return -1;
++        }
++        if (n == 0) {
++            break;
++        }
++        done += n;
++    }
++    close(fd);
++    return done;
++}
++#endif
++
++static size_t porty_snap_chunk_len(QIOChannelPortySnapshot *s, uint32_t index)
++{
++    uint64_t start = (uint64_t)index * s->chunk_size;
++
++    return MIN((uint64_t)s->chunk_size, s->size - start);
++}
++
++static bool porty_snap_should_stop(QIOChannelPortySnapshot *s)
++{
++    bool stop;
++
++    qemu_mutex_lock(&s->lock);
++    stop = s->stop;
++    qemu_mutex_unlock(&s->lock);
++    return stop;
++}
++
++/* Returns NULL on success, or a message to be freed with g_free(). */
++static char *porty_snap_load_chunk(QIOChannelPortySnapshot *s, uint32_t index,
++                                   uint8_t *dst)
++{
++    PortySnapChunk *c = &s->chunks[index];
++    g_autofree char *path = g_strdup_printf("%s/%s", s->base, c->name);
++    g_autofree char *why = NULL;
++    size_t want = porty_snap_chunk_len(s, index);
++    uLongf out_len = want;
++    int attempt;
++    int n = -1;
++    int zret;
++
++    for (attempt = 0; attempt < PORTY_SNAP_ATTEMPTS; attempt++) {
++        if (attempt) {
++            g_usleep(250000u << attempt); /* 0.5 s, 1 s, 2 s */
++            if (porty_snap_should_stop(s)) {
++                return g_strdup("cancelled");
++            }
++        }
++        g_clear_pointer(&why, g_free);
++        /* one spare byte, so that a file that is too long is noticed */
++        n = porty_snap_fetch_once(path, s->zbuf, (size_t)c->csize + 1, &why);
++        if (n == (int)c->csize) {
++            break;
++        }
++        qatomic_inc(&porty_snap_stats.errors);
++        if (n >= 0) {
++            why = g_strdup_printf("got %d bytes, expected %u", n, c->csize);
++            n = -1;
++        }
++    }
++    if (n < 0) {
++        return g_strdup_printf("chunk %u (%s): %s", index, path,
++                               why ? why : "fetch failed");
++    }
++
++    if (c->sha256) {
++        g_autofree char *sum = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
++                                                           s->zbuf, c->csize);
++        if (!sum || strcmp(sum, c->sha256) != 0) {
++            return g_strdup_printf("chunk %u (%s): SHA-256 mismatch (a stale "
++                                   "cache or a different snapshot)",
++                                   index, path);
++        }
++    }
++
++    zret = uncompress(dst, &out_len, s->zbuf, c->csize);
++    if (zret != Z_OK) {
++        return g_strdup_printf("chunk %u (%s): zlib error %d (%s)", index,
++                               path, zret,
++                               zret == Z_BUF_ERROR ? "more data than a chunk"
++                               : "corrupt data");
++    }
++    if (out_len != want) {
++        return g_strdup_printf("chunk %u (%s): inflates to %lu bytes, "
++                               "expected %zu (short stream)", index, path,
++                               (unsigned long)out_len, want);
++    }
++
++    qatomic_inc(&porty_snap_stats.chunks_fetched);
++    qatomic_add(&porty_snap_stats.fetched_kb, (c->csize + 512) / 1024);
++    return NULL;
++}
++
++static void *porty_snap_thread(void *opaque)
++{
++    QIOChannelPortySnapshot *s = opaque;
++    uint32_t i;
++
++    for (i = 0; i < s->nb_chunks; i++) {
++        char *err;
++        bool stop;
++
++        /* Chunk i goes into the slot chunk i - 2 was read from. */
++        qemu_mutex_lock(&s->lock);
++        while (!s->stop && i >= s->cur + PORTY_SNAP_SLOTS) {
++            qemu_cond_wait(&s->cond, &s->lock);
++        }
++        stop = s->stop;
++        qemu_mutex_unlock(&s->lock);
++        if (stop) {
++            break;
++        }
++
++        err = porty_snap_load_chunk(s, i, s->slot[i % PORTY_SNAP_SLOTS]);
++
++        qemu_mutex_lock(&s->lock);
++        if (err) {
++            s->error = err;
++        } else {
++            s->produced = i + 1;
++        }
++        qemu_cond_broadcast(&s->cond);
++        qemu_mutex_unlock(&s->lock);
++        if (err) {
++            break;
++        }
++    }
++    return NULL;
++}
++
++/* ------------------------------------------------------------------ */
++/* The channel (read from the incoming migration coroutine)            */
++/* ------------------------------------------------------------------ */
++
++static ssize_t porty_snap_readv(QIOChannel *ioc, const struct iovec *iov,
++                                size_t niov, int **fds, size_t *nfds,
++                                int flags, Error **errp)
++{
++    QIOChannelPortySnapshot *s = QIO_CHANNEL_PORTY_SNAPSHOT(ioc);
++    size_t want = iov_size(iov, niov);
++    size_t n;
++
++    if (s->closed) {
++        error_setg(errp, "porty-snapshot: the stream is closed");
++        return -1;
++    }
++    if (s->failed) {
++        error_setg(errp, "porty-snapshot: the stream failed earlier");
++        return -1;
++    }
++    if (!want) {
++        return 0;
++    }
++
++    if (s->cur_pos == s->cur_len) {
++        qemu_mutex_lock(&s->lock);
++        if (s->holding) {
++            /* Done with this chunk: its slot may be filled again. */
++            s->holding = false;
++            s->cur++;
++            qemu_cond_broadcast(&s->cond);
++        }
++        if (s->cur == s->nb_chunks) {
++            qemu_mutex_unlock(&s->lock);
++            return 0; /* end of the stream */
++        }
++        while (s->produced <= s->cur && !s->error) {
++            qemu_cond_wait(&s->cond, &s->lock);
++        }
++        if (s->produced <= s->cur) {
++            error_setg(errp, "porty-snapshot: %s", s->error);
++            qemu_mutex_unlock(&s->lock);
++            s->failed = true;
++            qatomic_set(&porty_snap_stats.state, PORTY_SNAP_FAILED);
++            error_report("porty-snapshot: %s", s->error);
++            return -1;
++        }
++        s->holding = true;
++        qemu_mutex_unlock(&s->lock);
++        s->cur_pos = 0;
++        s->cur_len = porty_snap_chunk_len(s, s->cur);
++    }
++
++    /* The claimed slot is not written again until it is released above. */
++    n = MIN(want, s->cur_len - s->cur_pos);
++    iov_from_buf(iov, niov, 0,
++                 s->slot[s->cur % PORTY_SNAP_SLOTS] + s->cur_pos, n);
++    s->cur_pos += n;
++    s->consumed += n;
++    qatomic_set(&porty_snap_stats.consumed_kb, (uint32_t)(s->consumed / 1024));
++    return n;
++}
++
++static ssize_t porty_snap_writev(QIOChannel *ioc, const struct iovec *iov,
++                                 size_t niov, int *fds, size_t nfds,
++                                 int flags, Error **errp)
++{
++    error_setg(errp, "porty-snapshot: the stream is read-only");
++    return -1;
++}
++
++static int porty_snap_set_blocking(QIOChannel *ioc, bool enabled, Error **errp)
++{
++    /* Reads always block until data is there; nothing to switch. */
++    return 0;
++}
++
++static void porty_snap_set_aio_fd_handler(QIOChannel *ioc,
++                                          AioContext *read_ctx,
++                                          IOHandler *io_read,
++                                          AioContext *write_ctx,
++                                          IOHandler *io_write,
++                                          void *opaque)
++{
++    /* Never asked to wait: reads do not return QIO_CHANNEL_ERR_BLOCK. */
++}
++
++static GSource *porty_snap_create_watch(QIOChannel *ioc, GIOCondition condition)
++{
++    /* Unused for the same reason; an idle source keeps callers alive. */
++    return g_idle_source_new();
++}
++
++static void porty_snap_stop(QIOChannelPortySnapshot *s)
++{
++    if (s->thread_started) {
++        qemu_mutex_lock(&s->lock);
++        s->stop = true;
++        qemu_cond_broadcast(&s->cond);
++        qemu_mutex_unlock(&s->lock);
++        qemu_thread_join(&s->thread);
++        s->thread_started = false;
++    }
++}
++
++static int porty_snap_close(QIOChannel *ioc, Error **errp)
++{
++    QIOChannelPortySnapshot *s = QIO_CHANNEL_PORTY_SNAPSHOT(ioc);
++    int i;
++
++    if (s->closed) {
++        return 0;
++    }
++    s->closed = true;
++    porty_snap_stop(s);
++    if (s->error && !s->failed) {
++        /* A failure the reader never ran into: still worth a line. */
++        warn_report("porty-snapshot: %s", s->error);
++    }
++    for (i = 0; i < PORTY_SNAP_SLOTS; i++) {
++        qemu_vfree(s->slot[i]);
++        s->slot[i] = NULL;
++    }
++    qemu_vfree(s->zbuf);
++    s->zbuf = NULL;
++    if (s->started && !s->failed) {
++        qatomic_set(&porty_snap_stats.state, PORTY_SNAP_DONE);
++    }
++    return 0;
++}
++
++static void porty_snap_init(Object *obj)
++{
++    QIOChannelPortySnapshot *s = QIO_CHANNEL_PORTY_SNAPSHOT(obj);
++
++    qemu_mutex_init(&s->lock);
++    qemu_cond_init(&s->cond);
++}
++
++static void porty_snap_finalize(Object *obj)
++{
++    QIOChannelPortySnapshot *s = QIO_CHANNEL_PORTY_SNAPSHOT(obj);
++    uint32_t i;
++
++    porty_snap_close(QIO_CHANNEL(obj), NULL);
++    for (i = 0; i < s->nb_chunks; i++) {
++        g_free(s->chunks[i].name);
++        g_free(s->chunks[i].sha256);
++    }
++    g_free(s->chunks);
++    g_free(s->base);
++    g_free(s->error);
++    qemu_cond_destroy(&s->cond);
++    qemu_mutex_destroy(&s->lock);
++}
++
++static void porty_snap_class_init(ObjectClass *klass, void *class_data)
++{
++    QIOChannelClass *ioc_klass = QIO_CHANNEL_CLASS(klass);
++
++    ioc_klass->io_readv = porty_snap_readv;
++    ioc_klass->io_writev = porty_snap_writev;
++    ioc_klass->io_set_blocking = porty_snap_set_blocking;
++    ioc_klass->io_close = porty_snap_close;
++    ioc_klass->io_create_watch = porty_snap_create_watch;
++    ioc_klass->io_set_aio_fd_handler = porty_snap_set_aio_fd_handler;
++}
++
++static const TypeInfo porty_snap_info = {
++    .parent = TYPE_QIO_CHANNEL,
++    .name = TYPE_QIO_CHANNEL_PORTY_SNAPSHOT,
++    .instance_size = sizeof(QIOChannelPortySnapshot),
++    .instance_init = porty_snap_init,
++    .instance_finalize = porty_snap_finalize,
++    .class_init = porty_snap_class_init,
++};
++
++static void porty_snap_register_types(void)
++{
++    type_register_static(&porty_snap_info);
++}
++
++type_init(porty_snap_register_types);
++
++/* ------------------------------------------------------------------ */
++/* The index file                                                       */
++/* ------------------------------------------------------------------ */
++
++static bool porty_snap_is_sha256(const char *s)
++{
++    size_t i;
++
++    if (strlen(s) != 64) {
++        return false;
++    }
++    for (i = 0; i < 64; i++) {
++        if (!g_ascii_isdigit(s[i]) && !(s[i] >= 'a' && s[i] <= 'f')) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool porty_snap_parse_index(QIOChannelPortySnapshot *s,
++                                   const char *index_path, Error **errp)
++{
++    g_autofree char *text = NULL;
++    g_auto(GStrv) lines = NULL;
++    GError *gerr = NULL;
++    GArray *chunks;
++    uint64_t chunk_size = 0;
++    uint64_t compressed = 0;
++    uint64_t expect;
++    uint32_t max_csize = 0;
++    bool have_size = false;
++    bool ok = false;
++    int i;
++
++    if (!g_file_get_contents(index_path, &text, NULL, &gerr)) {
++        error_setg(errp, "porty-snapshot: cannot read the index: %s",
++                   gerr->message);
++        g_error_free(gerr);
++        return false;
++    }
++    lines = g_strsplit(text, "\n", -1);
++    if (!lines[0] || strcmp(g_strchomp(lines[0]), PORTY_SNAP_MAGIC) != 0) {
++        error_setg(errp, "porty-snapshot: %s does not start with '%s'",
++                   index_path, PORTY_SNAP_MAGIC);
++        return false;
++    }
++
++    chunks = g_array_new(FALSE, TRUE, sizeof(PortySnapChunk));
++    for (i = 1; lines[i]; i++) {
++        char *line = g_strchomp(lines[i]);
++        g_auto(GStrv) w = NULL;
++        guint nw;
++
++        if (!*line) {
++            continue;
++        }
++        w = g_strsplit(line, " ", -1);
++        nw = g_strv_length(w);
++        if (nw == 2 && !strcmp(w[0], "url") && !s->base) {
++            s->base = g_strdup(w[1]);
++        } else if (nw == 2 && !strcmp(w[0], "chunk-size") && !chunk_size &&
++                   !qemu_strtou64(w[1], NULL, 10, &chunk_size) &&
++                   chunk_size >= PORTY_SNAP_MIN_CHUNK &&
++                   chunk_size <= PORTY_SNAP_MAX_CHUNK) {
++            /* parsed */
++        } else if (nw == 2 && !strcmp(w[0], "size") && !have_size &&
++                   !qemu_strtou64(w[1], NULL, 10, &s->size) && s->size > 0) {
++            have_size = true;
++        } else if (nw == 4 && !strcmp(w[0], "chunk") && chunk_size &&
++                   chunks->len < PORTY_SNAP_MAX_CHUNKS) {
++            PortySnapChunk c = { 0 };
++            uint64_t csize;
++
++            if (qemu_strtou64(w[1], NULL, 10, &csize) || csize == 0 ||
++                csize > compressBound(chunk_size) ||
++                (strcmp(w[2], "-") && !porty_snap_is_sha256(w[2])) ||
++                !*w[3] || strstr(w[3], "..") || strchr(w[3], '/')) {
++                error_setg(errp, "porty-snapshot: bad chunk at %s line %d",
++                           index_path, i + 1);
++                goto out;
++            }
++            c.csize = csize;
++            c.sha256 = strcmp(w[2], "-") ? g_strdup(w[2]) : NULL;
++            c.name = g_strdup(w[3]);
++            g_array_append_val(chunks, c);
++            compressed += csize;
++            max_csize = MAX(max_csize, c.csize);
++        } else {
++            error_setg(errp, "porty-snapshot: cannot parse %s line %d",
++                       index_path, i + 1);
++            goto out;
++        }
++    }
++
++    if (!chunk_size || !have_size) {
++        error_setg(errp, "porty-snapshot: %s lacks chunk-size or size",
++                   index_path);
++        goto out;
++    }
++    expect = DIV_ROUND_UP(s->size, chunk_size);
++    if (chunks->len != expect) {
++        error_setg(errp, "porty-snapshot: %s lists %u chunks, but %" PRIu64
++                   " bytes in chunks of %" PRIu64 " need %" PRIu64,
++                   index_path, chunks->len, s->size, chunk_size, expect);
++        goto out;
++    }
++    if (!s->base) {
++        s->base = g_path_get_dirname(index_path);
++    }
++    /* tolerate a trailing slash so that "<url>/<file>" stays canonical */
++    while (strlen(s->base) > 1 && s->base[strlen(s->base) - 1] == '/') {
++        s->base[strlen(s->base) - 1] = '\0';
++    }
++    s->chunk_size = chunk_size;
++    s->zbuf_size = (size_t)max_csize + 1;
++
++    qatomic_set(&porty_snap_stats.chunks_total, chunks->len);
++    qatomic_set(&porty_snap_stats.compressed_kb,
++                (uint32_t)((compressed + 512) / 1024));
++    qatomic_set(&porty_snap_stats.total_kb, (uint32_t)(s->size / 1024));
++    ok = true;
++out:
++    s->nb_chunks = chunks->len;
++    s->chunks = (PortySnapChunk *)g_array_free(chunks, FALSE);
++    return ok;
++}
++
++/* ------------------------------------------------------------------ */
++/* -incoming porty:<index file>                                         */
++/* ------------------------------------------------------------------ */
++
++static void porty_snap_accept_bh(void *opaque)
++{
++    QIOChannel *ioc = opaque;
++
++    migration_channel_process_incoming(ioc);
++    object_unref(OBJECT(ioc));
++}
++
++void porty_snapshot_start_incoming_migration(const char *index_path,
++                                             Error **errp)
++{
++    QIOChannelPortySnapshot *s;
++    int i;
++
++    s = QIO_CHANNEL_PORTY_SNAPSHOT(object_new(TYPE_QIO_CHANNEL_PORTY_SNAPSHOT));
++    if (!porty_snap_parse_index(s, index_path, errp)) {
++        object_unref(OBJECT(s));
++        return;
++    }
++    s->zbuf = qemu_try_memalign(4096, s->zbuf_size);
++    for (i = 0; i < PORTY_SNAP_SLOTS; i++) {
++        s->slot[i] = qemu_try_memalign(4096, s->chunk_size);
++    }
++    if (!s->zbuf || !s->slot[0] || !s->slot[1]) {
++        error_setg(errp, "porty-snapshot: cannot allocate the chunk buffers");
++        object_unref(OBJECT(s));
++        return;
++    }
++
++    s->started = true;
++    qatomic_set(&porty_snap_stats.state, PORTY_SNAP_LOADING);
++    qio_channel_set_name(QIO_CHANNEL(s), "migration-porty-snapshot-incoming");
++    /* Starts downloading now, while the machine is still being set up. */
++    qemu_thread_create(&s->thread, "porty-snapshot", porty_snap_thread, s,
++                       QEMU_THREAD_JOINABLE);
++    s->thread_started = true;
++    /* As for file: the stream is consumed once the main loop runs. */
++    aio_bh_schedule_oneshot(qemu_get_aio_context(), porty_snap_accept_bh, s);
++}
+diff --git a/migration/porty-snapshot.h b/migration/porty-snapshot.h
+new file mode 100644
+index 0000000000..765178128a
+--- /dev/null
++++ b/migration/porty-snapshot.h
+@@ -0,0 +1,18 @@
++/*
++ * Porty snapshot source ("-incoming porty:<index file>").
++ *
++ * Copyright (c) 2026 The Porty contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef QEMU_MIGRATION_PORTY_SNAPSHOT_H
++#define QEMU_MIGRATION_PORTY_SNAPSHOT_H
++
++/*
++ * Start reading an incoming migration stream from the chunk files listed
++ * in @index_path (see porty-snapshot.c for the format).
++ */
++void porty_snapshot_start_incoming_migration(const char *index_path,
++                                             Error **errp);
++
++#endif

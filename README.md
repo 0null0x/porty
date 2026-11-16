@@ -169,6 +169,7 @@ and say how far it got, with that message.
 | `fps` | 30 | Canvas refresh cap |
 | `diet` | 1 | Android properties set at boot to shorten it: `1` no boot animation (the screen stays black until the launcher) and first-boot app preparation without verification; `0` none; `2` also a 64-bit-only Android without the 32-bit zygote (experiment) |
 | `props` | | More Android properties, `key=value,key=value` (letters, digits, `.`, `_`, `-`); they override `diet`, for example `props=debug.sf.nobootanimation=0` |
+| `resume` | auto | A site that publishes a snapshot resumes the saved, already booted Android instead of booting. `0` always boots; `1` resumes even when the address sets machine parameters (the snapshot's own settings then apply) |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |
 | `cmdline` | | Replace the whole kernel command line |
 | `qemu` | | Extra QEMU arguments |

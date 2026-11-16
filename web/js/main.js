@@ -7,13 +7,15 @@ import { Emulator, StartError, checkEnvironment } from './emulator.js';
 import { describeDiet } from './boot-diet.js';
 import { CONTROL, Input } from './input.js';
 import { SerialConsole } from './serial.js';
+import { resumeMode, resumeVeto, storeResumeFailure, takeResumeFailure } from './snapshot.js';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
-const parsedCfg = parseConfig(location.search, {
+const deviceEnv = {
     userAgent: navigator.userAgent,
     maxTouchPoints: navigator.maxTouchPoints,
-});
+};
+const parsedCfg = parseConfig(location.search, deviceEnv);
 const baseUrl = new URL('.', location.href).href;
 
 // Did the last start end without the page noticing (Safari killed the tab)?
@@ -29,6 +31,22 @@ if (steps && decision.level !== runLog.level()) {
     runLog.setLevel(decision.level);
 }
 const cfg = applyPhoneLevel(parsedCfg, steps ? decision.level : 0);
+
+// A snapshot on the site is resumed instead of booting (snapshot.js), unless
+// something speaks against it; a resume that failed reloads into a boot.
+function sessionStore() {
+    try {
+        return globalThis.sessionStorage || null;
+    } catch (e) {
+        return null;
+    }
+}
+const resumeFailure = takeResumeFailure(sessionStore());
+const resume = {
+    mode: resumeMode(location.search),
+    veto: resumeVeto({ search: location.search, lastRun, failure: resumeFailure }),
+    env: deviceEnv,
+};
 
 let emulator = null;
 let input = null;
@@ -181,6 +199,24 @@ async function keepAwake() {
     }
 }
 
+/** QEMU stopped while loading the snapshot: start over with a normal boot. */
+function resumeFailed(error) {
+    console.warn(`resume failed: ${error.message || error}`);
+    // QEMU's own words: the line of migration/porty-snapshot.c if there is
+    // one ("chunk 12 (...): HTTP 404"), else the last thing it printed.
+    const lines = lastLogLines.filter((l) => l.trim());
+    const last = lines.filter((l) => l.includes('porty-snapshot:')).slice(-1)[0] || lines.slice(-1)[0] || '';
+    const message = `${error.message || error}${last ? ` ${last.trim()}` : ''}`;
+    if (!storeResumeFailure(sessionStore(), message)) {
+        // Nowhere to remember it: a reload would only try the same again.
+        fail(new StartError(message, 'Add ?resume=0 to the address to boot Android normally.'));
+        return;
+    }
+    runLog.end('resume-failed');
+    app.dataset.state = 'reloading';
+    location.reload();
+}
+
 function fail(error) {
     console.error(error);
     app.dataset.state = 'failed';
@@ -232,6 +268,10 @@ function renderLoop() {
         const display = emulator.display;
         if (display.update(now)) {
             frames++;
+        }
+        const resuming = emulator.resumeTick();
+        if (resuming) {
+            return;
         }
         // Once the guest leaves VGA text mode, hide the overlay as soon as
         // Android draws something.  Until then (no boot animation by
@@ -311,6 +351,8 @@ async function start() {
             baseUrl,
             onStatus,
             onFatal: fail,
+            resume,
+            onResumeFailed: resumeFailed,
         });
         // For debugging from the browser console (and for tests/ui).
         globalThis.__porty = emulator;
@@ -331,6 +373,10 @@ async function start() {
     }
     emulator.display.onResize = fitCanvas;
     emulator.notes.forEach((n) => console.warn(n));
+    if (emulator.resumeNote) {
+        $('resume-note').textContent = emulator.resumeNote;
+        $('resume-note').hidden = false;
+    }
 
     input = new Input(emulator.sendInput, $('screen'), $('softkeys'));
     input.attach();
@@ -447,3 +493,7 @@ function bind() {
 fillIntro();
 precheck();
 bind();
+if (resumeFailure) {
+    // Reloaded by resumeFailed(): the visitor already pressed Start.
+    start();
+}

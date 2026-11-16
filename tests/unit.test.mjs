@@ -313,6 +313,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(checkEnvironment({ WebAssembly: {}, Atomics: {}, crossOriginIsolated: false }).length, 1);
 }
 
+// Resuming a saved Android (web/js/snapshot.js) has its own file.
+await import('./snapshot.test.mjs');
+
 console.log('unit: all checks passed');
 
 // The boot diet (appended initramfs archive, ?diet= and ?props=) has its own file.

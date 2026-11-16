@@ -67,6 +67,7 @@ export const PARAM_HELP = [
     ['fps', 'canvas refresh cap (default 30).'],
     ['diet', 'Android properties that shorten the boot: 1 (default) no boot animation and no first-boot app verification, 0 none, 2 also a 64-bit-only Android (experiment).'],
     ['props', 'more Android properties, key=value,key=value (letters, digits, . _ -); they override diet.'],
+    ['resume', '1 resumes the saved Android even with other settings in the address; 0 always boots.'],
 ];
 
 function intParam(params, name, fallback, min, max) {

@@ -7,7 +7,8 @@
 # The run itself never fails, because every failed run emails the repository
 # owner.  The outcome of each part is a commit status on the branch's commit
 # ("porty/check lint", "porty/check ui", "porty/check qemu", "porty/check
-# site", "porty/check disk") plus the job summary; read them with
+# site", "porty/check disk", "porty/check native") plus the job summary; read
+# them with
 #   gh api repos/<owner>/<repo>/commits/<sha>/statuses
 name: Branch check
 
@@ -380,9 +381,127 @@ jobs:
           { echo "qemu=$qemu"; echo "site=$site"; } >> "$GITHUB_OUTPUT"
           { echo "## Branch check"; echo; echo "- QEMU-Wasm: ${qemu/|/: }"; echo "- Site: ${site/|/: }"; } >> "$GITHUB_STEP_SUMMARY"
 
+  # The snapshot source of QEMU patch 0012 in a native QEMU built from the
+  # patched tree: save a small Linux guest with "migrate file:", pack it as
+  # published, resume it through "-incoming porty:" (tests/snapshot-native.sh).
+  native:
+    name: Native QEMU (snapshot resume)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      outcome: ${{ steps.summary.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          echo "qemu_commit=$QEMU_WASM_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build python3-venv libglib2.0-dev libpixman-1-dev zlib1g-dev \
+            libfdt-dev flex bison xorriso squashfs-tools busybox-static cpio zstd
+
+      - name: Restore cached native QEMU build
+        id: native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu-native
+          key: qemu-native-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/pc-bios.list') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.native-cache.outputs.cache-hit != 'true' && steps.tools.outcome == 'success'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-native-src"
+
+      # The configuration docs/PLAN.md, section 5, lists for the native build.
+      - name: Compile qemu-system-x86_64 natively
+        id: compile
+        if: steps.native-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir "$RUNNER_TEMP/qemu-native-build"
+          cd "$RUNNER_TEMP/qemu-native-build"
+          "$RUNNER_TEMP/qemu-native-src/configure" --target-list=x86_64-softmmu --without-default-features \
+            --enable-system --enable-tcg --enable-fdt=system --disable-werror --with-coroutine=ucontext \
+            > configure.log 2>&1 || { tail -50 configure.log; exit 1; }
+          ninja qemu-system-x86_64 > build.log 2>&1 || { grep -B2 -A12 -E 'error|FAILED' build.log | head -200; exit 1; }
+          # Warnings in the files the patches add would be errors in a -Werror build.
+          grep -A6 -E '(porty|wasmfb)[^ ]*\.c:[0-9]+:[0-9]+: warning' build.log || echo "no warnings in the Porty files"
+          mkdir -p "$GITHUB_WORKSPACE/out/qemu-native/pc-bios"
+          cp qemu-system-x86_64 "$GITHUB_WORKSPACE/out/qemu-native/"
+          while read -r rom; do
+            [[ -n "$rom" ]] || continue
+            cp "$RUNNER_TEMP/qemu-native-src/pc-bios/$rom" "$GITHUB_WORKSPACE/out/qemu-native/pc-bios/"
+          done < "$GITHUB_WORKSPACE/build/pc-bios.list"
+
+      - name: Save the native QEMU build
+        if: steps.native-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu-native
+          key: qemu-native-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/pc-bios.list') }}
+
+      # A stock Ubuntu kernel as the guest: virtio-blk, squashfs and the
+      # serial console are built in, so no modules are needed.
+      - name: Fetch a guest kernel
+        id: kernel
+        if: steps.tools.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/kernel"
+          cd "$RUNNER_TEMP/kernel"
+          pkg="$(apt-cache depends linux-image-generic | awk '$1 == "Depends:" && $2 ~ /^linux-image-[0-9]/ { print $2; exit }')"
+          echo "guest kernel package: $pkg"
+          apt-get download "$pkg"
+          dpkg-deb -x ./*.deb root
+          cp root/boot/vmlinuz-* vmlinuz
+          ls -l vmlinuz
+
+      - name: Save, pack and resume a guest
+        id: test
+        if: steps.kernel.outcome == 'success' && (steps.native-cache.outputs.cache-hit == 'true' || steps.compile.outcome == 'success')
+        continue-on-error: true
+        run: |
+          chmod +x out/qemu-native/qemu-system-x86_64
+          tests/snapshot-native.sh out/qemu-native/qemu-system-x86_64 out/qemu-native/pc-bios \
+            "$RUNNER_TEMP/kernel/vmlinuz" "$RUNNER_TEMP/snapshot-native" | tee "$RUNNER_TEMP/snapshot-native.log"
+
+      - name: Summary
+        id: summary
+        env:
+          TOOLS: ${{ steps.tools.outcome }}
+          PATCHES: ${{ steps.patches.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          KERNEL: ${{ steps.kernel.outcome }}
+          TEST: ${{ steps.test.outcome }}
+        run: |
+          if [[ "$TEST" == success ]]; then
+            n="$(grep -c '^PASS' "$RUNNER_TEMP/snapshot-native.log" || true)"
+            out="success|native QEMU saved and resumed a guest through -incoming porty: ($n checks)"
+          elif [[ "$TOOLS" == failure ]]; then out="failure|could not install the build tools"
+          elif [[ "$PATCHES" == failure ]]; then out="failure|patches do not apply"
+          elif [[ "$COMPILE" == failure ]]; then out="failure|native compile failed, see the log"
+          elif [[ "$KERNEL" == failure ]]; then out="failure|could not fetch a guest kernel"
+          else out="failure|snapshot test failed: $(grep -m1 '^FAIL' "$RUNNER_TEMP/snapshot-native.log" 2>/dev/null | cut -c7-90)"; fi
+          echo "outcome=$out" >> "$GITHUB_OUTPUT"
+          { echo "## Native QEMU"; echo; echo "- ${out/|/: }"; } >> "$GITHUB_STEP_SUMMARY"
+
   report:
     name: Report as commit statuses
-    needs: [checks, ui-test, disk, build]
+    needs: [checks, ui-test, disk, build, native]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -398,6 +517,7 @@ jobs:
           QEMU: ${{ needs.build.outputs.qemu }}
           SITE: ${{ needs.build.outputs.site }}
           DISK: ${{ needs.disk.outputs.outcome }}
+          NATIVE: ${{ needs.native.outputs.outcome }}
         run: |
           post() { # <context> <state|description>
             local state="${2%%|*}" desc="${2#*|}"
@@ -411,3 +531,4 @@ jobs:
           post qemu "$QEMU"
           post site "$SITE"
           post disk "$DISK"
+          post native "$NATIVE"

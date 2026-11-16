@@ -5,12 +5,18 @@
 //   - default export: async factory(Module) -> instance
 //   - Module.wasmMemory, Module.instantiateWasm, Module.preRun, Module.pty
 //   - instance._porty_fb_poll / _porty_input_event / _porty_disk_stats
+//   - "-incoming porty:<index>": the chunks the index lists are fetched one
+//     by one (synchronous XHR in a worker, as migration/porty-snapshot.c
+//     does), progress is published through _porty_snapshot_stats, and the
+//     "guest" then appears already booted; a chunk that cannot be fetched
+//     ends "QEMU" with status 1, as a failed incoming migration does
 // and paints a test pattern into the shared memory in the exact layout
 // ui/wasmfb.c publishes (PIXMAN_x8r8g8b8, i.e. B, G, R, X bytes).
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 const INFO = 1 << 20;          // PortyFbInfo snapshot
 const STATS = INFO + 256;      // PortyDiskStats
+const SNAP_STATS = INFO + 512; // PortySnapshotStats
 const FB = 2 << 20;            // pixels
 const MAGIC = 0x31424650;
 
@@ -35,12 +41,16 @@ export default async function createFakeQemu(Module) {
 
     const files = new Map();
     let initrd = null; // a copy of what -initrd would load, for the test
+    const texts = new Map();
     const FS = {
         mkdir() {},
         writeFile(path, data) {
             files.set(path, data.length);
             if (path.endsWith('/initrd.img')) {
                 initrd = data.slice();
+            }
+            if (typeof data === 'string') {
+                texts.set(path, data);
             }
         },
     };
@@ -95,29 +105,95 @@ export default async function createFakeQemu(Module) {
 
     const say = (text) => Module.pty.write(Array.from(new TextEncoder().encode(`${text}\r\n`)));
     setMode(720, 400); // "VGA text mode"
-    say('[    0.000000] Linux version 4.19.110-android-x86_64 (fake)');
-    say(`[    0.000000] Command line: ${args[args.indexOf('-append') + 1]}`);
+    const syncFetchWorker = `onmessage = (e) => {
+        try {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', e.data, false);
+            xhr.responseType = 'arraybuffer';
+            xhr.send(null);
+            postMessage({ status: xhr.status, bytes: xhr.response ? xhr.response.byteLength : 0 });
+        } catch (err) { postMessage({ status: -1, bytes: 0, error: String(err) }); }
+    };`;
+    const incoming = args.includes('-incoming') ? args[args.indexOf('-incoming') + 1] : '';
+    const snapshot = { urls: [], done: false, error: '' };
+    if (incoming) {
+        // A saved machine: no boot, the stream is loaded and the guest is there.
+        const snap = SNAP_STATS >> 2;
+        const fail = (text) => {
+            snapshot.error = text;
+            u32[snap] = 3;
+            say(`qemu-system-x86_64: porty-snapshot: ${text}`);
+            say('qemu-system-x86_64: load of migration failed: Input/output error');
+            setTimeout(() => {
+                try {
+                    Module.quit(1, { name: 'ExitStatus', status: 1 });
+                } catch (e) {
+                    // rethrown ExitStatus, as above
+                }
+            }, 50);
+        };
+        const lines = (texts.get(incoming.replace(/^porty:/, '')) || '').split('\n');
+        const field = (name) => (lines.find((l) => l.startsWith(`${name} `)) || '').slice(name.length + 1);
+        const chunks = lines.filter((l) => l.startsWith('chunk ')).map((l) => l.split(' '));
+        const chunkSize = Number(field('chunk-size'));
+        const size = Number(field('size'));
+        if (!incoming.startsWith('porty:') || lines[0] !== 'porty-snapshot 1' || !chunks.length) {
+            setTimeout(() => fail('cannot read the index'), 0);
+        } else {
+            u32[snap] = 1;
+            u32[snap + 1] = chunks.length;
+            u32[snap + 4] = Math.round(chunks.reduce((sum, c) => sum + Number(c[1]), 0) / 1024);
+            u32[snap + 6] = Math.floor(size / 1024);
+            const worker = new Worker(URL.createObjectURL(new Blob([syncFetchWorker], { type: 'text/javascript' })));
+            let next = 0;
+            let fetched = 0;
+            const step = () => {
+                if (next === chunks.length) {
+                    worker.terminate();
+                    u32[snap] = 2;
+                    snapshot.done = true;
+                    setMode(guestWidth, guestHeight);
+                    return;
+                }
+                const url = `${field('url')}/${chunks[next][3]}`;
+                snapshot.urls.push(url);
+                worker.postMessage(url);
+            };
+            worker.onmessage = (e) => {
+                const want = Number(chunks[next][1]);
+                if (e.data.status !== 200 || e.data.bytes !== want) {
+                    worker.terminate();
+                    u32[snap + 7] += 1;
+                    fail(`chunk ${next} (${snapshot.urls[next]}): ` + (e.data.status !== 200
+                        ? `HTTP ${e.data.status}` : `got ${e.data.bytes} bytes, expected ${want}`));
+                    return;
+                }
+                fetched += e.data.bytes;
+                next++;
+                u32[snap + 2] = next;
+                u32[snap + 3] = Math.round(fetched / 1024);
+                u32[snap + 5] = Math.floor(Math.min(size, next * chunkSize) / 1024);
+                // Slow enough for the page (and the test) to show progress.
+                setTimeout(step, 150);
+            };
+            setTimeout(step, 150);
+        }
+    } else {
+        say('[    0.000000] Linux version 4.19.110-android-x86_64 (fake)');
+        say(`[    0.000000] Command line: ${args[args.indexOf('-append') + 1]}`);
 
-    setTimeout(() => {
-        say('[    5.000000] Detecting Android-x86... found at /dev/vda');
-        setMode(guestWidth, guestHeight);
-    }, 700);
+        setTimeout(() => {
+            say('[    5.000000] Detecting Android-x86... found at /dev/vda');
+            setMode(guestWidth, guestHeight);
+        }, 700);
+    }
 
     // Exercise the same path block/porty.c uses: a synchronous XHR issued
     // from a worker, through the service worker.
     const diskArg = args.find((a) => a.includes('file.driver=porty')) || '';
     const diskUrl = (/file\.url=([^,]+)/.exec(diskArg) || [])[1];
     if (diskUrl) {
-        const source = `onmessage = (e) => {
-            try {
-                const xhr = new XMLHttpRequest();
-                xhr.open('GET', e.data, false);
-                xhr.responseType = 'arraybuffer';
-                xhr.send(null);
-                postMessage({ status: xhr.status, bytes: xhr.response ? xhr.response.byteLength : 0 });
-            } catch (err) { postMessage({ status: -1, bytes: 0, error: String(err) }); }
-        };`;
-        const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+        const worker = new Worker(URL.createObjectURL(new Blob([syncFetchWorker], { type: 'text/javascript' })));
         worker.onmessage = (e) => {
             const base = STATS >> 2;
             if (e.data.status === 200) {
@@ -145,6 +221,8 @@ export default async function createFakeQemu(Module) {
         __files: files,
         __initrd: initrd,
         __args: args,
+        __texts: texts,
+        __snapshot: snapshot,
         __memoryBytes: memory.buffer.byteLength,
         _porty_abi_version: () => 1,
         _porty_fb_poll() {
@@ -178,6 +256,7 @@ export default async function createFakeQemu(Module) {
             return 1;
         },
         _porty_disk_stats: () => STATS,
+        _porty_snapshot_stats: () => SNAP_STATS,
     };
     return instance;
 }
