@@ -27,6 +27,10 @@ on:
         description: Run QEMU-Wasm's own Alpine x86_64 demo instead of Porty (control experiment)
         type: boolean
         default: false
+      shell:
+        description: Commands to type into Android's root shell once it is up (experiments, e.g. setprop)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -35,7 +39,7 @@ permissions:
 # A new deployment cancels the boot test of the previous one; hand-started
 # runs with different parameters run side by side.
 concurrency:
-  group: boot-test-${{ github.event_name }}-${{ inputs.query }}-${{ inputs.control }}
+  group: boot-test-${{ github.event_name }}-${{ inputs.query }}-${{ inputs.control }}-${{ inputs.shell }}
   cancel-in-progress: true
 
 defaults:
@@ -69,6 +73,7 @@ jobs:
           MINUTES: ${{ inputs.minutes }}
           DUMP_FILES: ${{ inputs.dump }}
           CONTROL: ${{ inputs.control }}
+          SHELL_INIT: ${{ inputs.shell }}
         run: |
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"

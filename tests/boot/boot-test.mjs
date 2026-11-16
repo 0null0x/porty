@@ -32,6 +32,8 @@ if (!/^https?:\/\/.+\/$/.test(siteUrl)) {
 }
 const minutes = Math.max(1, Math.min(240, Number(process.env.MINUTES) || 40));
 const params = new URLSearchParams((process.env.QUERY || '').trim().replace(/^\?/, ''));
+// Typed into Android's root shell once, as soon as its prompt appears.
+const shellInit = (process.env.SHELL_INIT || '').trim();
 params.set('serial', '1');
 const url = `${siteUrl}?${params}`;
 
@@ -114,7 +116,8 @@ async function postStatus(state, description) {
             },
             body: JSON.stringify({
                 state,
-                context: `porty/boot ${(process.env.QUERY || '').trim() || 'defaults'}`.slice(0, 100),
+                context: (`porty/boot ${(process.env.QUERY || '').trim() || 'defaults'}` +
+                    (shellInit ? ` sh:${shellInit}` : '')).slice(0, 100),
                 description: description.replace(/\s+/g, ' ').slice(0, 139),
                 target_url: `${server}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID || ''}`,
             }),
@@ -264,6 +267,7 @@ try {
     let recent = '';
     let probeAt = t0 + 8 * 60000;
     let appsListed = false;
+    let shellSent = !shellInit;
     let bootedAt = 0;
     let lastStatusLine = '';
     let lastStatusTime = 0;
@@ -397,8 +401,24 @@ try {
         }
 
         // Ask the serial shell (if Android-x86 runs one) whether boot finished.
+        if (!shellSent && /console:\/ #/.test(stripAnsi(recent))) {
+            shellSent = true;
+            log(`SHELL INIT: ${shellInit}`);
+            await page.evaluate((cmd) => globalThis.__porty.serial.send(`\r${cmd}\r`), shellInit);
+            await sleep(3000);
+        }
         if (!booted && snap.state === 'running' && Date.now() >= probeAt) {
             probeAt = Date.now() + 120000;
+            // Where the guest's time goes: cumulative user/nice/system/idle/
+            // iowait ticks, and from 14 minutes the busiest processes.
+            await page.evaluate(() => globalThis.__porty.serial.send(
+                '\rhead -1 /proc/stat; cat /proc/loadavg\r'));
+            await sleep(2000);
+            if (Date.now() - t0 > 14 * 60000) {
+                await page.evaluate(() => globalThis.__porty.serial.send(
+                    'top -b -n 2 -d 2 -m 8 2>/dev/null | tail -9 | cut -c1-110\r'));
+                await sleep(8000);
+            }
             if (!appsListed && Date.now() - t0 > 12 * 60000) {
                 // Once: which Google packages the system image ships (the
                 // README says none; the boot log mentions Play services).
