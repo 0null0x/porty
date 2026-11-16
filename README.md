@@ -1,18 +1,26 @@
-# Porty
+# Porty: 64-bit Android in your web browser
 
-Porty is a static web page that boots a real 64-bit Android,
-**Android-x86 9.0-r2 (x86_64)**, inside the browser. A PC is emulated by
+[![Build and deploy](https://github.com/0null0x/porty/actions/workflows/build-and-deploy.yml/badge.svg)](https://github.com/0null0x/porty/actions/workflows/build-and-deploy.yml)
+[![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
+
+Porty boots a real 64-bit Android, **Android-x86 9.0** (Android 9 "Pie",
+x86_64), inside a browser tab on your own device. A PC is emulated by
 **QEMU compiled to WebAssembly** ([QEMU-Wasm](https://github.com/ktock/qemu-wasm)),
-the screen is drawn on a canvas and touches are delivered as a USB tablet.
-There is no server-side component, no app to install and no JIT helper: the
-only code generator involved is the browser's own WebAssembly engine, which
-is why it can run in Safari on an iPhone.
+Android runs on it, and its screen is drawn on a canvas. Porty is just a
+static web page: there is no app to install and no server running Android
+for you. That is what makes its goal possible: Android in **Safari on an
+iPhone**, with no jailbreak, no sideloading and no cloud streaming.
 
-Expected address once deployed: **https://0null0x.github.io/porty/**
+**Try it: [0null0x.github.io/porty](https://0null0x.github.io/porty/)**
 
-## Status: Android 9 reaches its boot animation in desktop Chrome
+Porty is experimental. In desktop Chrome, Android 9 currently boots as far
+as its boot animation, after about 25 to 30 minutes. Nobody has seen the
+home screen yet, and it has not been tried on an iPhone. See
+[Status](#status).
 
-![Android 9 x86_64 boot animation in headless Chrome, 30 minutes in](docs/img/boot-animation-vesa-30min.jpg)
+## Status
+
+<img src="docs/img/boot-animation-vesa-30min.jpg" width="400" alt="Android 9 x86_64 boot animation drawn by Porty in headless Chrome, 30 minutes after pressing Start">
 
 As of 2026-11-16, in headless Chrome on a 4-vCPU GitHub runner (the boot
 test), the Linux kernel boots, Android's init starts its services, zygote
@@ -29,60 +37,101 @@ the home screen, and it has not been tried on an iPhone.
 - [ ] **M5** boots in Safari on an iPhone (iOS 26 or later)
 - [ ] **M6** performance tuning
 
+## Why Porty
+
+- **It runs on your device, not in the cloud.** Most "online Android
+  emulators" run Android on a remote server and stream video of it to your
+  browser. Porty downloads the emulator and Android itself and runs both
+  inside your tab. The page has no analytics and Android has no network
+  inside it, so nothing you do in Android leaves your device.
+- **Nothing to install.** No App Store app, no jailbreak, no sideloading
+  and no JIT helper. The only code generator involved is the browser's own
+  WebAssembly engine, which is why it can run in Safari on an iPhone.
+- **A 64-bit Android.** In-browser Android projects built on the v86
+  emulator, such as Webdroid, emulate a 32-bit, Pentium 4-class CPU and stop
+  at Android 4.4. QEMU emulates a 64-bit x86_64 CPU, so Porty can boot
+  Android 9.
+- **Open source and static.** GPL-licensed, built by GitHub Actions and
+  served from GitHub Pages. Anyone can deploy their own copy; see
+  [docs/DEVELOPING.md](docs/DEVELOPING.md).
+
+## Porty and Webdroid
+
+[Webdroid](https://github.com/AttilaTheFun/webdroid-releases) runs
+Android-x86 4.4 on the v86 emulator and showed that a browser-hosted Android
+on an iPhone is practical. Porty is a 64-bit alternative that trades speed
+for a much newer Android.
+
+| | Porty | Webdroid |
+| --- | --- | --- |
+| Android | 9 (Pie), 64-bit x86_64 | 4.4 (KitKat), 32-bit x86 |
+| Emulator | QEMU compiled to WebAssembly | v86 |
+| Safari on an iPhone | Not tried yet | Works |
+| Boot time | 25 to 30 minutes to the boot animation (desktop Chrome) | About a minute (iPhone) |
+| Network inside Android | No | No |
+| Google Play | No | No |
+| Session survives a reload | No | No |
+
+## How it works
+
+- `qemu-system-x86_64`, compiled to WebAssembly, emulates a PC with a
+  Nehalem-class x86_64 CPU. QEMU's code translator turns the guest's x86
+  code into WebAssembly, which the browser compiles to native code.
+- The page downloads Android-x86's kernel and ramdisks and the PC firmware,
+  then boots the kernel directly, without a boot menu.
+- Android's system image (roughly 950 MB) is never downloaded whole. A small
+  block driver added to QEMU fetches it in 2 MiB pieces as Android reads
+  them, from QEMU's own worker threads.
+- The guest's video memory is shared with the page, which copies the rows
+  that changed onto a canvas every frame. Taps, clicks and keys enter the
+  guest as a USB tablet and a keyboard.
+- QEMU's threads need `SharedArrayBuffer`, which browsers only allow on
+  cross-origin-isolated pages. GitHub Pages cannot send the headers that
+  turn this on, so a service worker
+  ([coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker)) adds
+  them. That is why the page reloads itself once on the first visit.
+
 [docs/PLAN.md](docs/PLAN.md) has the design, the reasoning behind each
-decision, the size budget and what to try when a milestone fails.
+decision, the size budget, what to try when a milestone fails and the
+findings from every boot attempt so far.
 
-## First deployment
+## Using Porty
 
-1. On GitHub open **Settings > Pages** and set **Build and deployment >
-   Source** to **GitHub Actions**. Do this before the first push; the deploy
-   job fails otherwise.
-2. Push `main`. The workflow `.github/workflows/build-and-deploy.yml` then:
-   - lints the scripts and runs the unit tests and a miniature dry run of the
-     image pipeline (a few seconds);
-   - checks out QEMU-Wasm at the pinned commit, applies `patches/qemu-wasm/`,
-     builds QEMU-Wasm's own Docker toolchain image and compiles
-     `qemu-system-x86_64` to WebAssembly (about 20 minutes for the whole
-     first run; the result is cached and reused until the patches or the
-     build script change);
-   - downloads `android-x86_64-9.0-r2.iso` from SourceForge, verifies the
-     SHA-1 published by Android-x86, extracts the kernel and ramdisks and
-     splits `system.sfs` into 2 MiB chunks (the ISO is cached as well);
-   - assembles the site, checks its size against the GitHub Pages limit and
-     deploys it.
-3. Open the address above.
+1. Open **[0null0x.github.io/porty](https://0null0x.github.io/porty/)** in
+   desktop Chrome. On the first visit the page reloads itself once; that is
+   the service worker enabling cross-origin isolation.
+2. Press **Start Android** and keep the tab in the foreground. Expect many
+   minutes. The toolbar shows how many MB of the system image have been
+   read; while that number keeps growing, Android is still booting.
+3. To watch the boot, press **Console**, or open the page with
+   [`?serial=1`](#url-parameters). You should see, in order: SeaBIOS text on
+   the canvas; Linux kernel messages in the console;
+   `Detecting Android-x86... found at /dev/vda`; and eventually the canvas
+   switching from text mode to Android's boot animation. Once Android is up,
+   the serial console also has a root shell.
 
-A build can also be started by hand from the Actions tab ("Run workflow"),
-optionally forcing a QEMU rebuild or skipping the deployment.
+The toolbar has **Pause**, **Reset**, **Console** and **Full** (full
+screen). Below the screen are Android's **Back**, **Home** and **Recents**
+buttons, and **Keyboard** for the on-screen keyboard.
 
-## Testing, in this order
+**On an iPhone** (Safari 26 or later): use the plain address with no
+parameters, stay on Wi-Fi and keep the screen on. Nobody has tried this
+yet; if you do, please [open an issue](https://github.com/0null0x/porty/issues)
+and say how far it got.
 
-1. **Desktop Chrome** (then desktop Safari): open the page with
-   [`?serial=1`](#url-parameters). Press *Start Android*. You should see, in
-   order: the download bar; SeaBIOS text on the canvas; Linux kernel messages
-   in the console panel; `Detecting Android-x86... found at /dev/vda`; and
-   eventually the canvas switching from text mode to Android's boot
-   animation. Expect minutes. The toolbar shows how many MB of the system
-   image have been read; if that number keeps growing, it is still booting.
-2. **iPhone, Safari 26 or later**: plain address, no parameters. The page
-   reloads itself once on the first visit (that is the service worker
-   enabling cross-origin isolation). Use Wi-Fi and keep the screen on.
+### What you need
 
-After every successful deployment, `.github/workflows/boot-test.yml` opens
-the live site in headless Chrome on a GitHub runner, presses *Start* and lets
-Android boot for up to 100 minutes. Its log has the serial console, the page status
-every few seconds, and screenshots of the guest display printed as base64
-JPEG between marker lines. Recover them with
-`python3 -I tests/boot/extract-shots.py <log> <out-dir>`. Start it by hand
-from the Actions tab to try other [URL parameters](#url-parameters) (for
-example `smp=1`). The job stays green whatever happens to Android, because
-GitHub e-mails the repository owner about every failed run; the verdict is
-in the run's summary and in a warning annotation.
-
-When something goes wrong the page shows the reason, a hint and the last
-lines of the serial console, with a *Copy details* button. From the browser
-console, `__porty` exposes the running emulator (`__porty.args`,
-`__porty.cmdline`, `__porty.diskStats()`).
+- **A current browser.** Porty has been run in Chrome so far. Desktop
+  Safari and Safari on iPhone (iOS 26 or later) are the next targets; other
+  browsers are untested. Private browsing and in-app browsers (inside chat
+  or social apps) block service workers, so open the page in Safari or
+  Chrome itself.
+- **Memory.** By default the tab reserves 2300 MiB of memory on a desktop
+  and 1664 MiB on a phone, 1024 MiB of which is Android's RAM. Close other
+  tabs and apps first.
+- **Bandwidth.** Tens of MB to start, then the parts of the roughly 950 MB
+  system image that Android reads while booting (several hundred MB). Use
+  Wi-Fi.
 
 ## URL parameters
 
@@ -136,15 +185,10 @@ Example: `https://0null0x.github.io/porty/?serial=1&mem=1024&smp=1&res=1024x768`
 
 ## Troubleshooting
 
-**The workflow fails in "Build the toolchain image".** That step downloads
-third-party sources (Docker Hub, GNOME, freedesktop.org, GitHub). Re-run the
-job; if one source is gone for good, the URL lives in QEMU-Wasm's
-`Dockerfile` and can be changed with another patch in `patches/qemu-wasm/`
-(`0003-*.patch` is exactly such a fix).
-
-**The deploy job fails.** If it mentions Pages not being enabled, do step 1
-of *First deployment*. If it mentions the artifact size, see "Size budget"
-in the plan.
+When something goes wrong the page shows the reason, a hint and the last
+lines of the serial console, with a *Copy details* button. If the tips below
+do not help, paste those details into an
+[issue](https://github.com/0null0x/porty/issues).
 
 **"This page is not cross-origin isolated".** Reload once. If it stays:
 private browsing and in-app browsers (inside chat or social apps) block
@@ -174,42 +218,64 @@ bug apart from everything else.
 **After a new deployment the page behaves strangely.** GitHub Pages caches
 files for ten minutes; reload after that.
 
-## Repository layout
+Problems building or deploying your own copy are covered in
+[docs/DEVELOPING.md](docs/DEVELOPING.md#troubleshooting-the-build).
 
-| Path | Purpose |
-| --- | --- |
-| `patches/qemu-wasm/` | The changes to QEMU-Wasm, as plain patches |
-| `build/` | Pinned versions and the script that compiles QEMU inside the toolchain container |
-| `scripts/` | ISO download and verification, image preparation, site assembly |
-| `web/` | The page (plain ES modules, no bundler) |
-| `tests/` | Unit tests, pipeline dry run, native QEMU end-to-end test, headless-browser test |
-| `.github/workflows/` | Build and deploy |
-| `docs/PLAN.md` | Design, decisions, sources, risks |
+## FAQ
 
-## What has been tested
+**Can Porty run Android on an iPhone?** That is what it is built for, but
+not yet: see [Status](#status) for how far Android gets today. It has not
+been tried in iPhone Safari.
 
-Run locally, without the WebAssembly build:
+**Do I need to jailbreak, sideload or install an app?** No. Porty is a web
+page that runs on the browser's own WebAssembly engine, so it needs no App
+Store app, no jailbreak, no sideloading and no JIT helper.
 
-| Check | Command |
-| --- | --- |
-| The patches apply to the pinned QEMU-Wasm commit and compile natively with `-Werror` (gcc; clang syntax check including the Emscripten-only branches) | see `docs/PLAN.md` |
-| Display, input and block driver work in a native QEMU built from the patched tree, booting a Linux guest through the real image pipeline with the page's own QEMU arguments | `tests/native-e2e.sh` |
-| Page logic | `node tests/unit.test.mjs`, `node tests/wasm-patch.test.mjs` |
-| Image and site pipeline on a miniature ISO | `tests/site-smoke.sh /tmp/smoke` |
-| The page in headless Chrome with a fake QEMU module: service-worker isolation, start-up, canvas, input, console | `tests/ui/run.sh /tmp/ui` |
-| Workflow and scripts | `actionlint`, `shellcheck -x` |
+**Is it a cloud emulator that streams Android to me?** No. Android runs
+inside your browser tab, on your device. The site is static files on GitHub
+Pages, the page has no analytics, and Android has no network connection.
 
-Not tested: the Emscripten build itself, QEMU-Wasm running the patched code
-in a browser, Android-x86 booting under it, anything on iOS.
+**Can I install apps or use Google Play?** No. Android has no internet
+connection inside Porty, there is no way to import an APK, and the
+Android-x86 image does not include Google Play or Google apps.
 
-To preview the UI without the real build:
+**Why is it so slow?** Every x86 instruction is translated inside the
+browser, without hardware virtualisation, and Android draws its screen in
+software. In the boot test each step of Android's start-up takes roughly 10
+to 50 times as long as on real hardware.
 
-```sh
-(cd web && npm ci --ignore-scripts)
-tests/site-smoke.sh /tmp/porty-preview
-cp tests/ui/fake-qemu.js /tmp/porty-preview/dist/qemu/out.js
-python3 tests/ui/serve.py /tmp/porty-preview/dist 8080
-```
+**Is anything saved?** No. Android's `/data` lives in RAM, so reloading the
+page or closing the tab starts over.
+
+**Is Porty made by Google or the Android-x86 project?** No. "Android" is a
+trademark of Google LLC. Porty is not affiliated with Google or with the
+Android-x86 project.
+
+## Contributing and development
+
+Bug reports and boot logs are welcome in
+[Issues](https://github.com/0null0x/porty/issues). The most useful things to
+include are the page's *Copy details* text, the URL parameters you used, and
+your browser and device.
+
+- [docs/DEVELOPING.md](docs/DEVELOPING.md): deploying your own copy, the CI
+  build and the automatic boot test, local tests, repository layout
+- [docs/PLAN.md](docs/PLAN.md): design, decisions, size budget, findings
+- [web/README.md](web/README.md): what each file of the page does
+
+## Credits
+
+- [QEMU-Wasm](https://github.com/ktock/qemu-wasm) by Kohei Tokunaga: QEMU
+  with a code generator that emits WebAssembly. Porty's changes to it are
+  the patches in [`patches/qemu-wasm/`](patches/qemu-wasm/).
+- [QEMU](https://www.qemu.org/)
+- [Android-x86](https://www.android-x86.org/), whose unmodified 9.0-r2 image
+  Porty boots
+- [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker),
+  [xterm.js](https://github.com/xtermjs/xterm.js) and
+  [xterm-pty](https://github.com/mame/xterm-pty)
+- [Webdroid](https://github.com/AttilaTheFun/webdroid-releases), Porty's
+  design precedent (no code used)
 
 ## License
 
