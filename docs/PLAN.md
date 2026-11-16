@@ -751,15 +751,60 @@ publishes the slim image (2.8), with the boot diet on by default.
 - One boot test failed in the first minutes after a deploy: the page was
   not cross-origin isolated (its service worker had not taken over).
 
+**Tenth round: touch (2026-11-16).** On the iPhone the resume worked (the
+home screen came up) but taps did nothing visible. The boot test now ends
+with an input probe (`inputProbe` in `tests/boot/boot-test.mjs`): the
+kernel's and Android's view of the input devices, then a finger tap on
+the Gallery icon, the page's Home button and a mouse click, each followed
+by polling what has the focus.
+
+- Touch reaches Android. The USB tablet is a pointer device to
+  Android-x86 (`Classes: 0x80000008`, CursorInputMapper, mode pointer): a
+  tap moves an arrow cursor to the finger and clicks there; the cursor
+  landed on the Gallery icon (run 43864879886).
+- Snapshot 3 hid a dialog for SystemUI not responding (`visible=false`,
+  not focused, so `make-snapshot.py` missed it). While SystemUI does not
+  answer, InputDispatcher holds back every touch, because SystemUI's
+  status bar watches touches outside it; after the first tap the dialog
+  showed over the home screen. `make-snapshot.py` now looks for such
+  dialogs in every window, and saves only an idle Android on its home
+  screen (window manager answering, launcher focused, no such dialog,
+  screen at least 50% lit, load below 4 after settling), else the
+  workflow boots again, up to three times (f5a794c). One native boot had
+  been saved with system_server killed by its Watchdog and a black screen
+  (43867426731); the gate catches that now.
+- With snapshot 5 (43875574697), from the resumed home screen:
+
+  | Run | Setting | Tap on Gallery: Gallery focused | Home: launcher focused |
+  | --- | --- | --- | --- |
+  | 43878808688 | phone (`wasmmem=1280`, `jitcap=4000`) | not within 240 s | not within 120 s |
+  | 43883333056 | desktop (`jitcap` 15000) | within 180 s | within 90 s |
+  | 43885676292 | phone memory, `jitcap=15000` | within 150 s | within 60 s |
+
+  The phone's cap of 4000 compiled blocks is what makes it unusable: once
+  it is reached, all new code runs in TCI. Whether iOS keeps a tab alive
+  with 15000 is not known; their memory is outside the WebAssembly heap.
+- The page now draws a ring where a press lands (869fcd7), since Android
+  may take minutes to react.
+- Compiling apps ahead of time in the snapshot (`--compile`, branch
+  `swarm/aot`) could not be tried: in that run all three native boots
+  were still at load 10 to 14 after settling. Unclear whether AOT code
+  helps under QEMU-Wasm at all, where new guest code is expensive (every
+  block is interpreted, then compiled to its own WebAssembly module).
+- A full boot on the desktop setting once lost QEMU after the probe's
+  first tap: the worker threw `Infinity`, Emscripten's longjmp, and
+  nothing caught it (43867762831). The boot test now logs V8's call
+  frames for such exceptions.
+
 **Next steps:**
 
-1. The iPhone, with the resume: memory, time to the home screen, and how
-   usable the home screen is at that speed.
-2. The full boot on the phone setting with the provisioning, for visitors
-   who do not resume (the desktop one is above).
-3. SystemUI's "isn't responding" in a normal boot.
-4. The iPhone's speed: about 9 times slower than the runner in the first
-   try.
+1. `jitcap` on phones: 15000 if an iPhone keeps the tab alive with it.
+2. Native snapshot boots that stay busy after settling: run the
+   "isn't responding" rounds before giving up, or dilate time natively too.
+3. A real touchscreen instead of the pointer (QEMU's
+   `virtio-multitouch-pci`), so that taps and swipes behave like touch.
+4. The uncaught longjmp after a tap.
+5. The full boot on the phone setting with the provisioning.
 
 ## 8. Open questions for the first real run
 
