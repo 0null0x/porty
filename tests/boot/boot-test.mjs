@@ -397,6 +397,13 @@ try {
             await page.evaluate(() => globalThis.__porty.serial.send(
                 '\rgetprop init.svc.zygote; getprop init.svc.surfaceflinger; getprop init.svc.bootanim\r'));
             await sleep(3000);
+            // From 20 minutes on, also the newest Android log lines (what
+            // system_server is busy with); they land in the job log.
+            if (Date.now() - t0 > 20 * 60000) {
+                await page.evaluate(() => globalThis.__porty.serial.send(
+                    'logcat -d -b main -b system -t 12 2>/dev/null | cut -c1-150\r'));
+                await sleep(5000);
+            }
             await page.evaluate(() => globalThis.__porty.serial.send('getprop sys.boot_completed\r'));
         }
         if (!booted && /getprop sys\.boot_completed[^\n]*\n\s*1\s*\r?\n/.test(stripAnsi(recent))) {
