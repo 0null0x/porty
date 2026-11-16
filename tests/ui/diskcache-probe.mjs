@@ -34,9 +34,13 @@ try {
         await page.goto(`${site}diskcache-probe.html`, { waitUntil: 'load' });
         // coi-serviceworker reloads the page once on the first visit.
         let result = null;
-        for (let i = 0; i < 90 && !result; i++) {
+        for (let i = 0; i < 150 && !result; i++) {
             await new Promise((resolve) => setTimeout(resolve, 1000));
             result = await page.evaluate(() => globalThis.__probe || null).catch(() => null);
+        }
+        if (!result) {
+            const step = await page.evaluate(() => globalThis.__probeStep || 'the page script did not start').catch((e) => String(e));
+            result = { error: `no result after 150 s; last step: ${step}` };
         }
         console.log(`--- ${label} ---`);
         console.log(JSON.stringify(result, null, 1));
@@ -60,11 +64,14 @@ try {
             `XHR in a URL worker ${fine(first.urlWorker) ? 'ok' : 'FAILED'}`,
             `in a blob worker ${fine(first.blobWorker) ? 'ok' : 'FAILED'}`,
             `in a nested worker ${fine(first.nestedWorker) ? 'ok' : 'FAILED'}`,
-            `first visit: ${first.stats ? `${first.stats.misses} through the service worker, ${first.stats.stored} stored` : 'no counters'} of ${want} (${ms(all(first))} ms)`,
+            `first visit: ${first.stats ? `${first.stats.misses} fetched by the service worker, ${first.stats.stored} stored, ${first.stats.hits} already there` : 'no counters'} of ${want} (${ms(all(first))} ms)`,
             `second visit: ${second.stats ? `${second.stats.hits} from the device, ${second.stats.misses} from the network` : 'no counters'} (${ms(all(second))} ms)`,
             `persist=${second.persisted}`,
         ];
-        const works = first.stats && second.stats && first.stats.stored === want && second.stats.hits === want &&
+        // (The first visit may find chunks its own first load stored, before
+        // coi-serviceworker reloaded the page.)
+        const works = first.stats && second.stats && first.stats.hits + first.stats.misses === want &&
+            first.stats.hits + first.stats.stored === want && second.stats.hits === want &&
             second.stats.misses === 0 && fine(all(second));
         verdict = `${works ? 'WORKS' : 'DOES NOT WORK'}: ${parts.join('; ')}`;
     }

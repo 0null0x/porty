@@ -266,7 +266,10 @@
         } catch (e) {
             state.stats.errors++;
         }
-        const response = await self.fetch(request);
+        // What is kept here need not also fill the browser's HTTP cache;
+        // when nothing more can be kept, that cache is the next best thing.
+        const keeping = Date.now() >= state.fullUntil;
+        const response = await self.fetch(keeping ? new Request(request, { cache: 'no-store' }) : request);
         if (response.status !== 200) {
             return response;
         }

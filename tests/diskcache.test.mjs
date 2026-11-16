@@ -61,6 +61,7 @@ class FakeCaches {
 /** A service worker global with the disk cache loaded, and a fake site. */
 function worker({ files, caches = new FakeCaches(), estimate = true } = {}) {
     const fetched = [];
+    const modes = [];
     const self = {
         registration: { scope: SCOPE },
         location: { href: `${SCOPE}coi-serviceworker.js` },
@@ -70,6 +71,7 @@ function worker({ files, caches = new FakeCaches(), estimate = true } = {}) {
         fetch: async (request) => {
             const url = typeof request === 'string' ? request : request.url;
             fetched.push(url);
+            modes.push(typeof request === 'string' ? 'default' : request.cache);
             const body = files.get(url);
             return body ? new Response(body, { status: 200 }) : new Response('no', { status: 404 });
         },
@@ -87,7 +89,7 @@ function worker({ files, caches = new FakeCaches(), estimate = true } = {}) {
         await Promise.all(pending.splice(0));
         return { status: response.status, body };
     };
-    return { self, dc: self.portyDiskCache, caches, fetched, get };
+    return { self, dc: self.portyDiskCache, caches, fetched, modes, get };
 }
 
 const bytes = (n, seed) => Uint8Array.from({ length: n }, (_, i) => (i * 7 + seed) & 255);
@@ -249,6 +251,8 @@ for (const estimate of [true, false]) {
     assert.equal(w.dc.state.stats.stored, 2, `cap of 2 MB (estimate: ${estimate})`);
     assert.equal(w.dc.state.stats.full, 1);
     assert.equal(w.fetched.length, 5, 'what does not fit comes from the network every time');
+    // What is stored here skips the browser's HTTP cache; what is not may use it.
+    assert.deepEqual(w.modes, ['no-store', 'no-store', 'no-store', 'default', 'default']);
     assert.deepEqual((await w.get(imageUrl(0))).body, files.get(imageUrl(0)));
     assert.equal(w.fetched.length, 5, 'what was stored first stays');
 }

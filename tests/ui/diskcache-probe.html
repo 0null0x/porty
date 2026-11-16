@@ -49,7 +49,7 @@ const nested = `onmessage = (e) => {
 
 function run(worker, message) {
     return new Promise((resolve) => {
-        const timer = setTimeout(() => resolve([{ status: -3, bytes: 0, ms: 0, error: 'no answer in 30 s' }]), 30000);
+        const timer = setTimeout(() => resolve([{ status: -3, bytes: 0, ms: 0, error: 'no answer in 20 s' }]), 20000);
         worker.onmessage = (e) => { clearTimeout(timer); worker.terminate(); resolve(e.data); };
         worker.onerror = (e) => { clearTimeout(timer); resolve([{ status: -2, bytes: 0, ms: 0, error: String(e.message || e) }]); };
         worker.postMessage(message);
@@ -65,10 +65,13 @@ async function probe() {
         estimate: !!(navigator.storage && navigator.storage.estimate),
         persist: !!(navigator.storage && navigator.storage.persist),
     };
+    const step = (text) => { window.__probeStep = text; };
+    step('manifests');
     const json = async (path) => (await fetch(base + path, { cache: 'no-cache' })).json();
     const image = await json('image/manifest.json');
     const snap = await json('snapshot/manifest.json');
     const dc = new DiskCache({ search: location.search, baseUrl: base });
+    step('prepare (service worker control, settings, persist)');
     result.note = await dc.prepare(image.disk);
     result.controlled = !!navigator.serviceWorker.controller;
     result.persisted = dc.persisted;
@@ -77,13 +80,17 @@ async function probe() {
     const snapUrls = snap.chunks.map((c) => `${base}snapshot/${c.file}?v=${c.sha256.slice(0, 16)}&s=${snapshotVersion(snap)}`);
     const half = Math.ceil(snapUrls.length / 2);
     const blobUrl = URL.createObjectURL(new Blob([fetchLoop], { type: 'text/javascript' }));
+    step('XHR in a URL worker');
     // 1. a worker from a script URL (as Emscripten starts QEMU's threads)
     result.urlWorker = await run(new Worker(`${base}diskcache-probe-worker.js`), { urls: diskUrls });
+    step('XHR in a blob worker');
     // 2. a worker from a blob URL (as the UI tests' fake QEMU does)
     result.blobWorker = await run(new Worker(blobUrl), { urls: snapUrls.slice(0, half) });
+    step('XHR in a nested worker');
     // 3. a worker started by a worker
     result.nestedWorker = await run(new Worker(URL.createObjectURL(new Blob([nested], { type: 'text/javascript' }))),
         { script: `${base}diskcache-probe-worker.js`, urls: snapUrls.slice(half) });
+    step('counters and Cache Storage');
     // Writes finish after the answers.
     await new Promise((resolve) => setTimeout(resolve, 1500));
     result.stats = await dc.stats();
