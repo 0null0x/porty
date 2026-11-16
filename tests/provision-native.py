@@ -57,6 +57,10 @@ FACTS = (
     ("crash_processes", "logcat -b crash -d | grep -e 'Process: ' -e '>>> ' | cut -c1-200 | sort -k5 | uniq -c -f4 | head -20"),
     ("am_crashes", "logcat -b events -d | grep -e am_crash -e am_anr | cut -c1-240 | head -20"),
     ("activity_starts", "logcat -b events -d | grep -e am_create_activity -e am_finish_activity -e boot_progress | cut -c1-200 | head -40"),
+    ("system_events", "logcat -b system,crash,main -d -v time | grep -e Watchdog -e 'ANR in' -e 'Reason: ' -e ' died' -e 'FATAL'"
+                      " -e RescueParty -e 'Exit zygote' -e 'Process: ' -e 'Caused by' -e 'porty' -e 'Failed to parse'"
+                      " -e 'java.lang' | cut -c1-230 | tail -70"),
+    ("system_server", "pidof system_server; ps -A -o PID,ETIME,NAME | grep -e system_server -e zygote -e systemui -e launcher"),
     ("uptime", "cat /proc/uptime; cat /proc/loadavg"),
 )
 

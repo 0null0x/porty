@@ -42,18 +42,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: baseline
-            context: porty/check provisioning x0
-            experiment: ''
-            args: --trace 1
-          - name: hide-only
-            context: porty/check provisioning x1
-            experiment: hide-only
-            args: --trace 1
-          - name: hide-wizard-taskbar
-            context: porty/check provisioning x2
-            experiment: hide-wizard-taskbar
-            args: --trace 1
+          - name: z1
+            context: porty/check provisioning z1
+            experiment: z1
+            args: --idle 150
+          - name: z2
+            context: porty/check provisioning z2
+            experiment: z2
+            args: --idle 150
+          - name: z3
+            context: porty/check provisioning z3
+            experiment: z3
+            args: --idle 150
     env:
       QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
       STATUS_CONTEXT: ${{ matrix.context }}
