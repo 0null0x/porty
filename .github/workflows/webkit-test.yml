@@ -48,6 +48,10 @@ on:
         description: 'Cross-origin isolation: auto, sw (only the page''s service worker) or route (headers added by the test)'
         type: string
         default: auto
+      browser_env:
+        description: 'Experiment: options of WebKit''s JavaScript engine as environment variables, e.g. JSC_useOMGJIT=0 (space separated)'
+        type: string
+        default: ''
       table_grow:
         description: 'Experiment: QEMU''s function table grows by this many entries at a time (0: as built, one per compiled block)'
         type: number
@@ -58,7 +62,7 @@ permissions:
   statuses: write  # the verdicts (tests/boot/webkit-test.mjs)
 
 concurrency:
-  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}-${{ inputs.table_grow }}
+  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}-${{ inputs.table_grow }}-${{ inputs.browser_env }}
   cancel-in-progress: true
 
 defaults:
@@ -151,6 +155,7 @@ jobs:
           DEVICE: ${{ inputs.device || 'iphone' }}
           COI: ${{ inputs.coi || 'auto' }}
           TABLE_GROW: ${{ inputs.table_grow || 0 }}
+          BROWSER_ENV: ${{ inputs.browser_env }}
         run: |
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
