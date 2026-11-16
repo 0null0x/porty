@@ -1,0 +1,611 @@
+# TTM panic check: boots the page's phone configuration several times in a
+# NATIVE QEMU (the one snapshot.yml builds, from the same patched QEMU-Wasm
+# tree as the site) and counts guest kernel panics per variant, with and
+# without the page's remedy.  See docs/PLAN.md, "The ttm_bo_vm_open panic".
+#
+# Android-x86 9.0-r2's kernel dies whenever surfaceflinger forks while it
+# has the bochs-drm framebuffer mapped (WARN_ON in ttm_bo_vm_open, which
+# this kernel cannot survive).  Android makes surfaceflinger fork when it
+# collects stack traces after an app did not respond, which a guest that
+# runs 50-100 times slower in a browser does all the time.
+#
+# The run itself never fails, because every failed run emails the repository
+# owner.  The verdict is the commit status "porty/check ttm" (one more per
+# variant, "porty/check ttm <name>") and the job summaries; read them with
+#   gh api repos/<owner>/<repo>/commits/<sha>/statuses
+name: TTM panic check
+
+on:
+  push:
+    branches: [swarm/ttm-panic]
+    paths:
+      - .github/workflows/ttm-panic.yml
+      - tests/ttm-panic.py
+      - scripts/snapshot/make-snapshot.py
+      - web/js/qemu-args.js
+      - web/js/config.js
+      - web/js/boot-diet.js
+      - web/js/initramfs.js
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ttm-panic-${{ github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  PHONE: mem=768&tb=128&cache=16
+
+jobs:
+  # Native QEMU and the image, once, for every variant.
+  prepare:
+    name: Native QEMU and the image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      ready: ${{ steps.ready.outputs.ready }}
+      image_key: ${{ steps.ready.outputs.image_key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv binutils
+
+      # The same key as snapshot.yml: the same binary.
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          tail -30 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Save the native QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          out/native-qemu/qemu-system-x86_64 -display help | grep -q wasmfb
+          # Which display devices this build (and so the browser's) has at
+          # all: every one of them is a candidate for "another VGA model".
+          out/native-qemu/qemu-system-x86_64 -device help > "$RUNNER_TEMP/devices.txt"
+          echo "--- display devices ---"
+          sed -n '/^Display devices:/,/^$/p' "$RUNNER_TEMP/devices.txt"
+          echo "--- anything else that draws ---"
+          grep -i -e vga -e gpu -e display -e ramfb -e qxl "$RUNNER_TEMP/devices.txt" || true
+
+      # The image the site publishes (build-and-deploy.yml caches it under
+      # this key); a new one only if there is none.
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore cached Android-x86 ISO
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: prepare
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          tail -1 "$RUNNER_TEMP/prepare.log"
+          rm -rf out/iso
+
+      # Never under the published image's key: snapshot.yml takes whatever
+      # is there for the image the site serves.
+      - name: Keep a newly prepared image for this run
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: ttm-image-${{ github.run_id }}
+
+      # The module the panic is in, as the image ships it: where
+      # ttm_bo_vm_open's WARN_ON sits in the file, and what the initrd's
+      # shell has to work with.
+      - name: Look at ttm.ko and the initrd
+        id: module
+        continue-on-error: true
+        run: |
+          test -s out/image/manifest.json
+          work="$RUNNER_TEMP/mod"; mkdir -p "$work/initrd"
+          dir="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["disk"]["dir"])' out/image/manifest.json)"
+          fmt="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["disk"].get("format", "raw"))' out/image/manifest.json)"
+          echo "disk: $dir ($fmt)"
+          find "out/image/$dir" -name '*.bin' | sort | xargs cat > "$work/disk.$fmt"
+          if [[ "$fmt" == qcow2 ]]; then
+            qemu-img convert -f qcow2 -O raw "$work/disk.qcow2" "$work/system.img"
+            debugfs -R "ls -l /lib/modules" "$work/system.img" 2>/dev/null | head -8
+            ver="$(debugfs -R "ls /lib/modules" "$work/system.img" 2>/dev/null | tr -s ' ' '\n' | grep -m1 '^[0-9]')"
+            echo "modules: $ver"
+            for m in ttm/ttm bochs/bochs-drm; do
+              debugfs -R "dump /lib/modules/$ver/kernel/drivers/gpu/drm/$m.ko $work/$(basename "$m").ko" "$work/system.img" 2>/dev/null
+            done
+            ls -l "$work"/*.ko
+            sha256sum "$work"/*.ko
+            debugfs -R "cat /lib/modules/$ver/modules.dep" "$work/system.img" 2>/dev/null | grep -e 'ttm.ko:' -e 'bochs-drm.ko:' || true
+            echo "--- sections ---"
+            readelf -S -W "$work/ttm.ko" | grep -e ' \.text' -e '\.rela\.text' -e __bug_table -e '\.modinfo'
+            echo "--- symbols ---"
+            readelf -s -W "$work/ttm.ko" | grep -e ttm_bo_vm_open -e ttm_fbdev_mmap -e ttm_bo_vm_close
+            echo "--- ttm_bo_vm_open ---"
+            objdump -d -r --disassemble=ttm_bo_vm_open "$work/ttm.ko" | sed -n '/<ttm_bo_vm_open>:/,$p'
+            echo "--- modinfo ---"
+            strings "$work/ttm.ko" | grep -e '^vermagic=' -e '^depends=' -e '^srcversion='
+            base64 -w 200 "$work/ttm.ko" > "$work/ttm.b64"
+            echo "ttm.ko as base64: $(wc -l < "$work/ttm.b64") lines"
+            echo "-----BEGIN TTM KO-----"
+            cat "$work/ttm.b64"
+            echo "-----END TTM KO-----"
+          fi
+          echo "--- initrd ---"
+          initrd="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["initrd"]["file"])' out/image/manifest.json)"
+          (cd "$work/initrd" && zcat "$GITHUB_WORKSPACE/out/image/$initrd" | cpio -id --quiet --no-absolute-filenames 2>/dev/null) || true
+          (cd "$work/initrd" && find . -maxdepth 2 | sort | head -120) || true
+          bb="$(find "$work/initrd" -name busybox -type f | head -1)"
+          if [[ -n "$bb" ]]; then
+            file "$bb" || true
+            for applet in dd cmp od hexdump printf sed mount md5sum sha256sum sha1sum cat uname tr; do
+              printf '%s: ' "$applet"; if grep -a -q -w -- "$applet" "$bb"; then echo yes; else echo no; fi
+            done
+          fi
+          echo "--- initrd /init (the part that sources the scripts and loads modules) ---"
+          grep -n -e 'scripts' -e load_modules -e auto_detect -e 'ln -s' -e switch_root "$work/initrd/init" | head -30 || true
+          grep -n -e modprobe -e 'auto_detect' "$work/initrd/scripts/"* | head -20 || true
+
+      - name: Ready
+        id: ready
+        if: ${{ always() }}
+        env:
+          QEMU: ${{ steps.qemu.outcome }}
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+          IMAGE_KEY: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+          RUN_KEY: ttm-image-${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          ready=false
+          [[ "$QEMU" == success && -s out/image/manifest.json ]] && ready=true
+          key="$RUN_KEY"; [[ "$CACHE_HIT" == true ]] && key="$IMAGE_KEY"
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "image_key=$key" >> "$GITHUB_OUTPUT"
+          echo "ready: $ready (qemu $QEMU, published image from the cache: ${CACHE_HIT:-false})"
+          gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context="porty/check ttm" \
+            -f description="booting (native QEMU and image ready: $ready)" -f target_url="$RUN_URL" >/dev/null || true
+          exit 0
+
+  boots:
+    name: ${{ matrix.name }}
+    needs: prepare
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        # expect: "panic" (the fault, shown), "clean" (a remedy: not one
+        # panic, every boot reaches sys.boot_completed) or "info".
+        # device: "" is the page's own argv; the others change the display
+        # device after the page built it (experiments the page cannot do).
+        include:
+          - name: base
+            query: ''
+            boots: 4
+            observe: 200
+            provoke: debuggerd
+            expect: panic
+            device: ''
+          - name: base-anr
+            query: ''
+            boots: 3
+            observe: 20
+            provoke: anr,debuggerd
+            expect: panic
+            device: ''
+          - name: props
+            query: '&props=dalvik.vm.stack-trace-dir='
+            boots: 4
+            observe: 200
+            provoke: anr
+            expect: clean
+            device: ''
+          - name: props-debuggerd
+            query: '&props=dalvik.vm.stack-trace-dir='
+            boots: 1
+            observe: 20
+            provoke: debuggerd
+            expect: info
+            device: ''
+          - name: vesa
+            query: '&gfx=vesa'
+            boots: 2
+            observe: 120
+            provoke: anr,debuggerd
+            expect: clean
+            device: ''
+          - name: nopanic
+            query: ''
+            boots: 1
+            observe: 20
+            provoke: nopanic
+            expect: info
+            device: ''
+          - name: bochs-display
+            query: ''
+            boots: 1
+            observe: 20
+            provoke: debuggerd
+            expect: info
+            device: bochs-display
+          - name: bochs-display-vesa
+            query: '&gfx=vesa'
+            boots: 1
+            observe: 60
+            provoke: anr,debuggerd
+            expect: info
+            device: bochs-display-vesa
+    env:
+      NAME: ${{ matrix.name }}
+      QUERY_EXTRA: ${{ matrix.query }}
+      BOOTS: ${{ matrix.boots }}
+      OBSERVE: ${{ matrix.observe }}
+      PROVOKE: ${{ matrix.provoke }}
+      EXPECT: ${{ matrix.expect }}
+      DEVICE: ${{ matrix.device }}
+      STATUS_CONTEXT: porty/check ttm ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          echo "qemu_commit=$QEMU_WASM_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libglib2.0-0t64 libfdt1 zlib1g
+          if [[ "$DEVICE" == bochs-display-vesa ]]; then
+            # A VGA BIOS for bochs-display (the build ships only the one
+            # for "-vga std"); Ubuntu's, for this experiment.
+            sudo apt-get install -y -qq seabios
+            find /usr/share/seabios -iname 'vgabios*' || true
+          fi
+
+      - name: Restore the native QEMU
+        id: qemu-cache
+        if: needs.prepare.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Restore the image
+        id: image-cache
+        if: needs.prepare.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: ${{ needs.prepare.outputs.image_key }}
+
+      - name: Build the QEMU arguments
+        id: argv
+        if: needs.prepare.outputs.ready == 'true'
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          test -s out/image/manifest.json
+          query="$PHONE$QUERY_EXTRA"
+          echo "query: $query"
+          mkdir -p out/ttm out/artifact
+          # The page changes initrd.img in memory before QEMU starts (boot
+          # diet, web/js/boot-diet.js); the native boot uses the same bytes.
+          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/ttm/initrd-page.img" "?$query" \
+            | tee out/artifact/boot-diet.txt
+          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+            "$PWD/out/native-qemu/pc-bios" "?$query" \
+            | awk -v initrd="$PWD/out/ttm/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+            > out/ttm/argv-page.txt
+          grep -qxF "$PWD/out/ttm/initrd-page.img" out/ttm/argv-page.txt
+          python3 -I - "$DEVICE" out/ttm/argv-page.txt out/ttm/argv-native.txt <<'PY'
+          import sys
+          device, src, dst = sys.argv[1:4]
+          args = open(src, encoding="utf-8").read().split("\n")
+          args = [a for a in args if a != ""]
+          if device:
+              rom = "" if device == "bochs-display" else "/usr/share/seabios/vgabios-bochs-display.bin"
+              out = []
+              i = 0
+              while i < len(args):
+                  if args[i] == "-vga" and args[i + 1] == "std":
+                      out += ["-vga", "none", "-device", f"bochs-display,xres=480,yres=800,romfile={rom}"]
+                      i += 2
+                  elif args[i] == "-global" and args[i + 1].startswith("VGA."):
+                      i += 2
+                  elif args[i] == "-append" and device == "bochs-display-vesa":
+                      # SeaBIOS' VGA BIOS for a plain framebuffer (vgasrc/cbvga.c)
+                      # offers it as VBE mode 0x140.
+                      words = ["vga=0x340" if w.startswith("vga=") else w for w in args[i + 1].split(" ")]
+                      out += ["-append", " ".join(words)]
+                      i += 2
+                  else:
+                      out.append(args[i])
+                      i += 1
+              args = out
+          open(dst, "w", encoding="utf-8").write("\n".join(args) + "\n")
+          PY
+          if grep -q kvm out/ttm/argv-native.txt; then exit 1; fi
+          cp out/ttm/argv-native.txt out/artifact/
+          cat out/ttm/argv-native.txt
+
+      - name: Boot and count panics
+        id: boot
+        if: steps.argv.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 140
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          (
+            while sleep 180; do
+              [[ -f out/ttm/work/progress.txt ]] || continue
+              gh api "repos/$REPO/statuses/$SHA" -f state=pending -f context="$STATUS_CONTEXT" \
+                -f description="$(head -c 140 out/ttm/work/progress.txt)" -f target_url="$RUN_URL" >/dev/null 2>&1 || true
+            done
+          ) &
+          reporter=$!
+          trap 'kill "$reporter" 2>/dev/null || true' EXIT
+          python3 -I tests/ttm-panic.py \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/ttm/argv-native.txt \
+            --work out/ttm/work \
+            --name "$NAME" \
+            --boots "$BOOTS" \
+            --observe "$OBSERVE" \
+            --provoke "$PROVOKE" \
+            --deadline 6600
+
+      - name: Collect logs
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          mkdir -p out/artifact
+          cp out/ttm/work/result.json out/artifact/ 2>/dev/null || true
+          for d in out/ttm/work/boot-*; do
+            [[ -d "$d" ]] || continue
+            mkdir -p "out/artifact/$(basename "$d")"
+            cp "$d"/serial.log "$d"/qemu.log "$d"/*.png "out/artifact/$(basename "$d")/" 2>/dev/null || true
+          done
+          du -sh out/artifact || true
+
+      - name: Upload the logs
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ttm-panic-${{ matrix.name }}
+          path: out/artifact
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          READY: ${{ needs.prepare.outputs.ready }}
+          ARGV: ${{ steps.argv.outcome }}
+        run: |
+          set +e
+          python3 -I - out/ttm/work/result.json "$NAME" "$EXPECT" "$READY" "$ARGV" > "$RUNNER_TEMP/report.txt" <<'PY'
+          import json, sys
+          path, name, expect, ready, argv = sys.argv[1:6]
+          try:
+              result = json.load(open(path, encoding="utf-8"))
+          except (OSError, ValueError):
+              result = None
+          boots = (result or {}).get("boots") or []
+          panics = [b for b in boots if b.get("panic")]
+          booted = [b for b in boots if b.get("booted")]
+          if not boots:
+              why = "native QEMU or image missing" if ready != "true" else ("no QEMU arguments" if argv != "success" else "no boot was made")
+              state, line = "failure", f"{name}: {why}"
+          else:
+              line = result.get("summary", name)
+              if expect == "clean":
+                  ok = not panics and len(booted) == len(boots)
+              elif expect == "panic":
+                  ok = bool(panics)
+              else:
+                  ok = True
+              state = "success" if ok else "failure"
+              line += {"clean": " (expected: none)", "panic": " (expected: panics)", "info": ""}[expect]
+          print(state)
+          print(line)
+          print()
+          print("| boot | sys.boot_completed | panic | phase | s after boot | guest uptime |")
+          print("|---|---|---|---|---|---|")
+          for b in boots:
+              print(f"| {b.get('boot')} | {b.get('booted_seconds', 'no')} | {b.get('panic') or 'none'} | {b.get('panic_phase') or ''} "
+                    f"| {b.get('panic_after_boot_seconds', '')} | {b.get('panic_guest_uptime') or ''} |")
+          for b in boots[:1]:
+              for title, block in (("Diagnostics (boot 1)", b.get("diagnostics") or {}), ("Steps (boot 1)", b.get("steps") or {})):
+                  print(f"\n<details><summary>{title}</summary>\n")
+                  for key, value in block.items():
+                      if isinstance(value, list):
+                          value = "\n".join(value)
+                      print(f"**{key}**\n\n```\n{str(value)[:3000]}\n```\n")
+                  print("</details>")
+          for b in panics[:1]:
+              print("\n<details><summary>Console at the first panic</summary>\n\n```")
+              print("\n".join(b.get("console") or []))
+              print("```\n</details>")
+          PY
+          state="$(sed -n '1p' "$RUNNER_TEMP/report.txt")"
+          desc="$(sed -n '2p' "$RUNNER_TEMP/report.txt")"
+          [[ "$state" == success || "$state" == failure ]] || { state=failure; desc="$NAME: no report"; }
+          echo "$state: $desc"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## TTM panic check: $NAME"
+            echo
+            echo "**$state**: $desc"
+            echo
+            echo "Query \`$PHONE$QUERY_EXTRA\`, device change \`${DEVICE:-none}\`, $BOOTS boots, watched $OBSERVE s each, then: \`${PROVOKE:-nothing}\`."
+            sed -n '3,$p' "$RUNNER_TEMP/report.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+  verdict:
+    name: Verdict
+    needs: boots
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: One status for all variants
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          gh api "repos/$REPO/commits/$SHA/statuses?per_page=100" --paginate > "$RUNNER_TEMP/statuses.json"
+          python3 -I - "$RUNNER_TEMP/statuses.json" > "$RUNNER_TEMP/verdict.txt" <<'PY'
+          import json, sys
+          text = open(sys.argv[1], encoding="utf-8").read()
+          # --paginate prints one JSON array per page.
+          statuses = []
+          decoder = json.JSONDecoder()
+          pos = 0
+          while pos < len(text):
+              while pos < len(text) and text[pos].isspace():
+                  pos += 1
+              if pos >= len(text):
+                  break
+              value, pos = decoder.raw_decode(text, pos)
+              statuses += value
+          latest = {}
+          for s in statuses:  # newest first
+              c = s.get("context", "")
+              if c.startswith("porty/check ttm ") and c not in latest:
+                  latest[c] = s
+          done = {c: s for c, s in latest.items() if s["state"] in ("success", "failure")}
+          bad = sorted(c[len("porty/check ttm "):] for c, s in done.items() if s["state"] == "failure")
+          pending = sorted(c[len("porty/check ttm "):] for c in latest if c not in done)
+          if not done:
+              print("failure"); print("no variant reported")
+          elif bad or pending:
+              print("failure"); print(f"not as expected: {', '.join(bad + pending)} ({len(done) - len(bad)} of {len(latest)} as expected)")
+          else:
+              print("success"); print(f"all {len(done)} variants as expected (remedies: no panic; without: panics)")
+          print()
+          print("| variant | state | result |"); print("|---|---|---|")
+          for c in sorted(latest):
+              print(f"| {c[len('porty/check ttm '):]} | {latest[c]['state']} | {latest[c].get('description', '')} |")
+          PY
+          state="$(sed -n '1p' "$RUNNER_TEMP/verdict.txt")"
+          desc="$(sed -n '2p' "$RUNNER_TEMP/verdict.txt")"
+          [[ "$state" == success || "$state" == failure ]] || { state=failure; desc="no verdict"; }
+          echo "$state: $desc"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="porty/check ttm" \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## TTM panic check"
+            echo
+            echo "**$state**: $desc"
+            sed -n '3,$p' "$RUNNER_TEMP/verdict.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
