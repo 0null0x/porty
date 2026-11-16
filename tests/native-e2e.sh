@@ -252,6 +252,7 @@ check "USB tablet received events"                   "PORTY-TEST: tablet-bytes [
 check "keyboard received events"                     "PORTY-TEST: kbd-bytes [1-9]"
 check "KEY_BACK (158 = 0x9e) arrived"                "PORTY-TEST: kbd-hex .*01009e00"
 check "kernel unpacked the appended boot-diet archive" "porty: boot diet, 3 properties in default.prop"
+check "the module fix leaves a guest without ttm.ko alone" "porty: no ttm.ko, nothing to fix"
 check "the script rewrote default.prop"              "PORTY-TEST: diet ro.zygote=zygote64_32 ro.debuggable=1 debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract"
 check "guest finished"                               "PORTY-TEST: done"
 
