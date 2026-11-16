@@ -612,6 +612,8 @@ async function inputProbe() {
         'tail -6 /data/local/tmp/porty-am.txt | cut -c1-170 | sed "s/^/EV|/"',
         'echo FOCUS:$(dumpsys window | grep mCurrentFocus | head -1 | cut -c1-90):END',
     ].join('; ');
+    // The busiest threads over one second of the guest's time.
+    const guestTop = 'top -b -H -n 1 -d 1 -m 12 -o %CPU,PID,TID,S,CMD,NAME 2>&1 | tail -13 | cut -c1-110 | sed "s/^/TOP|/"';
     // How fast the guest runs a hot loop now: seconds for 20000 rounds of
     // the shell's arithmetic.  Comparable between runs and conditions.
     const calibrate = async (label) => {
@@ -625,6 +627,12 @@ async function inputProbe() {
         log(`INPUT PROBE: guest speed ${label}: ${s < 0 ? 'no answer in 300 s' : `${s.toFixed(1)} s for 20000 shell loop rounds`}`);
         return s;
     };
+    // During a launch the guest's one CPU is busy with ten runnable threads
+    // and an ordinary shell did not answer for minutes (run 43900085582).
+    // With the highest priority its samples come back; they cost the launch
+    // a little, which the "quiet" option shows.
+    await send('renice -n -20 -p $$ > /dev/null; echo NICE:$(cut -d" " -f19 /proc/$$/stat):END\r');
+    await sleep(4000);
     const result = { conditions, query: String(params), calibrationS: await calibrate('before the tap') };
     // The guest's clock against ours, for the times in the event log: a
     // line written to the log now carries the log's time stamp.  The line
@@ -657,6 +665,7 @@ async function inputProbe() {
     let nextGuest = tapAt + 20000;
     let nextLine = tapAt + 30000;
     let shotDone = false;
+    let guestRound = 0;
     let lastSeenSt = prevSt;
     let lastSeenPs = prevPs;
     let peakInFlight = 0;
@@ -667,7 +676,7 @@ async function inputProbe() {
     while (Date.now() - tapAt < probeWaitMs) {
         if (guestEveryMs && Date.now() >= nextGuest) {
             nextGuest = Date.now() + guestEveryMs;
-            await send(`${guestSample}\r`);
+            await send(`${guestSample}${guestRound++ % 3 === 1 ? `; ${guestTop}` : ''}\r`);
         }
         await sleep(5000);
         let now;
