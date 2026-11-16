@@ -159,12 +159,16 @@ function isContentProcess(p) {
  */
 function mappings(pid) {
     try {
-        const out = { giant: [], giantRss: 0, codeRss: 0, fileRss: 0, heapRss: 0 };
+        const out = { giant: [], giantRss: 0, codeRss: 0, fileRss: 0, heapRss: 0, byName: {} };
         let cur = null;
         const close = () => {
             if (!cur) {
                 return;
             }
+            // Linux names anonymous mappings ("[anon:WKFastMalloc]", "[heap]",
+            // "[stack]"); files count as one.
+            const name = cur.path.startsWith('/') ? 'files' : (cur.path || 'unnamed').replace(/^\[anon:(.*)\]$/, '$1');
+            out.byName[name] = (out.byName[name] || 0) + cur.rss;
             if (cur.size >= 1048576) {
                 out.giant.push(cur);
                 out.giantRss += cur.rss;
@@ -220,6 +224,8 @@ function memorySample(withMaps = false) {
             out.code = mb(maps.codeRss);
             out.heaps = mb(maps.heapRss);
             out.rest = out.rss - out.bigRss;
+            out.names = Object.entries(maps.byName).filter(([, kb]) => kb >= 8192).sort((x, y) => y[1] - x[1])
+                .slice(0, 8).map(([n, kb]) => `${n} ${mb(kb)}`).join(', ');
             out.giant = maps.giant.filter((g) => g.rss >= 1024).slice(0, 5)
                 .map((g) => `${mb(g.size)}M:${mb(g.rss)}M ${g.perms}${g.path ? ` ${g.path.slice(0, 24)}` : ''}`).join(', ');
         }
@@ -228,7 +234,7 @@ function memorySample(withMaps = false) {
 }
 
 const describeMemory = (m) => (m ? `${m.name}[${m.pid}] rss=${m.rss} anon=${m.anon} file=${m.file} shmem=${m.shmem}` +
-    (m.bigRss !== undefined ? ` giant=${m.bigRss} [${m.giant}] code=${m.code} heaps=${m.heaps}` : '') +
+    (m.bigRss !== undefined ? ` giant=${m.bigRss} [${m.giant}] code=${m.code} heaps=${m.heaps} by-name: ${m.names}` : '') +
     ` threads=${m.threads}; content processes ${m.content} MiB, all ${m.count} processes ${m.total} MiB` : 'no browser process found');
 
 // -------------------------------------------------------------- browser ---
@@ -920,10 +926,86 @@ async function qemuTableInfo() {
             }
         };
         let pos = 8;
+        let importedFuncs = 0;
+        const bodies = [];
+        const names = new Map();
+        const text = (p, len) => new TextDecoder().decode(bytes.subarray(p, p + len));
         while (pos < bytes.length) {
             const id = bytes[pos++];
             let size;
             [size, pos] = leb(pos);
+            if (id === 2) {
+                // imports: count the functions (they come first in the index space)
+                let p = pos;
+                let count;
+                [count, p] = leb(p);
+                for (let i = 0; i < count; i++) {
+                    let len;
+                    [len, p] = leb(p);
+                    p += len;
+                    [len, p] = leb(p);
+                    p += len;
+                    const kind = bytes[p++];
+                    if (kind === 0) {
+                        importedFuncs++;
+                        [, p] = leb(p);
+                    } else if (kind === 1) {
+                        const flags = bytes[p + 1];
+                        [, p] = leb(p + 2);
+                        if (flags & 1) {
+                            [, p] = leb(p);
+                        }
+                    } else if (kind === 2) {
+                        const flags = bytes[p];
+                        [, p] = leb(p + 1);
+                        if (flags & 1) {
+                            [, p] = leb(p);
+                        }
+                    } else if (kind === 3) {
+                        p += 2;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if (id === 10) {
+                // code: the size of every function body
+                let p = pos;
+                let count;
+                [count, p] = leb(p);
+                for (let i = 0; i < count; i++) {
+                    let len;
+                    [len, p] = leb(p);
+                    bodies.push(len);
+                    p += len;
+                }
+            }
+            if (id === 0) {
+                let p = pos;
+                let len;
+                [len, p] = leb(p);
+                if (text(p, len) === 'name') {
+                    p += len;
+                    while (p < pos + size) {
+                        const sub = bytes[p++];
+                        let subSize;
+                        [subSize, p] = leb(p);
+                        if (sub === 1) {
+                            let q = p;
+                            let count;
+                            [count, q] = leb(q);
+                            for (let i = 0; i < count; i++) {
+                                let index;
+                                [index, q] = leb(q);
+                                [len, q] = leb(q);
+                                names.set(index, text(q, len));
+                                q += len;
+                            }
+                        }
+                        p += subSize;
+                    }
+                }
+            }
             if (id === 4) {
                 // table section: count, then reftype, limits
                 let p = pos;
@@ -937,11 +1019,18 @@ async function qemuTableInfo() {
             if (id === 9) {
                 out.elementSectionBytes = size;
             }
-            if (id >= 10) {
-                break;
-            }
             pos += size;
         }
+        // The engine's optimizing compiler works per function: how big are QEMU's?
+        const order = bodies.map((v, i) => i).sort((x, y) => bodies[y] - bodies[x]);
+        out.functions = {
+            count: bodies.length, imported: importedFuncs, named: names.size,
+            codeBytes: bodies.reduce((x, y) => x + y, 0),
+            over100k: bodies.filter((v) => v >= 100000).length,
+            over20k: bodies.filter((v) => v >= 20000).length,
+            over5k: bodies.filter((v) => v >= 5000).length,
+            biggest: order.slice(0, 25).map((i) => `${names.get(i + importedFuncs) || `#${i + importedFuncs}`} ${bodies[i]}`),
+        };
     } catch (err) {
         out.wasmError = String(err);
     }
@@ -1071,7 +1160,7 @@ async function sample(label, every = 10000) {
         diskMb: s.disk ? Math.round(s.disk.megabytes) : undefined,
         rss: m ? m.rss : undefined, anon: m ? m.anon : undefined, shmem: m ? m.shmem : undefined,
         total: m ? m.total : undefined,
-        ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest, code: m.code, heaps: m.heaps, giant: m.giant } : {}),
+        ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest, code: m.code, heaps: m.heaps, giant: m.giant, names: m.names } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
@@ -1519,7 +1608,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         `- URL: ${url}`,
         `- Isolation: ${result.coi || 'none'}; SharedArrayBuffer ${f.sharedArrayBuffer}; worker: ${JSON.stringify(f.worker || {})}`,
         `- Shared WebAssembly memory: ${JSON.stringify(f.memory || {})}`,
-        `- QEMU module: ${JSON.stringify(result.qemu || {}).slice(0, 900)}`,
+        `- QEMU module: ${JSON.stringify({ ...(result.qemu || {}), grow: undefined, remove: undefined }).slice(0, 2500)}`,
         ...(tableGrow ? [`- Experiment: table grows by ${tableGrow} (${result.tableGrowHits || 0} places rewritten in ${result.tableGrowLoads || 0} loads of out.js)`] : []),
         `- Compiled blocks in the code buffer: ${JSON.stringify(result.blocks || {})}`,
         ...(result.fixed ? [`- Fixed costs (MiB): ${JSON.stringify(result.fixed)}`] : []),
@@ -1534,10 +1623,10 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         ] : []),
         ...(result.errors.length ? ['- Errors:', ...result.errors.map((e) => `  - \`${e.replace(/`/g, "'").split('\n')[0]}\``)] : []),
         '',
-        '| s | phase | JIT alive | compiled | QEMU heap MiB | RSS MiB | anon | shmem | mappings of 1 GiB+ | rest | of it heaps |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+        '| s | phase | JIT alive | compiled | QEMU heap MiB | RSS MiB | anon | shmem | mappings of 1 GiB+ | rest | of it heaps | by name |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows.map((r) => `| ${r.t} | ${r.label} | ${r.alive ?? ''} | ${r.compiled ?? ''} | ${r.heapUsed ?? ''} | ` +
-            `${r.rss ?? ''} | ${r.anon ?? ''} | ${r.shmem ?? ''} | ${r.wasmRss ?? ''} | ${r.rest ?? ''} | ${r.heaps ?? ''} |`),
+            `${r.rss ?? ''} | ${r.anon ?? ''} | ${r.shmem ?? ''} | ${r.wasmRss ?? ''} | ${r.rest ?? ''} | ${r.heaps ?? ''} | ${r.names ?? ''} |`),
         '',
     ].join('\n'));
 }
