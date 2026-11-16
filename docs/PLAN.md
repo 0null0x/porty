@@ -592,6 +592,62 @@ without the page bug first.
   previous command, whose output was "1". It now checks
   `echo BOOTCHK:$(getprop sys.boot_completed):END`.
 
+**The ttm_bo_vm_open panic (2026-11-16).** Booted natively (snapshot.yml's
+QEMU, the page's phone argv), the guest restarted by itself about 100 s into
+almost every boot, silently: Android leaves the console log level at 0, so
+the oops prints nothing. In the browser the sign is the kernel banner and
+the "porty: boot diet" line appearing again in the middle of a boot.
+
+- Mechanism. Android-x86 draws through bochs-drm's fbdev emulation:
+  surfaceflinger maps `/dev/graphics/fb0` (`bochsfb_mmap` ->
+  `ttm_fbdev_mmap`), which puts TTM's `vm_ops` on a mapping of a file that
+  is not the DRM device. When that process forks, `ttm_bo_vm_open` runs
+  `WARN_ON(bo->bdev->dev_mapping != vma->vm_file->f_mapping)`, always true
+  for such a mapping. This kernel's `do_invalid_op` (traps.c) was replaced
+  by an SSE4/POPCNT emulator that never calls `fixup_bug()`, so the WARN's
+  `ud2` is "invalid opcode: 0000 [#1] ... RIP: ttm_bo_vm_open+0x4e/0x60
+  [ttm]", and `/init.rc` sets `kernel.panic_on_oops=1`: "Kernel panic - not
+  syncing: Fatal exception", reboot after 5 s (`CONFIG_PANIC_TIMEOUT=5`).
+- What makes surfaceflinger fork: debuggerd. Its signal handler (linker,
+  `debuggerd_handler.cpp`) does `clone(nullptr, nullptr, 0, nullptr)` to
+  exec `crash_dump64`. `ActivityManagerService.dumpStackTraces` asks for
+  that for every process in `Watchdog.NATIVE_STACKS_OF_INTEREST` after a
+  foreground ANR and from the Watchdog. The ANR seen natively is SystemUI's
+  on the `TIME_TICK` broadcast at the end of boot.
+- Triggers counted with `ttmfix=0` (4 boots): one each during boot, while
+  only watching, after an ANR made on purpose (focused app stopped, keys
+  sent) and after `debuggerd -b $(pidof surfaceflinger)`.
+- The fix (`TTM_FIX` in `web/js/boot-diet.js`): the script the page appends
+  to the initrd copies `ttm.ko` (SHA-256 `25e53cd1...d72d6536`), turns the
+  WARN_ON's `jne` at file offset 26173 (0x70 + 0x65cd) from `75 11` into
+  `66 90`, checks the copy (SHA-256 `1958d613...b3166408`) and bind-mounts it
+  over the module. `/init` sources the script after mounting the system
+  image and before `load_modules`, so the kernel loads the copy.
+  `ttmfix=0` leaves the module alone; `gfx=vesa` (no bochs-drm) gets no fix.
+
+| Run (commit) | Variant | Boots | Panicked |
+| --- | --- | --- | --- |
+| 43824222135 (3ef58b2) | `nofix` (`ttmfix=0`) | 4 | 4 (anr 1, boot 1, debuggerd 1, watching 1) |
+| | `fix-1`, `fix-2`, `fix-3`, `fix-long` | 13 | 0; 26 stack dumps of surfaceflinger survived |
+| | `vesa` (`gfx=vesa`) | 2 | 0 |
+| | `-device bochs-display` + `nomodeset vga=0x340` | 2 | 0 |
+| 43823348312 (6142359) | as shipped | 4 | 4 (all in `ttm_bo_vm_open`) |
+| 43821523037 (ffd22b5) | as shipped, two jobs | 7 | 7 |
+| | `-device bochs-display`, KMS | 1 | 1 (same driver, same oops) |
+
+Ruled out: a kernel parameter (nothing stops init from setting
+`panic_on_oops`); `props=dalvik.vm.stack-trace-dir=` (`/system/build.prop`
+sets it later; 3 of 4 boots still panicked). `bochs-display` with SeaBIOS'
+`vgabios-bochs-display.bin` (not shipped; Ubuntu's in the test) gives a
+480x800 `vesafb`, a portrait `gfx=vesa`.
+
+Caveats: the fix applies only to exactly this `ttm.ko`; any other file is
+left alone ("porty: ttm.ko is not the one known, left alone") and panics as
+before. A snapshot saved before the fix resumes a kernel that already loaded
+the unfixed module, so it must be made again. Any other WARN in this kernel
+is still an oops (the `smp=1` one in the table above looks like the same
+defect).
+
 **Next steps, in order of cost:**
 
 1. A debug build of QEMU-Wasm with `-sASSERTIONS=1` (and possibly
