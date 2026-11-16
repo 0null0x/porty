@@ -1,18 +1,33 @@
 // Porty page logic: wires the DOM to the emulator.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import { PARAM_HELP, parseConfig, requiredWasmMemoryMb } from './config.js';
+import { PARAM_HELP, PHONE_LEVELS, applyPhoneLevel, parseConfig, requiredWasmMemoryMb } from './config.js';
+import { RunLog, browserStorage, describeRun, nextLevel } from './crash-guard.js';
 import { Emulator, StartError, checkEnvironment } from './emulator.js';
 import { CONTROL, Input } from './input.js';
 import { SerialConsole } from './serial.js';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
-const cfg = parseConfig(location.search, {
+const parsedCfg = parseConfig(location.search, {
     userAgent: navigator.userAgent,
     maxTouchPoints: navigator.maxTouchPoints,
 });
 const baseUrl = new URL('.', location.href).href;
+
+// Did the last start end without the page noticing (Safari killed the tab)?
+// Then phones start with less memory; see crash-guard.js.
+const runLog = new RunLog(browserStorage());
+const lastRun = runLog.interrupted();
+const steps = parsedCfg.mobile && !parsedCfg.memoryExplicit;
+const decision = nextLevel(lastRun, runLog.level(), PHONE_LEVELS.length - 1);
+if (lastRun) {
+    runLog.acknowledge(lastRun);
+}
+if (steps && decision.level !== runLog.level()) {
+    runLog.setLevel(decision.level);
+}
+const cfg = applyPhoneLevel(parsedCfg, steps ? decision.level : 0);
 
 let emulator = null;
 let input = null;
@@ -23,13 +38,47 @@ let lastLogLines = [];
 
 // ---------------------------------------------------------------- intro ---
 function describeConfig() {
-    return `mem=${cfg.mem} tb=${cfg.tb} smp=${cfg.smp} cpu=${cfg.cpu} res=${cfg.width}x${cfg.height} ` +
-        `dpi=${cfg.dpi} gfx=${cfg.gfx} disk=${cfg.disk}` +
+    return `mem=${cfg.mem} tb=${cfg.tb} cache=${cfg.cache} smp=${cfg.smp} cpu=${cfg.cpu} ` +
+        `res=${cfg.width}x${cfg.height} dpi=${cfg.dpi} gfx=${cfg.gfx} disk=${cfg.disk}` +
         (cfg.usb ? '' : ' usb=0') + (cfg.jit >= 0 ? ` jit=${cfg.jit}` : '') +
-        (cfg.mobile ? ' (phone defaults)' : '');
+        (cfg.jitcap > 0 ? ` jitcap=${cfg.jitcap}` : '') +
+        (cfg.mobile ? (cfg.phoneLevel ? ` (phone, smaller memory step ${cfg.phoneLevel})` : ' (phone defaults)') : '');
+}
+
+/** Explain on the intro page why this start uses less memory, if it does. */
+function explainLastRun() {
+    const box = $('lastrun');
+    const text = $('lastrun-text');
+    const total = requiredWasmMemoryMb(cfg);
+    let message = '';
+    if (lastRun && lastRun.hidden) {
+        message = `The last start stopped ${describeRun(lastRun)} while Porty was in the background. ` +
+            'Browsers, above all on phones, free the memory of background tabs, so keep this ' +
+            'tab in front with the screen on while Android boots.';
+    } else if (lastRun && steps && decision.stepped) {
+        message = `The last start stopped ${describeRun(lastRun)}. On a phone that usually means ` +
+            'the browser ran out of memory for this tab and reloaded it. This start uses less: ' +
+            `${cfg.mem} MB of RAM for Android (about ${total} MB in all).`;
+    } else if (lastRun && steps) {
+        message = `The last start stopped ${describeRun(lastRun)}, already with the smallest memory ` +
+            'setting. Close other tabs and apps (or restart the phone) and try again.';
+    } else if (lastRun) {
+        message = `The last start did not finish (${describeRun(lastRun)}): the tab was closed, ` +
+            'reloaded or ran out of memory.';
+    } else if (cfg.phoneLevel) {
+        message = 'An earlier start was stopped by the browser, so Porty uses less memory on this ' +
+            `device: ${cfg.mem} MB of RAM for Android (about ${total} MB in all).`;
+    }
+    if (!message) {
+        return;
+    }
+    text.textContent = message;
+    $('lastrun-reset').hidden = !cfg.phoneLevel;
+    box.hidden = false;
 }
 
 function fillIntro() {
+    explainLastRun();
     $('cfgline').textContent = describeConfig();
     $('memnote').textContent =
         `${cfg.mem} MB of RAM is reserved for the guest (about ${requiredWasmMemoryMb(cfg)} MB in total).`;
@@ -74,7 +123,15 @@ function setPill(text, kind = '') {
     pill.dataset.kind = kind;
 }
 
+let loggedStage = '';
 function onStatus({ stage, detail, progress }) {
+    if (stage !== loggedStage) {
+        loggedStage = stage;
+        const memory = emulator && emulator.wasmMemoryMb
+            ? { wasmMb: emulator.wasmMemoryMb, mem: emulator.cfg.mem, tb: emulator.cfg.tb, cache: emulator.cfg.cache }
+            : {};
+        runLog.update({ stage, ...memory });
+    }
     $('stage-text').textContent = stage;
     $('stage-detail').textContent = detail || '';
     const bar = $('bar');
@@ -130,12 +187,17 @@ function fail(error) {
     $('failure').hidden = false;
     $('fail-message').textContent = error.message || String(error);
     $('fail-hint').textContent = error instanceof StartError ? error.hint : '';
+    runLog.end('failed');
     const notes = emulator ? emulator.notes : [];
+    const heap = emulator && emulator.heapStats ? emulator.heapStats() : null;
     $('fail-log').textContent = [
         `config: ${describeConfig()}`,
         `browser: ${navigator.userAgent}`,
         `crossOriginIsolated: ${globalThis.crossOriginIsolated}`,
         ...(emulator && emulator.wasmMemoryMb ? [`wasm memory: ${emulator.wasmMemoryMb} MiB`] : []),
+        ...(heap ? [`QEMU heap: ${heap.used} MiB in use, break at ${heap.brk} MiB` +
+            (heap.coroutines !== undefined ? `, ${heap.coroutines} coroutines` : '') +
+            (heap.jitAlive !== undefined ? `, ${heap.jitAlive} compiled blocks` : '')] : []),
         ...notes,
         '--- last serial output ---',
         ...lastLogLines.filter((l) => l.trim()).slice(-40),
@@ -152,6 +214,7 @@ function renderLoop() {
     let frames = 0;
     let lastBeat = -1;
     let beatAt = performance.now();
+    let lastLogged = 0;
 
     const tick = (now) => {
         if (app.dataset.state !== 'running') {
@@ -173,6 +236,15 @@ function renderLoop() {
         }
         if (now - lastStats >= 1000) {
             const disk = emulator.diskStats();
+            if (now - lastLogged >= 5000) {
+                lastLogged = now;
+                const heap = emulator.heapStats();
+                runLog.update({
+                    diskMb: Math.round(disk.megabytes),
+                    graphics: graphicsSeen,
+                    ...(heap ? { heapUsed: heap.used } : {}),
+                });
+            }
             const beat = display.heartbeat;
             if (beat !== lastBeat) {
                 lastBeat = beat;
@@ -203,6 +275,15 @@ async function start() {
     $('intro').hidden = true;
     $('machine').hidden = false;
     app.dataset.state = 'starting';
+    runLog.begin({
+        level: cfg.phoneLevel || 0,
+        mem: cfg.mem,
+        tb: cfg.tb,
+        cache: cfg.cache,
+        mobile: cfg.mobile,
+        stage: 'Starting',
+        hidden: document.visibilityState === 'hidden',
+    });
     fitCanvas();
     keepAwake();
 
@@ -227,6 +308,12 @@ async function start() {
         return;
     }
     app.dataset.state = 'running';
+    if (cfg.mobile && !cfg.memoryExplicit) {
+        // The browser may have refused the memory and QEMU fell back to a
+        // smaller step: the next step down must go below what really ran.
+        const ran = PHONE_LEVELS.findIndex((l) => l.mem === emulator.cfg.mem);
+        runLog.update({ level: Math.max(cfg.phoneLevel || 0, ran), mem: emulator.cfg.mem });
+    }
     emulator.display.onResize = fitCanvas;
     emulator.notes.forEach((n) => console.warn(n));
 
@@ -301,6 +388,10 @@ function bind() {
         }
     });
     $('fail-reload').addEventListener('click', () => location.reload());
+    $('lastrun-reset').addEventListener('click', () => {
+        runLog.setLevel(0);
+        location.reload();
+    });
     $('fail-copy').addEventListener('click', () => {
         const text = `${$('fail-message').textContent}\n${$('fail-hint').textContent}\n${$('fail-log').textContent}`;
         if (navigator.clipboard) {
@@ -313,8 +404,16 @@ function bind() {
         window.visualViewport.addEventListener('resize', fitCanvas);
     }
     document.addEventListener('visibilitychange', () => {
+        runLog.update({ hidden: document.visibilityState === 'hidden' });
         if (document.visibilityState === 'visible' && app.dataset.state === 'running') {
             keepAwake();
+        }
+    });
+    // Closing the tab or navigating away is not a crash.
+    window.addEventListener('pagehide', () => runLog.end('left'));
+    window.addEventListener('pageshow', (ev) => {
+        if (ev.persisted) {
+            runLog.resume();
         }
     });
     window.addEventListener('error', (ev) => {

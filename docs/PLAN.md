@@ -152,8 +152,10 @@ itself.
 
 | | guest RAM | TCG cache | WebAssembly memory |
 | --- | --- | --- | --- |
-| desktop | 1536 MiB | 384 MiB | 2300 MiB (as linked) |
-| phone | 1024 MiB | 256 MiB | 1600 MiB |
+| desktop | 1024 MiB | 384 MiB | 2300 MiB (as linked) |
+| phone | 768 MiB | 128 MiB | 1280 MiB |
+
+(Planned as 1536/1024 MiB of guest RAM; see "Findings" for why it is less.)
 
 The trade-off: Android 9 is uncomfortable below about 1 GB, and its `/data`
 is a tmpfs that eats into the same RAM; but Emscripten zero-fills anonymous
@@ -170,7 +172,10 @@ given and `sbrk` asks at run time *(source: emscripten 3.1.50
 `src/runtime_init_memory.js`)*. On desktop the linked size is kept, so the
 default desktop path is exactly QEMU-Wasm's tested configuration and does
 not depend on the patcher. If the browser refuses the allocation the page
-steps down (1280, 1024, 896, 768 MiB of guest RAM).
+steps down (desktops: 896, 768 MiB of guest RAM; phones: 640, 512 MiB).
+iOS does not refuse, it kills the tab later; so the page also records each
+start's progress in localStorage, and a phone whose last start never ended
+takes the next step down on its own (`web/js/crash-guard.js`).
 
 `build/versions.env` keeps the linked size at QEMU-Wasm's own 2300 MiB.
 
@@ -447,6 +452,32 @@ without the page bug first.
 - The boot test posts live progress as a commit status (`porty/boot ...`,
   including the share of lit pixels on the guest screen), because GitHub
   shows job logs and annotations only when a run ends.
+
+**Sixth round: memory, and the first iPhone try (2026-11-16).**
+
+- The earlier attempt to build without mimalloc never took effect: QEMU-Wasm's
+  toolchain image sets `-sMALLOC=mimalloc` in its `CFLAGS`, and the last
+  `-sMALLOC` on the link line wins. `build/build-qemu.sh` now ends with
+  `-sMALLOC=dlmalloc`. With mimalloc, 1280 to 1536 MiB WebAssembly memories
+  ran out at the first disk reads; with dlmalloc they boot.
+- `porty_heap_stats()` (patch 0007): with dlmalloc, QEMU needs about 290 MiB
+  beyond guest RAM, TCG cache and disk cache. About 115 MiB is there at
+  start; the other 170 MiB arrives in the first two minutes and stays. That
+  fits the coroutines: each had a 1 MiB C stack and a 1 MiB Asyncify buffer,
+  both committed when allocated and kept by the coroutine pool. Patch 0008
+  makes both 256 KiB and reports the coroutine count.
+- The first try in iPhone Safari ended in a forced restart while loading.
+  WebContent processes on iPhone have a soft memory limit of around 1.5 GB
+  (an Apple engineer in WebKit bug 277848), and the browser's own memory
+  comes on top of the WebAssembly memory: among other things every compiled
+  TB is a module and instance of its own, up to 15000 of them. Patch 0009
+  makes that cap adjustable (`?jitcap=`); phones keep 4000.
+- Phone defaults are now 768/128/16 (guest RAM, TCG cache, disk chunks), 1280
+  MiB of WebAssembly memory; after a killed start, 640/96/12, then 512/64/8.
+- Speed: `mem=768&tb=128&cache=16` reached Android's root shell in 8
+  minutes, against about 12 for the desktop defaults and more than 18 for
+  `mem=1024&tb=256&cache=32&wasmmem=1664`, whose heap had only 2 MiB of room
+  left (cause not known yet).
 
 **Next steps, in order of cost:**
 

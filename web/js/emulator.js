@@ -256,6 +256,14 @@ export class Emulator {
             // Runs on the page's thread after the module is instantiated and
             // before main() starts QEMU, so no code block has been compiled yet.
             onRuntimeInitialized: () => {
+                if (this.cfg.jitcap > 0) {
+                    if (typeof Module._porty_set_jit_max_instances === 'function') {
+                        const n = Module._porty_set_jit_max_instances(this.cfg.jitcap);
+                        this.notes.push(`At most ${n} compiled code blocks at once.`);
+                    } else {
+                        this.notes.push('This QEMU build has no adjustable JIT cap; ?jitcap= ignored.');
+                    }
+                }
                 if (this.cfg.jit < 0) {
                     return;
                 }
@@ -331,14 +339,29 @@ export class Emulator {
         };
     }
 
-    /** QEMU's heap in MiB (break, arena, used, free), or null on older builds. */
+    /**
+     * QEMU's heap in MiB (break, arena, used, free), with the number of
+     * coroutines and of compiled code blocks where the build reports them;
+     * null on builds without heap statistics.
+     */
     heapStats() {
-        if (!this.module || typeof this.module._porty_heap_stats !== 'function') {
+        const m = this.module;
+        if (!m || typeof m._porty_heap_stats !== 'function') {
             return null;
         }
-        const s = new Uint32Array(this.memory.buffer, this.module._porty_heap_stats() >>> 0, 4);
+        const s = new Uint32Array(this.memory.buffer, m._porty_heap_stats() >>> 0, 4);
         const mb = (v) => Math.round(v / 1048576);
-        return { brk: mb(s[0]), arena: mb(s[1]), used: mb(s[2]), free: mb(s[3]) };
+        const out = { brk: mb(s[0]), arena: mb(s[1]), used: mb(s[2]), free: mb(s[3]) };
+        if (typeof m._porty_coroutine_count === 'function') {
+            out.coroutines = m._porty_coroutine_count();
+        }
+        if (typeof m._porty_jit_stats === 'function') {
+            const j = new Uint32Array(this.memory.buffer, m._porty_jit_stats() >>> 0, 4);
+            out.jitAlive = j[0];
+            out.jitCap = j[1];
+            out.jitCompiled = j[3];
+        }
+        return out;
     }
 
     exitedWith(code) {

@@ -37,6 +37,11 @@ window.coi = {
     <p class="lead">A real 64-bit Android (Android-x86 9.0) running on your device, inside this
       browser tab. No app, no server: a PC is emulated by QEMU compiled to WebAssembly.</p>
 
+    <div id="lastrun" class="notice" role="status" hidden>
+      <p id="lastrun-text"></p>
+      <button id="lastrun-reset" type="button" hidden>Use the normal memory setting</button>
+    </div>
+
     <button id="start" class="primary" type="button" disabled>Start Android</button>
     <p id="precheck" class="note" role="status">Checking this browser...</p>
 

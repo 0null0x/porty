@@ -378,7 +378,9 @@ try {
         const fetched = snap.disk && typeof snap.disk === 'object' ? `${Math.round(snap.disk.megabytes)}MB` : '';
         if (Date.now() >= nextStatus) {
             nextStatus = Date.now() + 120000;
-            const heap = snap.heap ? ` heap${snap.heap.used}/${snap.heap.brk}MB` : '';
+            const heap = snap.heap ? ` heap${snap.heap.used}/${snap.heap.brk}MB` +
+                (snap.heap.coroutines !== undefined ? ` co${snap.heap.coroutines}` : '') +
+                (snap.heap.jitAlive !== undefined ? ` jit${snap.heap.jitAlive}/${snap.heap.jitCompiled}` : '') : '';
             await postStatus('pending', `${elapsed()} ${snap.screen} lit${snap.lit}%${heap} ${fetched} | ${lastLine.trim()}`);
         }
         if (notesAt.length && Date.now() >= notesAt[0]) {

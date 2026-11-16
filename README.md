@@ -15,8 +15,9 @@ iPhone**, with no jailbreak, no sideloading and no cloud streaming.
 
 Porty is experimental. In desktop Chrome, Android 9 currently boots as far
 as its boot animation, after about 25 to 30 minutes. Nobody has seen the
-home screen yet, and it has not been tried on an iPhone. See
-[Status](#status).
+home screen yet. The first try on an iPhone ended in a forced restart while
+Porty was loading, most likely for using more memory than iOS allows a tab;
+phones now get a smaller setting. See [Status](#status).
 
 ## Status
 
@@ -28,7 +29,16 @@ and SurfaceFlinger run, and the boot animation is drawn on the canvas
 after about 25 to 30 minutes (`gfx=vesa`, 800x600, above). Getting there
 took three fixes to QEMU-Wasm itself (patches 0005 and 0006) and one to the
 page; see [docs/PLAN.md](docs/PLAN.md), "Findings". Nobody has yet seen
-the home screen, and it has not been tried on an iPhone.
+the home screen.
+
+The first try in iPhone Safari (2026-11-16) ended in a forced restart while
+Porty was loading. iOS may kill a Safari tab that uses much more than about
+1.5 GB (WebKit bug 277848), and the phone setting then asked for up to
+1.66 GB of WebAssembly memory alone. Phones now give Android 768 MiB of RAM
+(1280 MiB of WebAssembly memory in all), QEMU's coroutines use a quarter of
+the memory they did, and phones keep fewer compiled code blocks. If Safari
+still reloads the tab, the page notices on the next visit, says how far the
+last start got, and starts with less memory.
 
 - [x] **M1** CI build is green and the site deploys
 - [x] **M2** desktop browser: kernel boot log appears on the serial console
@@ -66,7 +76,7 @@ for a much newer Android.
 | --- | --- | --- |
 | Android | 9 (Pie), 64-bit x86_64 | 4.4 (KitKat), 32-bit x86 |
 | Emulator | QEMU compiled to WebAssembly | v86 |
-| Safari on an iPhone | Not tried yet | Works |
+| Safari on an iPhone | First try ran out of memory | Works |
 | Boot time | 25 to 30 minutes to the boot animation (desktop Chrome) | About a minute (iPhone) |
 | Network inside Android | No | No |
 | Google Play | No | No |
@@ -115,9 +125,11 @@ screen). Below the screen are Android's **Back**, **Home** and **Recents**
 buttons, and **Keyboard** for the on-screen keyboard.
 
 **On an iPhone** (Safari 26 or later): use the plain address with no
-parameters, stay on Wi-Fi and keep the screen on. Nobody has tried this
-yet; if you do, please [open an issue](https://github.com/0null0x/porty/issues)
-and say how far it got.
+parameters, close other tabs and apps, stay on Wi-Fi, plug the phone in and
+keep Safari in front with the screen on. If Safari reloads the page, tap
+**Start Android** again: the page says how far the last start got and uses
+less memory this time. Please [open an issue](https://github.com/0null0x/porty/issues)
+and say how far it got, with that message.
 
 ### What you need
 
@@ -126,9 +138,9 @@ and say how far it got.
   browsers are untested. Private browsing and in-app browsers (inside chat
   or social apps) block service workers, so open the page in Safari or
   Chrome itself.
-- **Memory.** By default the tab reserves 2300 MiB of memory on a desktop
-  and 1664 MiB on a phone, 1024 MiB of which is Android's RAM. Close other
-  tabs and apps first.
+- **Memory.** By default the tab reserves 2300 MiB of memory on a desktop,
+  1024 MiB of which is Android's RAM, and 1280 MiB on a phone (768 MiB for
+  Android). Close other tabs and apps first.
 - **Bandwidth.** Tens of MB to start, then the parts of the roughly 950 MB
   system image that Android reads while booting (several hundred MB). Use
   Wi-Fi.
@@ -137,12 +149,13 @@ and say how far it got.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `mem` | 1024 | Guest RAM in MiB (512 to 3072; 1536 runs QEMU-Wasm out of memory) |
+| `mem` | 1024 (phones: 768) | Guest RAM in MiB (512 to 3072; 1536 runs QEMU-Wasm out of memory). Any memory parameter (`mem`, `tb`, `cache`, `wasmmem`) turns off the automatic smaller setting on phones |
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
-| `tb` | 384 (phones: 192) | TCG translation cache in MiB |
+| `tb` | 384 (phones: 128) | TCG translation cache in MiB |
 | `smp` | 1 | Guest CPUs, 1 to 4 (`smp=2` crashes QEMU-Wasm with this guest today) |
 | `usb` | on | `0` leaves out the USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
+| `jitcap` | 15000 (phones: 4000) | Compiled code blocks kept at once (256 to 15000). Each is a module in the browser's own memory |
 | `cpu` | `Nehalem` | QEMU CPU model (SSE4.2 and POPCNT, which Android's x86_64 ABI requires; no AVX) |
 | `res` | `480x800` | Guest resolution |
 | `dpi` | from `res` | Android screen density |
@@ -150,7 +163,7 @@ and say how far it got.
 | `disk` | `virtio` | `ide` presents the images as IDE CD-ROMs instead |
 | `setup` | off | `1` keeps Android's first-run setup wizard |
 | `serial` | off | `1` opens the serial console at start |
-| `cache`, `parallel` | 64 (phones: 32), 4 | 2 MiB disk chunks kept in RAM, concurrent chunk downloads |
+| `cache`, `parallel` | 64 (phones: 16), 4 | 2 MiB disk chunks kept in RAM, concurrent chunk downloads |
 | `fps` | 30 | Canvas refresh cap |
 | `append` | | Extra kernel arguments, for example `append=DEBUG=1` |
 | `cmdline` | | Replace the whole kernel command line |
@@ -196,8 +209,10 @@ service workers, so open the address in Safari or Chrome itself. To start
 over, open the page with `?nocoi=1`, then without it.
 
 **"The browser could not reserve WebAssembly memory", or the tab reloads by
-itself.** Close other tabs and apps, then try `?mem=768` (and, if needed,
-`?mem=768&tb=128`).
+itself.** Close other tabs and apps. On a phone, just start again: after a
+reload the page steps down to 640 and then 512 MiB of guest RAM by itself
+(**Use the normal memory setting** goes back). On a desktop, try `?mem=768`
+(and, if needed, `?mem=768&tb=128&cache=16`).
 
 **"QEMU exited with status 1".** The last serial lines name the option QEMU
 did not like. Remove custom `qemu=`/`cpu=` parameters first.
@@ -224,8 +239,8 @@ Problems building or deploying your own copy are covered in
 ## FAQ
 
 **Can Porty run Android on an iPhone?** That is what it is built for, but
-not yet: see [Status](#status) for how far Android gets today. It has not
-been tried in iPhone Safari.
+not yet: see [Status](#status) for how far Android gets today. The first
+try in iPhone Safari ran out of memory; phones now use much less.
 
 **Do I need to jailbreak, sideload or install an app?** No. Porty is a web
 page that runs on the browser's own WebAssembly engine, so it needs no App

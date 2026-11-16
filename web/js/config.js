@@ -11,22 +11,38 @@ export const WASM_PAGE = 65536;
 // about 290 MiB through Android's boot (2026-11-16); 352 leaves room.
 export const QEMU_OVERHEAD_MB = 352;
 
+// Phones, from the default down: what a start uses after Safari killed the
+// previous one (see crash-guard.js), and the fallbacks when the browser
+// refuses the WebAssembly memory.  iOS reloads a tab whose memory goes much
+// past 1.5 GB (WebKit bug 277848), and the browser's own share (compiled
+// code, the page) comes on top of the WebAssembly memory, so phones keep
+// the guest small.  In the boot tests mem=768 reached Android's shell
+// sooner than mem=1024 did.
+export const PHONE_LEVELS = [
+    { mem: 768, tb: 128, cache: 16 },
+    { mem: 640, tb: 96, cache: 12 },
+    { mem: 512, tb: 64, cache: 8 },
+];
+
 const DEFAULTS = {
     // 1536 MiB ran QEMU-Wasm out of its 2300 MiB at the virtio disk probe
     // (boot tests, 2026-11-15); 1024 boots through to Android's init.
     // cache: 2 MiB disk chunks kept in RAM. With 16, a boot re-downloaded
     // 1.25 GB for a 943 MB image and reached each stage later than with 64.
-    desktop: { mem: 1024, tb: 384, cache: 64 },
-    mobile: { mem: 1024, tb: 192, cache: 32 },
+    // jitcap: compiled code blocks alive at once (0: the build's 15000).
+    // Each is a module in the browser's own heap, so phones keep fewer.
+    desktop: { mem: 1024, tb: 384, cache: 64, jitcap: 0 },
+    mobile: { ...PHONE_LEVELS[0], jitcap: 4000 },
 };
 
 export const PARAM_HELP = [
-    ['mem', 'guest RAM in MiB (512-3072). Default 1024 (1536 runs out of WebAssembly memory).'],
+    ['mem', 'guest RAM in MiB (512-3072). Default 1024, phones 768 (1536 runs out of WebAssembly memory).'],
     ['wasmmem', 'size of the WebAssembly memory in MiB. Default: sized to fit.'],
-    ['tb', 'TCG translation cache in MiB (64-1024).'],
+    ['tb', 'TCG translation cache in MiB (64-1024). Default 384, phones 128.'],
     ['smp', 'guest CPUs, 1-4 (default 1).'],
     ['usb', '0 leaves out the USB tablet (no touch input; for diagnosis).'],
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
+    ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
     ['dpi', 'Android screen density (default derived from res).'],
@@ -34,7 +50,7 @@ export const PARAM_HELP = [
     ['disk', '"virtio" (default) or "ide".'],
     ['setup', '1 keeps the Android setup wizard (default: skipped).'],
     ['serial', '1 opens the serial console panel at start.'],
-    ['cache', '2 MiB disk chunks kept in RAM (default 64, phones 32).'],
+    ['cache', '2 MiB disk chunks kept in RAM (default 64, phones 16).'],
     ['parallel', 'concurrent chunk downloads (default 4).'],
     ['prefetch', '1 warms the browser cache with the first chunks in the background.'],
     ['append', 'extra kernel command line arguments.'],
@@ -107,12 +123,15 @@ export function parseConfig(search, env = {}) {
         wasmmem: intParam(params, 'wasmmem', 0, 512, 4032),
         wasmmemExplicit: params.has('wasmmem'),
         memExplicit: params.has('mem'),
+        // Any memory parameter in the URL: then phones never step down.
+        memoryExplicit: ['mem', 'tb', 'cache', 'wasmmem'].some((n) => params.has(n)),
         // One CPU by default: with -smp 2, QEMU-Wasm dies within seconds
         // (first boot test, 2026-11-15).
         smp: intParam(params, 'smp', 1, 1, 4),
         usb: boolParam(params, 'usb', true),
         // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
         jit: intParam(params, 'jit', -1, -1, 2147483647),
+        jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
         cpu: /^[A-Za-z0-9_,+=.-]+$/.test(cpu) ? cpu : 'Nehalem',
         width,
         height,
@@ -159,11 +178,26 @@ export function chooseWasmMemoryMb(cfg, builtMb, chunkBytes = 2 * MIB) {
 }
 
 /**
+ * A phone config with the memory of PHONE_LEVELS[level] (clamped to the
+ * list).  Desktops and URLs that set any memory parameter keep theirs.
+ */
+export function applyPhoneLevel(cfg, level) {
+    if (!cfg.mobile || cfg.memoryExplicit || !(level > 0)) {
+        return cfg;
+    }
+    const step = PHONE_LEVELS[Math.min(PHONE_LEVELS.length - 1, Math.floor(level))];
+    return { ...cfg, ...step, phoneLevel: PHONE_LEVELS.indexOf(step) };
+}
+
+/**
  * Smaller configurations to fall back to when the browser refuses to
- * allocate the WebAssembly memory.  Returns a list of {mem, tb} pairs, each
- * strictly smaller than the previous one.
+ * allocate the WebAssembly memory.  Returns a list of {mem, tb} pairs (on
+ * phones {mem, tb, cache}), each strictly smaller than the previous one.
  */
 export function fallbackLadder(cfg) {
+    if (cfg.mobile) {
+        return PHONE_LEVELS.filter((step) => step.mem < cfg.mem).map((step) => ({ ...step }));
+    }
     const steps = [];
     for (const mem of [1536, 1280, 1024, 896, 768]) {
         if (mem < cfg.mem) {

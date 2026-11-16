@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
 import {
-    chooseWasmMemoryMb, fallbackLadder, isMobile, parseConfig, requiredWasmMemoryMb,
+    PHONE_LEVELS, applyPhoneLevel, chooseWasmMemoryMb, fallbackLadder, isMobile, parseConfig,
+    requiredWasmMemoryMb,
 } from '../web/js/config.js';
+import { LEVEL_KEY, RUN_KEY, RunLog, describeRun, nextLevel } from '../web/js/crash-guard.js';
 import { buildKernelCmdline, buildQemuArgs, vesaMode } from '../web/js/qemu-args.js';
 import { CODE_TO_EVDEV, KEY, charToKey } from '../web/js/keymap.js';
 import { Display } from '../web/js/display.js';
@@ -34,13 +36,15 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(parseConfig('?jit=-5', {}).jit, -1);
     assert.equal(parseConfig('?jit=99999999999', {}).jit, 2147483647);
     const phone = parseConfig('', { userAgent: IPHONE });
-    assert.deepEqual([phone.mem, phone.tb], [1024, 192]);
+    assert.deepEqual([phone.mem, phone.tb, phone.cache, phone.jitcap], [768, 128, 16, 4000]);
+    assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
+    assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
 
     // desktop keeps the linked size (no patching) when the config fits
     assert.equal(requiredWasmMemoryMb(desktop), 1920);
     assert.equal(chooseWasmMemoryMb(desktop, 2300), 2300);
     // phones get the smallest memory that fits
-    assert.equal(chooseWasmMemoryMb(phone, 2300), 1664);
+    assert.equal(chooseWasmMemoryMb(phone, 2300), 1280);
     // a bigger guest grows past the linked size
     assert.equal(chooseWasmMemoryMb(parseConfig('?mem=2560', { userAgent: MAC }), 2300), 3456);
     // explicit override wins, rounded to 64 MiB
@@ -62,6 +66,73 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual(ladder.map((s) => s.mem), [1280, 1024, 896, 768]);
     assert.deepEqual(fallbackLadder(desktop).map((s) => s.mem), [896, 768]);
     assert.ok(ladder.every((s) => s.tb <= desktop.tb));
+    // phones fall back through their memory steps, caches included
+    assert.deepEqual(fallbackLadder(phone), PHONE_LEVELS.slice(1));
+    assert.deepEqual(fallbackLadder(parseConfig('?mem=1024', { userAgent: IPHONE })).map((s) => s.mem), [768, 640, 512]);
+
+    // phone memory steps after a killed start
+    assert.deepEqual(PHONE_LEVELS[0], { mem: phone.mem, tb: phone.tb, cache: phone.cache });
+    const step1 = applyPhoneLevel(phone, 1);
+    assert.deepEqual([step1.mem, step1.tb, step1.cache, step1.phoneLevel], [640, 96, 12, 1]);
+    assert.equal(requiredWasmMemoryMb(step1), 1152);
+    assert.equal(applyPhoneLevel(phone, 9).mem, 512, 'clamped to the last step');
+    assert.equal(applyPhoneLevel(phone, 0), phone);
+    assert.equal(applyPhoneLevel(desktop, 2), desktop, 'desktops never step down');
+    const pinned = parseConfig('?tb=256', { userAgent: IPHONE });
+    assert.equal(pinned.memoryExplicit, true);
+    assert.equal(applyPhoneLevel(pinned, 2), pinned, 'URL memory parameters win');
+    assert.equal(phone.memoryExplicit, false);
+}
+
+// --- crash guard (run log in localStorage) -------------------------------------
+{
+    const store = new Map();
+    const storage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
+    let t = 1_000_000;
+    const log = new RunLog(storage, () => t);
+    assert.equal(log.interrupted(), null);
+    assert.equal(log.level(), 0);
+
+    log.begin({ level: 0, mem: 768, stage: 'Starting', hidden: false });
+    t += 6 * 60000;
+    log.update({ stage: 'Booting Android', wasmMb: 1280, heapUsed: 1150, diskMb: 300 });
+    // A new page load (after Safari killed the tab) sees the unfinished run.
+    const next = new RunLog(storage, () => t + 1000);
+    const run = next.interrupted();
+    assert.equal(run.stage, 'Booting Android');
+    assert.equal(describeRun(run), 'after 6 min, at "Booting Android", with 768 MB guest RAM, ' +
+        '1280 MB WebAssembly memory (1150 MB in use), 300 MB of the system image read');
+    assert.deepEqual(nextLevel(run, 0, 2), { level: 1, stepped: true });
+    assert.deepEqual(nextLevel({ ...run, level: 2 }, 2, 2), { level: 2, stepped: false }, 'no step below the last');
+    assert.deepEqual(nextLevel({ ...run, hidden: true }, 0, 2), { level: 0, stepped: false }, 'killed in the background');
+    assert.deepEqual(nextLevel(null, 1, 2), { level: 1, stepped: false });
+    next.acknowledge(run);
+    assert.equal(new RunLog(storage, () => t).interrupted(), null, 'reported once');
+    next.setLevel(1);
+    assert.equal(JSON.parse(store.get(LEVEL_KEY)), 1);
+    assert.equal(new RunLog(storage).level(), 1);
+
+    // Runs the page saw end are not reported; neither are stale ones.
+    const a = new RunLog(storage, () => t);
+    a.begin({ stage: 'Starting' });
+    a.end('left');
+    assert.equal(a.interrupted(), null);
+    a.resume();
+    assert.equal(JSON.parse(store.get(RUN_KEY)).ended, false, 'back from the bfcache');
+    a.end('failed');
+    a.update({ stage: 'ignored' });
+    assert.equal(JSON.parse(store.get(RUN_KEY)).stage, 'Starting');
+    const b = new RunLog(storage, () => t);
+    b.begin({ stage: 'Starting' });
+    assert.equal(new RunLog(storage, () => t + 13 * 3600 * 1000).interrupted(), null);
+    // No storage at all (private browsing): everything is a no-op.
+    const none = new RunLog(null);
+    none.begin({});
+    none.update({ stage: 'x' });
+    assert.equal(none.interrupted(), null);
+    assert.equal(none.level(), 0);
+    store.set(RUN_KEY, '{not json');
+    assert.equal(new RunLog(storage).interrupted(), null);
 }
 
 // --- kernel command line and argv --------------------------------------------------

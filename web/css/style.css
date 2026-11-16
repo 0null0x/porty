@@ -37,6 +37,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .lead { margin: 0 0 1.25rem; color: var(--muted); }
 .note { color: var(--muted); font-size: 0.875rem; }
 .credits { color: var(--muted); font-size: 0.8125rem; margin-top: 1.5rem; }
+.notice {
+    border: 1px solid #e0b252;
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    margin: 0 0 1rem;
+    font-size: 0.9375rem;
+}
+.notice p { margin: 0 0 0.5rem; }
+.notice p:last-child { margin: 0; }
 
 button {
     font: inherit;

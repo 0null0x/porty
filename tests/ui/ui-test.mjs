@@ -175,6 +175,53 @@ try {
     await page.waitForFunction(() => /disk \d+ MB/.test(document.getElementById('stats').textContent), { timeout: 5000 });
     ok(`synchronous XHR from a worker fetches a disk chunk (${p.chunk.bytes} bytes)`);
 
+    // 9. crash guard: the running start is on record for the next visit
+    const crumb = await page.evaluate(() => JSON.parse(localStorage.getItem('porty.run')));
+    assert.equal(crumb.ended, false);
+    assert.equal(crumb.stage, 'Booting Android');
+    assert.equal(crumb.wasmMb, p.wasmMemoryMb);
+    ok('a running start is recorded in localStorage');
+    await page.close();
+
+    // An iPhone comes back after Safari killed the tab mid-boot: one memory
+    // step down, explained on the intro page, and a way back.  (Memory
+    // parameters in the URL turn the steps off, so only without a query.)
+    if (!query) {
+        const phone = await browser.newPage();
+        await phone.setViewport({ width: 390, height: 844, hasTouch: true });
+        phone.on('pageerror', (e) => errors.push(String(e)));
+        phone.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+        await phone.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 ' +
+            '(KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1');
+        await phone.evaluateOnNewDocument(() => {
+            if (sessionStorage.getItem('ui-test-crumb')) {
+                return;
+            }
+            sessionStorage.setItem('ui-test-crumb', '1');
+            const now = Date.now();
+            localStorage.removeItem('porty.phoneLevel');
+            localStorage.setItem('porty.run', JSON.stringify({
+                level: 0, mem: 768, tb: 128, cache: 16, mobile: true, stage: 'Booting Android',
+                hidden: false, wasmMb: 1280, heapUsed: 1150, diskMb: 300,
+                startedAt: now - 6 * 60000, updatedAt: now, ended: false,
+            }));
+        });
+        await phone.goto(url + query, { waitUntil: 'load' });
+        await phone.waitForFunction(() => !document.getElementById('lastrun').hidden, { timeout: 10000 });
+        const notice = await phone.$eval('#lastrun-text', (e) => e.textContent);
+        assert.match(notice, /stopped after 6 min, at "Booting Android", with 768 MB guest RAM, 1280 MB WebAssembly memory \(1150 MB in use\)/);
+        assert.match(notice, /This start uses less: 640 MB of RAM for Android \(about 1152 MB in all\)/);
+        assert.match(await phone.$eval('#cfgline', (e) => e.textContent), /mem=640 tb=96 cache=12 .*jitcap=4000/);
+        assert.equal(await phone.evaluate(() => localStorage.getItem('porty.phoneLevel')), '1');
+        assert.equal(await phone.evaluate(() => JSON.parse(localStorage.getItem('porty.run')).ended), 'killed');
+        ok('after a killed start an iPhone gets one memory step less, explained on the page');
+        await Promise.all([phone.waitForNavigation({ waitUntil: 'load' }), phone.click('#lastrun-reset')]);
+        await phone.waitForFunction(() => document.getElementById('cfgline').textContent.length > 0, { timeout: 10000 });
+        assert.equal(await phone.$eval('#lastrun', (e) => e.hidden), true);
+        assert.match(await phone.$eval('#cfgline', (e) => e.textContent), /^mem=768 tb=128 cache=16 /);
+        ok('"Use the normal memory setting" goes back to the phone defaults');
+    }
+
     assert.deepEqual(errors, [], 'page errors');
     ok('no page errors');
 } finally {
