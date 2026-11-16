@@ -474,10 +474,22 @@ without the page bug first.
   makes that cap adjustable (`?jitcap=`); phones keep 4000.
 - Phone defaults are now 768/128/16 (guest RAM, TCG cache, disk chunks), 1280
   MiB of WebAssembly memory; after a killed start, 640/96/12, then 512/64/8.
-- Speed: `mem=768&tb=128&cache=16` reached Android's root shell in 8
-  minutes, against about 12 for the desktop defaults and more than 18 for
-  `mem=1024&tb=256&cache=32&wasmmem=1664`, whose heap had only 2 MiB of room
-  left (cause not known yet).
+- Speed does not depend much on these settings, but runners vary. Times to
+  Android's root shell and to the boot animation (lit pixels on the canvas)
+  on the dlmalloc build, one run each:
+
+  | guest RAM / TCG cache / disk chunks | WebAssembly memory | shell | boot animation |
+  | --- | --- | --- | --- |
+  | 1024 / 384 / 64 (desktop default) | 2300 MiB | 8 min | 25 min |
+  | 1024 / 192 / 32 | 2300 MiB | 8 min | 29 min |
+  | 768 / 128 / 16 (phone default) | 1280 MiB | 8 min | 31 min |
+  | 768 / 384 / 64 | 2300 MiB | 10 min | not by 31 min |
+  | 1024 / 256 / 32 | 1664 MiB, 2 MiB of it left | 20 min | not by 55 min |
+
+  (Headless Chrome counts as a desktop, so only an explicit `wasmmem` makes
+  the memory smaller.) The last one stands out; its heap had almost no room
+  left, but the cause is not known yet. A 16-chunk disk cache re-downloads a
+  lot (2.4 GB in 53 minutes) without slowing the boot much.
 
 **Next steps, in order of cost:**
 
