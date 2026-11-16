@@ -331,6 +331,16 @@ export class Emulator {
         };
     }
 
+    /** QEMU's heap in MiB (break, arena, used, free), or null on older builds. */
+    heapStats() {
+        if (!this.module || typeof this.module._porty_heap_stats !== 'function') {
+            return null;
+        }
+        const s = new Uint32Array(this.memory.buffer, this.module._porty_heap_stats() >>> 0, 4);
+        const mb = (v) => Math.round(v / 1048576);
+        return { brk: mb(s[0]), arena: mb(s[1]), used: mb(s[2]), free: mb(s[3]) };
+    }
+
     exitedWith(code) {
         this.exited = true;
         this.fatal(code === 0

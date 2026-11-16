@@ -310,6 +310,7 @@ try {
                     failure: $('app').dataset.state === 'failed' ? text('failure') : '',
                     serial: globalThis.__cap ? globalThis.__cap.splice(0).join('') : '',
                     disk,
+                    heap: e && e.module && e.heapStats ? e.heapStats() : null,
                     screen: c ? `${c.width}x${c.height}` : '',
                     exited: e ? !!e.exited : false,
                     args: e && e.args ? e.args.join(' ') : '',
@@ -352,7 +353,8 @@ try {
 
         const statusLine = `state=${snap.state} screen=${snap.screen} stage="${snap.stage}" ` +
             `detail="${snap.detail}" stats="${snap.stats}" log="${snap.logline}"` +
-            (snap.disk ? ` disk=${JSON.stringify(snap.disk)}` : '');
+            (snap.disk ? ` disk=${JSON.stringify(snap.disk)}` : '') +
+            (snap.heap ? ` heap=${JSON.stringify(snap.heap)}` : '');
         if (statusLine !== lastStatusLine || Date.now() - lastStatusTime > 60000) {
             log(statusLine);
             lastStatusLine = statusLine;
@@ -376,7 +378,8 @@ try {
         const fetched = snap.disk && typeof snap.disk === 'object' ? `${Math.round(snap.disk.megabytes)}MB` : '';
         if (Date.now() >= nextStatus) {
             nextStatus = Date.now() + 120000;
-            await postStatus('pending', `${elapsed()} ${snap.screen} lit${snap.lit}% ${fetched} | ${lastLine.trim()}`);
+            const heap = snap.heap ? ` heap${snap.heap.used}/${snap.heap.brk}MB` : '';
+            await postStatus('pending', `${elapsed()} ${snap.screen} lit${snap.lit}%${heap} ${fetched} | ${lastLine.trim()}`);
         }
         if (notesAt.length && Date.now() >= notesAt[0]) {
             notesAt.shift();
