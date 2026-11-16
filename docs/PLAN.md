@@ -475,21 +475,36 @@ without the page bug first.
 - Phone defaults are now 768/128/16 (guest RAM, TCG cache, disk chunks), 1280
   MiB of WebAssembly memory; after a killed start, 640/96/12, then 512/64/8.
 - Speed does not depend much on these settings, but runners vary. Times to
-  Android's root shell and to the boot animation (lit pixels on the canvas)
-  on the dlmalloc build, one run each:
+  Android's root shell and to the boot animation (screenshots, so within a
+  few minutes) on the dlmalloc build, one run each:
 
   | guest RAM / TCG cache / disk chunks | WebAssembly memory | shell | boot animation |
   | --- | --- | --- | --- |
   | 1024 / 384 / 64 (desktop default) | 2300 MiB | 8 min | 25 min |
-  | 1024 / 192 / 32 | 2300 MiB | 8 min | 29 min |
-  | 768 / 128 / 16 (phone default) | 1280 MiB | 8 min | 31 min |
-  | 768 / 384 / 64 | 2300 MiB | 10 min | not by 31 min |
-  | 1024 / 256 / 32 | 1664 MiB, 2 MiB of it left | 20 min | not by 55 min |
+  | 1024 / 192 / 32 | 2300 MiB | 8 min | 30 min |
+  | 768 / 128 / 16 (phone default) | 1280 MiB | 8 min | 30 min |
+  | 768 / 384 / 64 | 2300 MiB | 13 min | 40 min |
+  | 1024 / 256 / 32 | 1664 MiB, 2 MiB of it left | 23 min | not by 60 min |
 
   (Headless Chrome counts as a desktop, so only an explicit `wasmmem` makes
-  the memory smaller.) The last one stands out; its heap had almost no room
-  left, but the cause is not known yet. A 16-chunk disk cache re-downloads a
-  lot (2.4 GB in 53 minutes) without slowing the boot much.
+  the memory smaller.) The last run was slow throughout, with no download
+  errors and nothing waiting on the network: it looked up a quarter as many
+  disk chunks per minute as the others, so the guest itself ran slowly. The
+  likely reason: QEMU grows each softmmu TLB with `g_try_new` and quietly
+  keeps a smaller one when that fails (`accel/tcg/cputlb.c`), so a full heap
+  means small TLBs and many more slow page-table walks. The page's memory
+  estimate keeps room for that. A 16-chunk disk cache re-downloads a lot
+  (2.4 GB in 53 minutes) without slowing the boot much.
+- With patch 0008 the phone setting's heap is 1035 MiB instead of 1216 and
+  the desktop default's 1648 instead of 1836; about 120 coroutines exist
+  after two minutes. With 768/128/16, at 58 minutes system_server was still
+  in PackageManagerService's first-boot work, with the boot animation up.
+- Patch 0009's counters show the compiled-block cap reached within two
+  minutes (15000 on desktop, 4000 on the phone setting), after which the
+  number of compiled blocks stopped growing for minutes at a time. Dropped
+  blocks only count as gone once the JavaScript garbage collector has
+  reclaimed them, and until then new hot code runs in the interpreter. Not
+  waiting for the collector may be a large speed-up; next experiment.
 
 **Next steps, in order of cost:**
 
