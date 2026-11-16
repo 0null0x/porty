@@ -44,6 +44,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { cpus } from 'node:os';
 import path from 'node:path';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
@@ -92,6 +93,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // eslint-disable-next-line no-control-regex
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b[()][A-Z0-9]/g, '');
 
+// Runners differ by more than 2x; compare times only on the same model.
+const hostCpu = `${(cpus()[0] || {}).model || 'unknown CPU'} x${cpus().length}`.replace(/\s+/g, ' ');
+log(`host CPU: ${hostCpu}`);
 const browser = await puppeteer.launch({
     executablePath: process.env.CHROME || '/usr/bin/google-chrome',
     headless: true,
@@ -651,7 +655,7 @@ async function inputProbe() {
     // a little, which the "quiet" option shows.
     await send('renice -n -20 -p $$ > /dev/null; echo NICE:$(cut -d" " -f19 /proc/$$/stat):END\r');
     await sleep(4000);
-    const result = { conditions, query: String(params), calibrationS: await calibrate('before the tap') };
+    const result = { conditions, query: String(params), hostCpu, calibrationS: await calibrate('before the tap') };
     // The guest's clock against ours, for the times in the event log: a
     // line written to the log now carries the log's time stamp.  The line
     // is written within moments of the send; reading it back takes longer.
@@ -1179,7 +1183,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
         `- Result: **${verdict}** after ${elapsed()} (page state \`${finalState}\`)`,
         `- Screen: ${s.screen || 'n/a'}; last stage: ${s.stage || 'n/a'} ${s.detail || ''}`,
         `- ${s.memory || ''}`,
-        `- Conditions: ${conditions}`,
+        `- Conditions: ${conditions}; host CPU: ${hostCpu}`,
         ...(launchResult ? [`- ${launchLine}`, '', '```json', JSON.stringify(launchResult, null, 1), '```'] : []),
         '',
         'Last serial lines:',
