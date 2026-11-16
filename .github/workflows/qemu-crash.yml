@@ -1,0 +1,163 @@
+# QEMU crash hunt: QEMU-Wasm's threads sometimes die of an uncaught
+# Emscripten longjmp ("Uncaught Infinity") or "memory access out of bounds".
+#
+#   mode=glue    prints the QEMU-Wasm build of this branch's patches (out.js,
+#                the worker glue and the .wasm, gzip+base64 between marker
+#                lines) so that call frames can be mapped to code; the
+#                Pages site and artifact downloads are not reachable from
+#                every place the logs are read.
+#   mode=stress  boots this branch's site (assembled from the caches, as
+#                branch-boot-test.yml does) in several jobs at once, drives
+#                taps, clicks, swipes and the Home and Back keys after the
+#                boot (STRESS_MINUTES of the boot test) or leaves the guest
+#                alone, and counts worker exceptions.  With trace on, the
+#                glue is instrumented (tests/boot/longjmp-trace.mjs) so that
+#                a longjmp that no setjmp frame will catch prints where it
+#                was thrown from.
+#
+# A push of this file or of tests/boot/qemu-crash.json runs what that JSON
+# file says; a manual start takes the same settings as inputs:
+#   gh workflow run qemu-crash.yml -R <owner>/<repo> --ref swarm/qemu-crash \
+#     -f mode=stress -f variants='["full-input","resume-input"]' -f reps='[1,2,3]'
+#
+# The run never fails, because every failed run emails the repository owner.
+# Verdicts are commit statuses ("porty/crash ...") and job summaries.
+name: QEMU crash
+
+on:
+  push:
+    branches: [swarm/qemu-crash]
+    paths:
+      - .github/workflows/qemu-crash.yml
+      - tests/boot/qemu-crash.json
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: glue or stress
+        type: string
+        default: stress
+      variants:
+        description: 'JSON list of variants: full-input, full-quiet, resume-input, resume-quiet (a suffix ":<query>" adds page parameters)'
+        type: string
+        default: '["full-input","full-quiet","resume-input","resume-quiet"]'
+      reps:
+        description: JSON list, one job per element and variant
+        type: string
+        default: '[1,2]'
+      minutes:
+        description: Minutes per job
+        type: number
+        default: 70
+      stress_minutes:
+        description: Minutes of input after the boot (the -input variants)
+        type: number
+        default: 45
+      trace:
+        description: Instrument the glue to print where an uncaught longjmp was thrown (1 or 0)
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: qemu-crash-${{ github.ref }}-${{ github.event_name }}-${{ inputs.mode }}-${{ inputs.variants }}-${{ inputs.reps }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  setup:
+    name: Settings
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.s.outputs.mode }}
+      variants: ${{ steps.s.outputs.variants }}
+      reps: ${{ steps.s.outputs.reps }}
+      minutes: ${{ steps.s.outputs.minutes }}
+      stress_minutes: ${{ steps.s.outputs.stress_minutes }}
+      trace: ${{ steps.s.outputs.trace }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Settings
+        id: s
+        env:
+          EVENT: ${{ github.event_name }}
+          I_MODE: ${{ inputs.mode }}
+          I_VARIANTS: ${{ inputs.variants }}
+          I_REPS: ${{ inputs.reps }}
+          I_MINUTES: ${{ inputs.minutes }}
+          I_STRESS: ${{ inputs.stress_minutes }}
+          I_TRACE: ${{ inputs.trace }}
+        run: |
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          print('mode=' + os.environ['I_MODE'])
+          print('variants=' + json.dumps(json.loads(os.environ['I_VARIANTS'])))
+          print('reps=' + json.dumps(json.loads(os.environ['I_REPS'])))
+          print('minutes=%d' % int(float(os.environ['I_MINUTES'] or 70)))
+          print('stress_minutes=%d' % int(float(os.environ['I_STRESS'] or 45)))
+          print('trace=' + ('1' if os.environ['I_TRACE'] in ('1', 'true') else '0'))
+          EOF
+          else
+            python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          c = json.load(open('tests/boot/qemu-crash.json'))
+          print('mode=' + c.get('mode', 'stress'))
+          print('variants=' + json.dumps(c.get('variants', ['full-input'])))
+          print('reps=' + json.dumps(c.get('reps', [1])))
+          print('minutes=%d' % int(c.get('minutes', 70)))
+          print('stress_minutes=%d' % int(c.get('stress_minutes', 45)))
+          print('trace=' + ('1' if c.get('trace', True) else '0'))
+          EOF
+          fi
+          cat "$GITHUB_OUTPUT"
+
+  glue:
+    name: Print the QEMU-Wasm build
+    needs: setup
+    if: needs.setup.outputs.mode == 'glue'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Print
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: |
+          cd out/qemu
+          ls -l
+          sha256sum out.js qemu-system-x86_64.worker.js qemu-system-x86_64.wasm
+          for f in out.js qemu-system-x86_64.worker.js qemu-system-x86_64.wasm; do
+            echo "-----BEGIN PORTY FILE $f-----"
+            gzip -9c "$f" | base64 -w 50000
+            echo "-----END PORTY FILE-----"
+          done
