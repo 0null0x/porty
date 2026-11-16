@@ -6,7 +6,9 @@ web page would use (as tests/provision-native.py does, whose boot loop this
 uses), waits for the home screen, and then starts a list of apps one after
 the other with "am start -W", twice round.  After every start it records
 
-  - am's TotalTime and WaitTime (guest milliseconds) and the host's seconds;
+  - the time until the app was drawn: am's TotalTime, or Android's
+    am_activity_launch_time event when am gave up waiting (guest
+    milliseconds), and the host's seconds;
   - whether the app's process was still there from the round before;
   - MemAvailable, swap in use, the load average;
   - what the memory pressure cost: major page faults, sectors read from the
@@ -59,6 +61,11 @@ FACTS = (
     ("am_config", "dumpsys activity settings | grep -e max_cached -e low_ram -e CUR_MAX -e trim; dumpsys activity oom | head -24"),
     ("packages", "pm list packages | sort | tr '\\n' ' '"),
     ("meminfo_boot", "cat /proc/meminfo | head -24"),
+    ("kmodules", "cat /proc/version; zcat /proc/config.gz | grep -e MODVERSIONS -e MODULE_SIG -e MODULE_FORCE -e 'CONFIG_CMA' -e LOCALVERSION"
+                 " -e RANDSTRUCT -e RETPOLINE -e CONFIG_CC_ -e CONFIG_GCC -e CONFIG_CLANG -e CONFIG_BLK_DEV_RAM -e CONFIG_CRYPTO_LZO"
+                 " -e CONFIG_ZBUD -e CONFIG_Z3FOLD -e MODULE_UNLOAD -e CONFIG_TRIM_UNUSED; modinfo /system/lib/modules/*/kernel/crypto/lz4.ko"),
+    ("dexopt", "dumpsys package dexopt | grep -A3 -e 'gallery3d\\]' -e 'settings\\]' -e 'calculator2\\]' -e 'deskclock\\]' -e 'systemui\\]'"
+               " -e 'launcher3\\]' | cut -c1-200; ls /system/app/Gallery2 /system/app/Gallery2/oat/* /system/framework/x86_64 | head -30 | tr '\\n' ' '"),
 )
 
 METRICS_A = ("grep -e MemFree -e MemAvailable -e '^Cached' -e Shmem: -e SwapTotal -e SwapFree -e 'Active(anon)'"
@@ -69,7 +76,7 @@ METRICS_A = ("grep -e MemFree -e MemAvailable -e '^Cached' -e Shmem: -e SwapTota
 EVENTS = ("am_proc_start", "am_proc_died", "am_kill", "am_low_memory", "am_anr", "am_crash", "am_pss")
 METRICS_B = ("logcat -b events -d > /data/local/tmp/porty-ev.txt; for e in " + " ".join(EVENTS) + ";"
              " do echo $e: $(grep -c $e /data/local/tmp/porty-ev.txt); done;"
-             " echo lmkd: $(logcat -b main,system -d -s lowmemorykiller | grep -c -i -e 'kill')")
+             " echo lmkd: $(logcat -b main,system -d -s lowmemorykiller | grep -c -e \"Kill '\")")
 
 LAUNCHER_COMPONENT = re.compile(r"^[A-Za-z0-9._]+/[A-Za-z0-9._$]+$")
 
@@ -126,23 +133,75 @@ def resolve(vm, app):
     return line if status == 0 and LAUNCHER_COMPONENT.match(line) else None
 
 
+def displayed(vm, component):
+    """The launch times Android logged for a component (am_activity_launch_time)."""
+    text = vm.sh(f"logcat -b events -d | grep 'am_activity_launch_time.*{component}' | cut -c1-200", 120)[1]
+    return [int(m.group(2)) for m in re.finditer(r",(\d+),(\d+)\]", text)], len(text.strip().split("\n")) if text.strip() else 0
+
+
 def launch(vm, component, timeout):
+    """Start an activity and wait until Android has drawn it.
+
+    "am start -W" gives up after ten guest seconds ("Status: timeout"); the
+    start goes on, and ends with an am_activity_launch_time event.
+    """
     package = component.split("/")[0]
     before = vm.sh(f"pidof {package}", 60)[1].strip()
+    seen = displayed(vm, component)[1]
     t0 = time.monotonic()
     status, text = vm.sh(f"am start -W -n {component} 2>&1 | grep -v '^$' | cut -c1-200", timeout)
-    host = time.monotonic() - t0
-    after = vm.sh(f"pidof {package}", 60)[1].strip()
-    out = {"component": component, "host_seconds": round(host, 1), "status": status,
-           "pid_before": before, "pid_after": after,
-           "kind": "timeout" if status is None else ("warm" if before and before == after else "cold")}
+    out = {"component": component, "status": status, "pid_before": before}
     for key in ("ThisTime", "TotalTime", "WaitTime"):
         m = re.search(rf"^{key}: (\d+)", text, re.M)
         if m:
             out[key] = int(m.group(1))
     m = re.search(r"^Status: (\S+)", text, re.M)
     out["am_status"] = m.group(1) if m else text[-200:]
+    out["drawn"] = out["am_status"] == "ok"
+    while not out["drawn"] and time.monotonic() - t0 < timeout and vm.alive():
+        prov.wait(vm, 5)
+        times, count = displayed(vm, component)
+        if count > seen and times:
+            out["drawn"] = True
+            out["TotalTime"] = times[-1]
+    out["host_seconds"] = round(time.monotonic() - t0, 1)
+    after = vm.sh(f"pidof {package}", 60)[1].strip()
+    out["pid_after"] = after
+    out["kind"] = "warm" if before and before == after else "cold"
     return out
+
+
+def settle(vm, opts, result):
+    """As scripts/snapshot/make-snapshot.py does before it saves: wait, wait
+    for the load to fall, end the processes Android shows an "isn't
+    responding" dialog for.  What is measured then is what a resumed
+    snapshot starts from, not the minutes after a first boot."""
+    prov.wait(vm, opts.settle)
+
+    def calm():
+        text = ""
+        for _ in range(12):
+            status, text = vm.sh("cat /proc/loadavg", 30)
+            try:
+                if float(text.split()[0]) < opts.max_load:
+                    break
+            except (ValueError, IndexError):
+                pass
+            prov.wait(vm, 30)
+        return text.strip()
+
+    result["load_settled"] = calm()
+    result["anr_dismissed"] = []
+    for _ in range(3):
+        status, windows = vm.sh("dumpsys window windows | grep -o 'Application Not Responding: [A-Za-z0-9_.]*' | sort -u", 180)
+        anrs = sorted(set(re.findall(r"Application Not Responding: ([A-Za-z0-9_.]+)", windows if status == 0 else "")))
+        if not anrs:
+            break
+        result["anr_dismissed"].extend(anrs)
+        vm.sh("; ".join(f"kill $(pidof {p})" for p in anrs) + "; echo killed", 120)
+        prov.wait(vm, 90)
+        result["load_settled"] = calm()
+    log(f"settled: load {result['load_settled']}, dialogs dismissed {result['anr_dismissed']}")
 
 
 def main():
@@ -152,7 +211,8 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--name", default="")
     ap.add_argument("--boot-timeout", type=float, default=2400)
-    ap.add_argument("--settle", type=float, default=75, help="seconds between sys.boot_completed=1 and the first start")
+    ap.add_argument("--settle", type=float, default=300, help="seconds between sys.boot_completed=1 and the first start")
+    ap.add_argument("--max-load", type=float, default=1.5, help="then wait (up to 6 min) for the load average to fall below this")
     ap.add_argument("--setup", action="append", default=[],
                     help="shell command to run in the guest right after sys.boot_completed=1 (repeatable)")
     ap.add_argument("--app", action="append", default=[], help="package or component to start (repeatable)")
@@ -198,9 +258,12 @@ def main():
             result["booted"] = True
             result["booted_seconds"] = round(booted - vm.boot_started, 1)
             log(f"sys.boot_completed=1 after {result['booted_seconds']:.0f} s")
+            # Room for every event and lmkd line of the run (the default
+            # buffers wrap within minutes).
+            run("log_buffers", "logcat -b events -G 2M; logcat -b main -G 4M; logcat -g | cut -c1-90")
             for i, command in enumerate(opts.setup):
                 run(f"setup_{i}", command)
-            prov.wait(vm, opts.settle)
+            settle(vm, opts, result)
             run("screen_on", "settings put system screen_off_timeout 2147483647; svc power stayon true")
             if opts.facts:
                 for key, command in FACTS:
@@ -208,6 +271,7 @@ def main():
             run("swaps", "cat /proc/swaps; cat /proc/sys/vm/swappiness; getprop ro.config.low_ram;"
                          " getprop | grep -e dalvik.vm.heap; cat /sys/module/lowmemorykiller/parameters/minfree")
             run("focus_home", "dumpsys window | grep -e mCurrentFocus -e mFocusedApp")
+            result["system_server"] = [vm.sh("pidof system_server", 60)[1].strip()]
             result["home"] = metrics(vm)
             log("home: " + brief(result["home"]))
             apps = []
@@ -228,10 +292,12 @@ def main():
                     one["after"] = metrics(vm)
                     result["launches"].append(one)
                     log(f"round {rnd} {component}: {one['kind']}, TotalTime {one.get('TotalTime')} ms, "
-                        f"host {one['host_seconds']} s, {one['am_status']}; " + brief(one["after"]))
+                        f"host {one['host_seconds']} s, am {one['am_status']}, drawn {one['drawn']}; " + brief(one["after"]))
             result["series_host_seconds"] = round(time.monotonic() - started, 1)
             result["end"] = metrics(vm)
             result["reboots"] = list(vm.reboots)
+            result["system_server"].append(vm.sh("pidof system_server", 60)[1].strip())
+            run("proc_starts", "grep am_proc_start /data/local/tmp/porty-ev.txt | cut -d, -f4,5 | cut -d']' -f1 | sort | uniq -c | sort -rn | head -60 | tr '\\n' ';'")
             run("focus_end", "dumpsys window | grep -e mCurrentFocus -e mFocusedApp")
             run("lmkd_log", "logcat -b main,system -d -s lowmemorykiller | tail -30 | cut -c1-200")
             run("kills", "grep -e am_kill -e am_low_memory -e am_anr -e am_crash /data/local/tmp/porty-ev.txt | cut -c1-200 | tail -60")

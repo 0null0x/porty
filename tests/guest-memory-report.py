@@ -40,7 +40,7 @@ def summary(r):
 
     return {
         "name": r.get("name", "?"),
-        "ok": bool(r.get("booted")) and bool(launches) and all(x.get("am_status") == "ok" for x in launches)
+        "ok": bool(r.get("booted")) and bool(launches) and all(x.get("drawn") for x in launches)
               and not r.get("error") and not r.get("reboots"),
         "error": r.get("error", "" if r.get("booted") else "not booted"),
         "boot_s": r.get("booted_seconds"),
@@ -48,7 +48,8 @@ def summary(r):
         "r2_ms": total(2),
         "host_s": r.get("series_host_seconds"),
         "warm2": sum(1 for x in launches if x["round"] == 2 and x["kind"] == "warm"),
-        "timeouts": sum(1 for x in launches if x["kind"] == "timeout"),
+        "timeouts": sum(1 for x in launches if not x.get("drawn")),
+        "ss_restart": len(set(r.get("system_server", []))) > 1,
         "avail_home_mb": home.get("MemAvailable", 0) // 1024,
         "avail_end_mb": end.get("MemAvailable", 0) // 1024,
         "swap_end_mb": end.get("swap_used_kb", 0) // 1024,
@@ -66,7 +67,7 @@ def summary(r):
     }
 
 
-COLUMNS = ("name", "ok", "boot_s", "r1_ms", "r2_ms", "host_s", "warm2", "timeouts", "avail_home_mb", "avail_end_mb",
+COLUMNS = ("name", "ok", "boot_s", "r1_ms", "r2_ms", "host_s", "warm2", "timeouts", "ss_restart", "avail_home_mb", "avail_end_mb",
            "swap_end_mb", "zram_used_mb", "load_end", "majfault", "disk_mb", "kills", "lmkd", "died", "starts",
            "anr", "crash", "reboots")
 

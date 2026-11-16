@@ -1,7 +1,14 @@
 {
-  "comment": "Variants for .github/workflows/guest-memory.yml. query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only; what is kept moves into web/js/boot-diet.js).",
+  "comment": "Variants for .github/workflows/guest-memory.yml. query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only). The kernel of Android-x86 9.0-r2 has no zram, zswap or zsmalloc (run 43898815543).",
   "base": "mem=768&tb=128&cache=16",
-  "run": ["base", "zram", "lowram", "zram-lowram"],
+  "run": [
+    "base",
+    "lowram",
+    "lmk-minfree",
+    "lmk-cached",
+    "lowram-minfree",
+    "heap"
+  ],
   "boots": 2,
   "apps": [
     "com.android.gallery3d/.app.GalleryActivity",
@@ -10,15 +17,23 @@
     "com.android.deskclock"
   ],
   "variants": {
-    "base": {"query": ""},
-    "zram": {
-      "query": "",
-      "setup": ["Z=/sys/block/zram0; [ -e $Z ] || modprobe zram; echo lz4 > $Z/comp_algorithm; echo 384M > $Z/disksize && mkswap /dev/block/zram0 && swapon /dev/block/zram0; echo 100 > /proc/sys/vm/swappiness; cat /proc/swaps $Z/comp_algorithm"]
+    "base": {
+      "query": ""
     },
-    "lowram": {"query": "props=ro.config.low_ram=true"},
-    "zram-lowram": {
-      "query": "props=ro.config.low_ram=true",
-      "setup": ["Z=/sys/block/zram0; [ -e $Z ] || modprobe zram; echo lz4 > $Z/comp_algorithm; echo 384M > $Z/disksize && mkswap /dev/block/zram0 && swapon /dev/block/zram0; echo 100 > /proc/sys/vm/swappiness; cat /proc/swaps $Z/comp_algorithm"]
+    "lowram": {
+      "query": "props=ro.config.low_ram=true"
+    },
+    "lmk-minfree": {
+      "query": "props=ro.lmk.use_minfree_levels=true"
+    },
+    "lmk-cached": {
+      "query": "props=ro.lmk.medium=1001,ro.lmk.critical=900"
+    },
+    "lowram-minfree": {
+      "query": "props=ro.config.low_ram=true,ro.lmk.use_minfree_levels=true"
+    },
+    "heap": {
+      "query": "props=dalvik.vm.heapstartsize=8m,dalvik.vm.heapgrowthlimit=128m,dalvik.vm.heapsize=256m"
     }
   }
 }
