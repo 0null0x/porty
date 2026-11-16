@@ -1,0 +1,45 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 04:00:00 +0000
+Subject: [PATCH] timer: optionally count host ticks in nanoseconds
+
+Under TCG the guest's TSC is cpu_get_host_ticks() plus an offset.  On
+x86 hosts that is RDTSC (a few GHz); on hosts without a cycle counter,
+which includes the WebAssembly build, it is get_clock(), exactly 1 GHz.
+The migration stream carries the offset but not the rate, so a guest that
+calibrated its TSC on a native x86 QEMU and is resumed in the browser
+would see its TSC run several times too slowly (udelay(), sched_clock(),
+and the clocksource until the kernel's watchdog retires it).
+
+With -DPORTY_NS_HOST_TICKS a native build uses the same nanosecond counter
+as the WebAssembly build.  Porty's snapshot producer is built that way.
+Nothing changes without the define.
+---
+ include/qemu/timer.h | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+index 9a366e5..3d77134 100644
+--- a/include/qemu/timer.h
++++ b/include/qemu/timer.h
+@@ -846,7 +846,21 @@ static inline int64_t get_clock(void)
+ /*******************************************/
+ /* host CPU ticks (if available) */
+ 
+-#if defined(_ARCH_PPC)
++#if defined(PORTY_NS_HOST_TICKS)
++/*
++ * Porty: count host ticks in nanoseconds, as hosts without a cycle counter
++ * do (the fallback at the end of this list; that is what the WebAssembly
++ * build uses).  Under TCG the guest's TSC is this counter, so a native
++ * build made with -DPORTY_NS_HOST_TICKS gives the guest the same 1 GHz TSC
++ * as the browser build, and a guest saved by one (migration) keeps a
++ * correctly calibrated TSC when the other resumes it.
++ */
++static inline int64_t cpu_get_host_ticks(void)
++{
++    return get_clock();
++}
++
++#elif defined(_ARCH_PPC)
+ 
+ static inline int64_t cpu_get_host_ticks(void)
+ {
