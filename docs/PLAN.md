@@ -702,21 +702,60 @@ publishes the slim image (2.8), with the boot diet on by default.
   1242 s), broadcasts timed out and the Watchdog had dumped stacks. A
   snapshot is only useful once the guest it saves is idle.
 
+**Ninth round: the home screen (2026-11-16).**
+
+- Why there was none. The only setup wizard in Android-x86 9.0-r2 is
+  Google's; without Google's services it dies in `onCreate` ("Failed to
+  find provider com.google.settings"), again and again, and a device that
+  is not provisioned (`device_provisioned` and `user_setup_complete` are 0
+  by default) never starts a launcher: HOME resolves to Settings'
+  FallbackHome, "Tablet is starting..." with a spinning progress bar.
+  Android-x86's analytics service crashes too, and Taskbar, a second
+  launcher, makes Android ask which home app to use.
+- The fix (`PROVISION` in `web/js/boot-diet.js`, merge 569b133): the
+  boot-diet script binds an empty directory over SetupWizard,
+  AnalyticsService and Taskbar, and appends an action to init.rc that sets
+  both settings to 1 at `sys.boot_completed=1`, which is all AOSP's own
+  wizard does. `setup=1` leaves all of it alone. Native boots of the
+  page's initrd (provisioning workflow, three boots on bd54965): Launcher3
+  the focused app, the screen 86 to 94% lit with 4096 colours, no crash.
+- surfaceflinger's 95% was that progress bar. With a static screen it
+  falls to about 1% once the burst after the boot is over (sf-cpu check,
+  92374e0, variant `long`: 84%, then 1% and 1%; load average 13.2, then
+  1.6 and 0.7). The display variants (`HWACCEL=0`, virtio-vga, vesa) gave
+  mixed single boots; not pursued.
+- The full boot in the browser got twice as fast: `sys.boot_completed`
+  after 13:11 on the desktop defaults (run 43847733043, against 25:09 in
+  43833368852): the wizard's crash loop had taken half the boot. 90 s
+  later the wallpaper filled the screen; the launcher's icons were not
+  drawn yet.
+- Natively, without time dilation, SystemUI stops responding in that
+  burst; the dialog is in front of the launcher in most boots, and
+  system_server was restarted by its Watchdog in some.
+- The second snapshot (run 43845626226, on 6352861): provisioned, idle
+  (load average 0.55), 605 MB of state, 159 MB compressed in 145 chunks;
+  the site is 962 MB. Resumed in the browser on the phone budget
+  (43847789944, `wasmmem=1280&jitcap=4000`): 152 MiB downloaded, the home
+  screen lit (86.8%) within the first two minutes, heap 1002/1026 MB, load
+  average 0.38, the shell answering. It was saved with "System UI isn't
+  responding" in front; `make-snapshot.py` now ends the process behind
+  such a dialog before saving (c5cc6cd).
+- The snapshot cache key now also covers the page code that shapes the
+  guest (`qemu-args.js`, `config.js`, `boot-diet.js`, `initramfs.js`) and
+  `scripts/snapshot`, so a guest booted or saved by older code is never
+  published after a change.
+- One boot test failed in the first minutes after a deploy: the page was
+  not cross-origin isolated (its service worker had not taken over).
+
 **Next steps:**
 
-1. A home screen: the setup wizard and the missing launcher on the slim
-   image (in progress).
-2. surfaceflinger's CPU: it leads every boot in the browser too
-   (43816513977: 398 against system_server's 379, %CPU summed over the
-   probes). Find the composition path and cut it (in progress).
-3. A snapshot that shows the home screen, saved idle. Its cache key must
-   then also cover the page code that shapes the guest (`boot-diet.js`,
-   `qemu-args.js`, `config.js`, `initramfs.js`), or a stale snapshot keeps
-   being published.
-4. The site back under 1 GB, for example without the kernel firmware and
-   modules a QEMU guest never loads.
-5. The iPhone: about 9 times slower than the runner in the first try;
-   measure again with the resume.
+1. The iPhone, with the resume: memory, time to the home screen, and how
+   usable the home screen is at that speed.
+2. The full boot on the phone setting with the provisioning, for visitors
+   who do not resume (the desktop one is above).
+3. SystemUI's "isn't responding" in a normal boot.
+4. The iPhone's speed: about 9 times slower than the runner in the first
+   try.
 
 ## 8. Open questions for the first real run
 

@@ -13,12 +13,14 @@ iPhone**, with no jailbreak, no sideloading and no cloud streaming.
 
 **Try it: [0null0x.github.io/porty](https://0null0x.github.io/porty/)**
 
-Porty is experimental. In headless desktop Chrome, Android 9 now finishes
-booting after about 26 minutes and draws its status and navigation bars,
-but a "keeps stopping" message from the setup wizard still covers the home
-screen. The first try on an iPhone ended in a forced restart while Porty
-was loading, most likely for using more memory than iOS allows a tab;
-phones now get a smaller setting. See [Status](#status).
+Porty is experimental. The page resumes an Android that was booted and
+saved in advance: in headless Chrome on the phone setting, Android 9's
+home screen is up about a minute after Start. A full boot, without the
+saved Android (`resume=0`), takes about 13 minutes on the desktop setting.
+On an iPhone, the first try ended in a forced restart while Porty was
+loading, most likely for using more memory than iOS allows a tab; phones
+now get a smaller setting, and the resume has not been tried there yet.
+See [Status](#status).
 
 ## Status
 
@@ -37,8 +39,12 @@ boot animation and guest time running 8 times slower than real time
 the first time in a browser: after 26 minutes on the desktop setting,
 20 minutes as a 64-bit-only Android (`diet=2`) and 43 minutes on the
 phone setting, which stayed within 1064 MiB of WebAssembly heap. The
-screen then shows Android's status and navigation bars and "Android Setup
-keeps stopping"; the home screen behind it is next.
+screen then showed "Android Setup keeps stopping": the only setup wizard
+in the image is Google's. The page now hides it at boot and marks Android
+as set up, which also halves the full boot (13 minutes on the desktop
+setting), and the site publishes an Android booted to its home screen and
+saved: resumed on the phone setting, the home screen is up about a minute
+after Start, within 1026 MiB of heap.
 
 The first try in iPhone Safari (2026-11-16) ended in a forced restart while
 Porty was loading. iOS may kill a Safari tab that uses much more than about
@@ -51,7 +57,7 @@ last start got, and starts with less memory.
 
 - [x] **M1** CI build is green and the site deploys
 - [x] **M2** desktop browser: kernel boot log appears on the serial console
-- [ ] **M3** desktop browser: Android UI is visible on the canvas (boot animation: yes; status and navigation bars: yes; home screen: not yet)
+- [x] **M3** desktop browser: Android UI is visible on the canvas (home screen: yes, resumed from the saved Android; a full boot completes after 13 minutes)
 - [ ] **M4** touch, navigation buttons and keyboard work
 - [ ] **M5** boots in Safari on an iPhone (iOS 26 or later)
 - [ ] **M6** performance tuning
