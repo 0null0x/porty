@@ -44,6 +44,9 @@ on:
       runstate:
         description: '"running": the resumed guest starts by itself; "paused": it waits for cont'
         default: running
+      guest_command:
+        description: Extra shell command to run in the guest before the save (optional)
+        default: ''
       boot_timeout_min:
         description: Minutes to wait for sys.boot_completed
         default: '180'
@@ -63,6 +66,7 @@ defaults:
 env:
   QUERY: ${{ inputs.query || 'mem=768&tb=128&cache=16' }}
   RUNSTATE: ${{ inputs.runstate || 'running' }}
+  GUEST_COMMAND: ${{ inputs.guest_command || '' }}
   BOOT_TIMEOUT_MIN: ${{ inputs.boot_timeout_min || '180' }}
 
 jobs:
@@ -241,13 +245,16 @@ jobs:
           ) &
           reporter=$!
           trap 'kill "$reporter" 2>/dev/null || true' EXIT
+          extra=()
+          [[ -z "$GUEST_COMMAND" ]] || extra=(--guest-command "$GUEST_COMMAND")
           python3 -I scripts/snapshot/make-snapshot.py save \
             --qemu out/native-qemu/qemu-system-x86_64 \
             --argv-file out/snap/argv-native.txt \
             --work out/snap/save \
             --state "$RUNNER_TEMP/vm.state" \
             --runstate "$RUNSTATE" \
-            --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))"
+            --boot-timeout "$(( BOOT_TIMEOUT_MIN * 60 ))" \
+            "${extra[@]}"
 
       - name: Cut the stream into compressed chunks
         id: pack

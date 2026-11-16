@@ -26,6 +26,7 @@ only; run with "python3 -I".
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -206,8 +207,8 @@ class Machine:
             return False
         self.out += data
         self.total += len(data)
-        if len(self.out) > (1 << 20):
-            self.out = self.out[-(1 << 19):]
+        # (Kept whole: sh() remembers offsets into it.  A boot prints well
+        # under a megabyte.)
         return True
 
     def wait_for(self, pattern, timeout, start=0):
@@ -225,34 +226,46 @@ class Machine:
         """Run a command in the guest's serial root shell.
 
         Returns (status, output) or (None, partial output) on timeout.  The
-        end marker is only matched with a number after it, which the echo of
-        the command line itself ("$?") does not have.
+        output is what the guest prints between two markers.  The markers
+        are written with an octal escape (\\137 is "_"), so the terminal's
+        and the shell's echo of the typed line, which the shell's line
+        editor redraws when it is long, never contains them.
         """
         self.counter += 1
-        tag = f"PORTY_END_{self.counter}"
+        n = self.counter
         start = len(self.out)
-        self.serial.sendall(f"{command}; echo {tag}:$?\n".encode())
-        m = self.wait_for(re.compile(tag.encode() + rb":(\d+)"), timeout, start)
-        text = self.out[start:(m.start() if m else len(self.out))].decode("utf-8", "replace")
-        text = text.replace("\r", "")
-        # Drop the echoed command line.
-        if "\n" in text:
-            text = text.split("\n", 1)[1]
-        return (int(m.group(1)) if m else None), text.strip()
+        self.serial.sendall(f"printf 'PORTY\\137B{n}\\n'; {command}; printf 'PORTY\\137E{n}:%s\\n' $?\n".encode())
+        begin = self.wait_for(re.compile(rb"PORTY_B%d\r?\n" % n), timeout, start)
+        if not begin:
+            return None, ""
+        end = self.wait_for(re.compile(rb"PORTY_E%d:(\d+)" % n), timeout, begin.end())
+        text = self.out[begin.end():(end.start() if end else len(self.out))].decode("utf-8", "replace")
+        return (int(end.group(1)) if end else None), text.replace("\r", "").strip()
 
     def tail(self, lines=40):
         text = self.out[-8192:].decode("utf-8", "replace").replace("\r", "")
         return text.split("\n")[-lines:]
 
-    def screenshot(self, name):
+    def screenshot(self, name, show=False):
+        """Save the guest's screen as <name>.png; show=True also prints it
+        to the log as base64 between marker lines (the log is the one thing
+        every reader of a run can get at)."""
         src = self.fb_prefix + ".ppm"
         if not os.path.exists(src):
             return None
         keep = os.path.join(self.work, name + ".ppm")
+        png = os.path.join(self.work, name + ".png")
         try:
             shutil.copyfile(src, keep)
-            stats = ppm_to_png(keep, os.path.join(self.work, name + ".png"))
+            stats = ppm_to_png(keep, png)
             os.unlink(keep)
+            if show:
+                with open(png, "rb") as f:
+                    text = base64.b64encode(f.read()).decode()
+                print(f"-----BEGIN PNG {name}-----", flush=True)
+                for i in range(0, len(text), 16000):
+                    print(text[i:i + 16000], flush=True)
+                print(f"-----END PNG {name}-----", flush=True)
             return stats
         except (OSError, ValueError) as e:
             log(f"screenshot {name}: {e}")
@@ -337,6 +350,9 @@ def do_save(opts, argv):
         with open(os.path.join(work, "machine-info.txt"), "w", encoding="utf-8") as f:
             for key, text in result["machine"].items():
                 f.write(f"===== {key} =====\n{text}\n")
+                if key not in ("qtree", "mtree"):
+                    print(f"===== {key} =====\n{text}", flush=True)
+        print("===== cpu =====\n" + json.dumps(result["cpu"]), flush=True)
         del result["machine"]["qtree"], result["machine"]["mtree"]
 
         marks = result["milestones"]
@@ -364,11 +380,11 @@ def do_save(opts, argv):
             due = (shell and now - last_probe >= 10) or (not shell and now > 600 and now - last_probe >= 60)
             if due:
                 last_probe = now
-                status, text = vm.sh('echo "BC=[$(getprop sys.boot_completed)]"', timeout=45)
+                status, text = vm.sh("getprop sys.boot_completed", timeout=45)
                 if status is not None:
                     shell = True
                     marks.setdefault("shell", round(now, 1))
-                if "BC=[1]" in text:
+                if status == 0 and text == "1":
                     booted = vm.elapsed()
                     break
             if now - last_shot >= 300:
@@ -385,7 +401,7 @@ def do_save(opts, argv):
         if booted is None:
             result.setdefault("error", f"sys.boot_completed was not 1 after {vm.elapsed():.0f} s")
             result["elapsed_seconds"] = round(vm.elapsed(), 1)
-            result["screen"] = vm.screenshot("screen-final")
+            result["screen"] = vm.screenshot("screen-final", show=True)
             if shell and vm.alive():
                 for name, command in (("logcat_tail", "logcat -d -t 80"),
                                       ("props", "getprop | grep -e boot -e init.svc | head -60"),
@@ -399,14 +415,14 @@ def do_save(opts, argv):
         marks["boot_completed"] = round(booted, 1)
         log(f"sys.boot_completed=1 after {booted:.0f} s")
         progress(work, f"booted in {booted / 60:.1f} min, settling")
-        result["screen_booted"] = vm.screenshot("screen-booted")
+        result["screen_booted"] = vm.screenshot("screen-booted", show=True)
 
         guest = result["guest"] = {}
 
         def run(key, command, timeout=120):
             status, text = vm.sh(command, timeout)
             guest[key] = text if status == 0 else f"[status {status}] {text}"
-            log(f"guest {key}: {guest[key][:300]}")
+            log(f"guest {key}: {guest[key][:1500]}")
             return status, text
 
         # Keep the display on: a sleeping screen would be saved black, and
@@ -449,6 +465,16 @@ def do_save(opts, argv):
         run("uptime", "cat /proc/uptime")
         run("date", "date -u '+%Y-%m-%dT%H:%M:%SZ'")
         run("focus", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
+        run("crashes", "logcat -b crash -d -t 30 | cut -c1-220", 180)
+        run("home", "cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN", 180)
+        run("provisioned", "settings get global device_provisioned; settings get secure user_setup_complete", 180)
+        for i, command in enumerate(opts.guest_command):
+            run(f"extra_{i}", command, 600)
+        if opts.guest_command:
+            end = time.monotonic() + 20
+            while time.monotonic() < end and vm.alive():
+                vm.pump(2.0)
+            run("focus_after_extra", "dumpsys window windows | grep -e mCurrentFocus -e mFocusedApp", 180)
         run("meminfo_before", "head -7 /proc/meminfo")
 
         run("sync", "sync; echo 3 > /proc/sys/vm/drop_caches", 300)
@@ -471,7 +497,7 @@ def do_save(opts, argv):
         while time.monotonic() < end and vm.alive():
             vm.pump(1.0)
 
-        result["screen"] = vm.screenshot("screen-final")
+        result["screen"] = vm.screenshot("screen-final", show=True)
         log(f"screen: {result['screen']}")
         if not vm.alive():
             result["error"] = f"QEMU exited with status {vm.proc.returncode} before the save"
@@ -567,8 +593,8 @@ def do_restore(opts, argv):
         end = time.monotonic() + 8
         while time.monotonic() < end and vm.alive():
             vm.pump(1.0)
-        result["screen"] = vm.screenshot("screen-restored")
-        result["restored"] = answers.get("boot_completed", "").strip().endswith("1") and vm.alive()
+        result["screen"] = vm.screenshot("screen-restored", show=True)
+        result["restored"] = answers.get("boot_completed") == "1" and vm.alive()
         if not result["restored"]:
             result["error"] = "the restored guest did not answer on the serial console"
             result["serial_tail"] = vm.tail(40)
@@ -597,6 +623,8 @@ def main():
     ap.add_argument("--runstate", choices=("running", "paused"), default="running",
                     help="running: the resumed guest starts by itself; paused: it waits for 'cont'")
     ap.add_argument("--zero-free", type=int, default=1, help="1: zero the guest's free memory before saving")
+    ap.add_argument("--guest-command", action="append", default=[],
+                    help="extra shell command to run in the guest before the save (repeatable)")
     ap.add_argument("--zero-reserve", type=int, default=96, help="MiB of free memory to leave alone")
     opts = ap.parse_args()
 
