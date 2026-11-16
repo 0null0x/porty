@@ -166,6 +166,9 @@ class Machine:
             if arg == "-accel" and "kvm" in args[i + 1]:
                 raise SystemExit("refusing to use KVM: the browser resumes into TCG")
         args += ["-monitor", "none", "-qmp", f"unix:{self.qmp_path},server=on,wait=off"]
+        # QEMU's own account of every CPU reset (registers, "Triple fault").
+        self.debug_log = os.path.join(work, "qemu-debug.log")
+        args += ["-d", "cpu_reset,guest_errors", "-D", self.debug_log]
         args += list(extra)
         self.args = args
 
@@ -224,7 +227,29 @@ class Machine:
             for line in before.replace("\r", "").split("\n")[-120:]:
                 print("    | " + line[:300], flush=True)
             self.reboots.append(round(self.elapsed(), 1))
+            self.show_debug()
+            if len(self.reboots) >= 3:
+                raise RuntimeError(f"the guest keeps rebooting by itself, {self.reboots} s after start")
         self.boots = max(self.boots, len(boots))
+
+    def show_debug(self):
+        """Print the end of QEMU's debug log and the QMP events so far."""
+        try:
+            with open(self.debug_log, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 9000))
+                text = f.read().decode("utf-8", "replace")
+            log(f"QEMU debug log ({size} bytes), last part:")
+            for line in text.split("\n")[-90:]:
+                print("    > " + line[:240], flush=True)
+        except OSError as e:
+            log(f"no QEMU debug log: {e}")
+        try:
+            self.qmp.cmd("query-status")
+        except Exception:
+            pass
+        log("QMP events: " + json.dumps(self.qmp.events[-12:]))
 
     def wait_for(self, pattern, timeout, start=0):
         deadline = time.monotonic() + timeout
