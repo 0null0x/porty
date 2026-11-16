@@ -1,0 +1,84 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 02:00:00 +0000
+Subject: [PATCH] coroutine-fiber: 256 KiB coroutine stacks, and count them
+
+Each coroutine had a 1 MiB C stack and a 1 MiB Asyncify buffer.  Both are
+committed when allocated (Emscripten's mmap and calloc clear the memory)
+and the coroutine pool keeps every coroutine it creates, so the burst of
+disk requests at the start of a boot pins that memory for the whole
+session: in the boot tests, QEMU's heap grew by about 170 MiB in the
+first two minutes and stayed there.  Phones cannot spare that: iOS reloads a
+Safari tab that goes much past 1.5 GB.
+
+Use 256 KiB for both (the thread's own leader context keeps 1 MiB) and
+export porty_coroutine_count() so the page and the boot test can see how
+many coroutines exist.
+---
+diff --git a/util/coroutine-fiber.c b/util/coroutine-fiber.c
+index a7920676ab..2d19591c03 100644
+--- a/util/coroutine-fiber.c
++++ b/util/coroutine-fiber.c
+@@ -20,11 +20,36 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/atomic.h"
+ #include "qemu/coroutine_int.h"
+ #include "qemu/coroutine-tls.h"
+ 
++#include <emscripten.h>
+ #include <emscripten/fiber.h>
+ 
++/*
++ * Porty: a coroutine's C stack and its Asyncify buffer were
++ * COROUTINE_STACK_SIZE (1 MiB) each.  Both are committed as soon as they
++ * are allocated (Emscripten's mmap and calloc clear the memory), and the
++ * coroutine pool keeps what it creates, so the burst of disk requests early
++ * in a boot leaves them all allocated for the rest of the session.  That
++ * fits QEMU's heap growing by about 170 MiB in the first two minutes of the
++ * boot tests and staying there.  An iPhone reloads a tab that goes much
++ * past 1.5 GB, so this matters.  The block layer's coroutines are shallow,
++ * so 256 KiB each still leaves a wide margin.  The leader context (a
++ * thread's own stack) keeps the full size.
++ */
++#define PORTY_FIBER_STACK_SIZE (256 * 1024)
++
++static int porty_coroutines_live;
++
++/* Porty: coroutines currently allocated, the pooled ones included. */
++int porty_coroutine_count(void);
++EMSCRIPTEN_KEEPALIVE int porty_coroutine_count(void)
++{
++    return qatomic_read(&porty_coroutines_live);
++}
++
+ typedef struct {
+     Coroutine base;
+     void *stack;
+@@ -61,14 +86,15 @@ Coroutine *qemu_coroutine_new(void)
+ 
+     co = g_malloc0(sizeof(*co));
+ 
+-    co->stack_size = COROUTINE_STACK_SIZE;
++    co->stack_size = PORTY_FIBER_STACK_SIZE;
+     co->stack = qemu_alloc_stack(&co->stack_size);
+ 
+-    co->asyncify_stack_size = COROUTINE_STACK_SIZE;
++    co->asyncify_stack_size = PORTY_FIBER_STACK_SIZE;
+     co->asyncify_stack = g_malloc0(co->asyncify_stack_size);
+     emscripten_fiber_init(&co->fiber, coroutine_trampoline, &co->base,
+                           co->stack, co->stack_size, co->asyncify_stack, co->asyncify_stack_size);
+-    
++    qatomic_inc(&porty_coroutines_live);
++
+     return &co->base;
+ }
+ 
+@@ -76,6 +102,7 @@ void qemu_coroutine_delete(Coroutine *co_)
+ {
+     CoroutineEmscripten *co = DO_UPCAST(CoroutineEmscripten, base, co_);
+ 
++    qatomic_dec(&porty_coroutines_live);
+     qemu_free_stack(co->stack, co->stack_size);
+     g_free(co->asyncify_stack);
+     g_free(co);

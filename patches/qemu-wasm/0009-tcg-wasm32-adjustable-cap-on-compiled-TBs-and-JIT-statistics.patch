@@ -1,0 +1,88 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 02:00:00 +0000
+Subject: [PATCH] tcg/wasm32: adjustable cap on compiled TBs, and JIT statistics
+
+Every compiled TB is a WebAssembly module and instance of its own, kept in
+the browser's JavaScript heap: outside the WebAssembly memory, but inside
+the tab's memory budget.  Up to MAX_INSTANCE_ALIVE (15000) of them stay
+alive at once, which a phone may not be able to afford on top of the
+guest's RAM.
+
+Make the cap a variable with an exported setter,
+porty_set_jit_max_instances(), so the page can lower it on phones (the
+ring buffer of running instances keeps its compile-time size, which bounds
+the cap), and export porty_jit_stats(): compiled TBs alive, the cap, the
+JIT threshold and the number of TBs compiled since start.
+---
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index 5095aeb7c4..a41b187180 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -122,6 +122,50 @@ struct instance_info {
+ #define MAX_INSTANCE_ALIVE 15000
+ #define INSTANCE_RUNNING_LEN MAX_INSTANCE_ALIVE
+ __thread struct instance_info instance_running[INSTANCE_RUNNING_LEN];
++
++/*
++ * Porty: every compiled TB is a WebAssembly module and instance of its own.
++ * They live in the browser's JavaScript heap, outside the WebAssembly
++ * memory but inside the same tab's memory budget, and phones cannot afford
++ * MAX_INSTANCE_ALIVE of them.  So the cap is a variable the page can lower
++ * (?jitcap=); the ring buffer above keeps its size, which bounds it.
++ */
++static int porty_jit_max_alive = MAX_INSTANCE_ALIVE;
++static uint32_t porty_jit_compiled;
++
++/*
++ * Set the cap on compiled TBs alive at once; 0 or a negative value restores
++ * the default.  Returns the value in effect.  The page calls this from
++ * onRuntimeInitialized, before main() starts any vCPU.
++ */
++int porty_set_jit_max_instances(int n);
++EMSCRIPTEN_KEEPALIVE int porty_set_jit_max_instances(int n)
++{
++    if (n <= 0 || n > MAX_INSTANCE_ALIVE) {
++        n = MAX_INSTANCE_ALIVE;
++    } else if (n < 256) {
++        n = 256;
++    }
++    qatomic_set(&porty_jit_max_alive, n);
++    return n;
++}
++
++/*
++ * Porty: [0] compiled TBs alive, counting dropped ones the JS garbage
++ * collector has not reclaimed yet, [1] the cap, [2] the JIT threshold,
++ * [3] TBs compiled since start.
++ */
++uint32_t *porty_jit_stats(void);
++EMSCRIPTEN_KEEPALIVE uint32_t *porty_jit_stats(void)
++{
++    static uint32_t out[4];
++    out[0] = qatomic_read(&instance_alive_global);
++    out[1] = qatomic_read(&porty_jit_max_alive);
++    out[2] = porty_jit_threshold;
++    out[3] = qatomic_read(&porty_jit_compiled);
++    return out;
++}
++
+ __thread int instance_running_begin = 0;
+ __thread int instance_running_end = 0;
+ 
+@@ -131,7 +175,7 @@ __thread static int to_remove_instance_idx = 0;
+ 
+ static bool can_add_instance()
+ {
+-    return qatomic_read(&instance_alive_global) < MAX_INSTANCE_ALIVE;
++    return qatomic_read(&instance_alive_global) < qatomic_read(&porty_jit_max_alive);
+ }
+ 
+ static void inc_instance_local()
+@@ -1354,6 +1398,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+             res = tcg_qemu_tb_exec_tci(env);
+         } else {
+             int fidx = instantiate_wasm();
++            qatomic_inc(&porty_jit_compiled);
+             add_instance_running_local(fidx, ctx.tb_ptr);
+             res = ((wasm_func_ptr)(fidx))(&ctx);
+         }
