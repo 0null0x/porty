@@ -152,6 +152,8 @@ section = lambda i, body: [i] + leb(len(body)) + body
 pages = int(sys.argv[2]) * 16
 module = [0, 0x61, 0x73, 0x6D, 1, 0, 0, 0] + section(
     2, [1] + name("env") + name("memory") + [2, 3] + leb(pages) + leb(pages))
+# assemble-site.sh looks for the qcow2 driver by one of its messages
+module += section(0, name("porty.test") + list(b"Image is not in qcow2 format"))
 open(sys.argv[1], "wb").write(bytes(module))
 PY
 echo "export default async function () { return {}; }" > "$work/qemu/out.js"
@@ -215,6 +217,17 @@ grep -q -- 'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug
 grep -q -- "if=virtio,index=0,media=disk,format=qcow2,read-only=on,file.driver=porty,file.url=/img/$disk_dir," "$work/argv.txt" \
     || fail "no read-only qcow2 drive over porty in argv"
 pass "manifest -> QEMU argv"
+
+# A QEMU build without the qcow2 driver cannot serve a qcow2 disk.
+cp -r "$work/qemu" "$work/qemu-noqcow2"
+head -c 8 "$work/qemu/qemu-system-x86_64.wasm" > "$work/qemu-noqcow2/qemu-system-x86_64.wasm"
+if "$repo/scripts/assemble-site.sh" --qemu "$work/qemu-noqcow2" --image "$work/image" \
+       --out "$work/dist-noqcow2" --id smoke-test >/dev/null 2>&1; then
+    fail "assemble-site.sh paired a qcow2 disk with a QEMU build that has no qcow2 driver"
+fi
+"$repo/scripts/assemble-site.sh" --qemu "$work/qemu-noqcow2" --image "$work/image-sfs" \
+    --out "$work/dist-sfs" --id smoke-test >/dev/null || fail "assemble-site.sh refused the sfs image"
+pass "assemble-site.sh checks that QEMU can read the disk format"
 
 # Size limits are enforced.
 if "$repo/scripts/assemble-site.sh" --qemu "$work/qemu" --image "$work/image" \

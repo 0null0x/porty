@@ -206,12 +206,6 @@ print("qcow2:", json.dumps({k: info.get(k) for k in ("virtual-size", "actual-siz
 if problems:
     sys.exit("qcow2 image: unexpected " + ", ".join(problems))
 PY
-    # TEMPORARY (first branch check only): what other cluster sizes would cost.
-    for other in ${PORTY_QCOW2_SURVEY:-}; do
-        qemu-img convert -f raw -O qcow2 -c -o "cluster_size=$other" "$img" "$work/survey.qcow2"
-        echo "survey: cluster size $other -> $(stat -c %s "$work/survey.qcow2") bytes"
-        rm -f "$work/survey.qcow2"
-    done
     rm -rf "$work/sfs"
     echo "system disk: ext4 of $virtual_size bytes as a compressed qcow2 of $(stat -c %s "$disk_file") bytes" \
          "(cluster size $cluster); system.sfs was $sfs_size bytes"
