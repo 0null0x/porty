@@ -140,8 +140,13 @@ if [[ "$format" == qcow2 ]]; then
     # with build.prop at its root ("mount --bind /mnt system"); that is how
     # Android-x86's own qemu-android script boots a system.img on vda.
     gzip -dc "$out/initrd.img" 2>/dev/null \
-        | cpio -i --quiet --to-stdout init > "$work/initrd-init" 2>/dev/null || true
-    grep -q -F -- '-e /mnt/build.prop' "$work/initrd-init" \
+        | cpio -i --quiet --to-stdout init ./init > "$work/initrd-init" 2>/dev/null || true
+    if ! grep -q -E -- '-[es] /mnt/build\.prop' "$work/initrd-init"; then
+        echo "initrd.img holds: $(gzip -dc "$out/initrd.img" 2>/dev/null | cpio -t --quiet 2>/dev/null | head -40 | tr '\n' ' ')"
+        echo "its init ($(wc -c < "$work/initrd-init") bytes), check_root:"
+        sed -n '/^check_root/,/^}/p' "$work/initrd-init" | sed 's/^/    /'
+    fi
+    grep -q -E -- '-[es] /mnt/build\.prop' "$work/initrd-init" \
         || die "the initrd's init does not accept a filesystem with build.prop at its root (PORTY_DISK_FORMAT=sfs still works)"
     echo "initrd init, where it looks for the system image:"
     grep -n -E 'try_mount ro|system\.sfs|system\.img|-d /mnt/|build\.prop|mount --bind /mnt|RAMDISK' \
