@@ -63,8 +63,10 @@ FACTS = (
     ("system_server", "pidof system_server; ps -A -o PID,ETIME,NAME | grep -e system_server -e zygote -e systemui -e launcher"),
     ("anr", "logcat -b system,main -d -v time | grep -m1 -A26 'ANR in ' | cut -c1-200"),
     ("anr_files", "for f in /data/anr/*; do echo $f $(grep -m1 'Cmd line' $f); done"),
-    ("anr_main", "f=$(grep -l 'Cmd line: com.android.systemui' /data/anr/* | head -1); grep -m1 -A50 '\"main\" prio' $f | cut -c1-200;"
-                 " grep -A30 'RenderThread\" ' $f | head -40 | cut -c1-200"),
+    ("anr_main", "f=$(grep -l 'Cmd line: com.android.systemui' /data/anr/* | head -1); sed -n '/^\"main\" prio/,/^$/p' $f | head -70 | cut -c1-200"),
+    ("anr_system", "f=$(grep -l 'Cmd line: system_server' /data/anr/* | head -1); sed -n '/^\"android.ui\" prio/,/^$/p' $f | head -50 | cut -c1-200;"
+                   " sed -n '/^\"RenderThread\" /,/^$/p' $f | head -50 | cut -c1-200; sed -n '/^\"main\" prio/,/^$/p' $f | head -40 | cut -c1-200"),
+    ("anr_cpu", "logcat -b system,main -d -v time | sed -n '/ANR in /,/TOTAL/p' | head -45 | cut -c1-200"),
     ("uptime", "cat /proc/uptime; cat /proc/loadavg"),
 )
 
