@@ -147,6 +147,13 @@ try {
     assert.ok(Math.abs(abs[0][2] - 0x7fff / 4) < 200, `y ${abs[0][2]}`);
     assert.deepEqual(btn, [[2, 0, 1, 0], [2, 0, 0, 0]]);
     ok('pointer events map to absolute tablet coordinates and a left click');
+    const ring = await page.evaluate(() => {
+        const r = document.querySelector('#stage .tap-ring');
+        const s = document.getElementById('stage').getBoundingClientRect();
+        return r ? [parseFloat(r.style.left) + s.left, parseFloat(r.style.top) + s.top] : null;
+    });
+    assert.ok(ring && Math.abs(ring[0] - cx) < 2 && Math.abs(ring[1] - cy) < 2, `tap ring at ${ring}`);
+    ok('a ring shows where the press landed');
     const dot = await page.evaluate(() => {
         const c = document.getElementById('screen');
         return [...c.getContext('2d').getImageData(c.width / 2, c.height / 4, 1, 1).data];

@@ -174,6 +174,22 @@ function onSerialText(text) {
     }
 }
 
+function showTapRing(ev) {
+    const stage = $('stage');
+    const box = stage.getBoundingClientRect();
+    const ring = document.createElement('div');
+    ring.className = 'tap-ring';
+    ring.style.left = `${ev.clientX - box.left}px`;
+    ring.style.top = `${ev.clientY - box.top}px`;
+    ring.addEventListener('animationend', () => ring.remove());
+    stage.appendChild(ring);
+    // Never more than a few at once, even if animationend does not fire.
+    const rings = stage.querySelectorAll('.tap-ring');
+    for (let i = 0; i < rings.length - 4; i++) {
+        rings[i].remove();
+    }
+}
+
 function hideOverlay() {
     graphicsSeen = true;
     $('overlay').hidden = true;
@@ -383,6 +399,9 @@ async function start() {
     // Touching the screen also dismisses the boot overlay (it cannot tell
     // every guest video mode apart from the BIOS text mode).
     $('screen').addEventListener('pointerdown', hideOverlay);
+    // A ring where the press landed: Android may take many seconds to show
+    // its own reaction, and without this a tap looks lost.
+    $('screen').addEventListener('pointerdown', showTapRing);
     if (cfg.serial) {
         toggleSerial(true);
     }
