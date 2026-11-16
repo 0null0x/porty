@@ -148,7 +148,7 @@ function runOne(v, index) {
             PROBE_SECONDS: String(probeSeconds),
             PROBE: v.probe ? '1' : '0',
             LOOP_ROUNDS: String(v.loops),
-            STATUS_CONTEXT: `porty/webkit-mem ${v.name}`,
+            STATUS_CONTEXT: `porty/webkit-mem r${replica} ${v.name}`,
             VARIANT: v.name,
             ...(gcLog ? { DEBUG: 'pw:browser' } : {}),
         };

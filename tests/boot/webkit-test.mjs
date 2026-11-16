@@ -223,6 +223,52 @@ function mappings(pid) {
 
 const mb = (kb) => Math.round(kb / 1024);
 
+// CPU time of the content process's threads, by thread name (the engine
+// names its threads: GC helpers and collector, compiler worklists, workers).
+const CLOCK_TICKS = 100;
+let lastThreadTicks = null;
+function threadCpu(pid) {
+    const byName = {};
+    try {
+        for (const tid of readdirSync(`/proc/${pid}/task`)) {
+            try {
+                const stat = readFileSync(`/proc/${pid}/task/${tid}/stat`, 'utf8');
+                const close = stat.lastIndexOf(')');
+                const name = stat.slice(stat.indexOf('(') + 1, close).replace(/[0-9]+$/, '#').replace(/\s+/g, ' ').trim();
+                const fields = stat.slice(close + 2).split(' ');
+                const ticks = Number(fields[11]) + Number(fields[12]);
+                byName[name] = byName[name] || { ticks: 0, threads: 0 };
+                byName[name].ticks += ticks;
+                byName[name].threads += 1;
+            } catch (e) {
+                // the thread ended
+            }
+        }
+    } catch (e) {
+        return null;
+    }
+    return byName;
+}
+
+/** Share of a CPU each thread name used since the last call, busiest first: "name xN 95%". */
+function threadCpuDelta(pid) {
+    const now = { t: Date.now(), pid, byName: threadCpu(pid) };
+    if (!now.byName) {
+        return '';
+    }
+    const last = lastThreadTicks && lastThreadTicks.pid === pid ? lastThreadTicks : null;
+    lastThreadTicks = now;
+    if (!last) {
+        return '';
+    }
+    const seconds = (now.t - last.t) / 1000;
+    return Object.entries(now.byName)
+        .map(([name, v]) => [name, v.threads, (v.ticks - ((last.byName[name] || {}).ticks || 0)) / CLOCK_TICKS / seconds])
+        .filter(([, , share]) => share >= 0.03)
+        .sort((x, y) => y[2] - x[2]).slice(0, 8)
+        .map(([name, n, share]) => `${name}${n > 1 ? ` x${n}` : ''} ${Math.round(share * 100)}%`).join(', ');
+}
+
 /** {pid, name, rss, anon, file, shmem (MiB), total, count} of the biggest content process. */
 function memorySample(withMaps = false) {
     const procs = browserProcesses();
@@ -1294,6 +1340,7 @@ async function sample(label, every = 10000) {
     const m = memorySample(withMaps);
     const h = s.heap || {};
     const counters = await counterRates();
+    const cpu = m ? threadCpuDelta(m.pid) : '';
     const row = {
         t: Math.round((Date.now() - t0) / 1000), label,
         alive: h.jitAlive, compiled: h.jitCompiled, heapUsed: h.used, brk: h.brk,
@@ -1302,11 +1349,13 @@ async function sample(label, every = 10000) {
         total: m ? m.total : undefined,
         ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest, code: m.code, heaps: m.heaps, giant: m.giant, names: m.names } : {}),
         ...(counters && counters.rate ? { rates: counters.rate } : {}),
+        ...(cpu ? { cpu } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}" | ${describeMemory(m)}` +
-        (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : ''));
+        (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
+        (cpu ? ` | threads ${cpu}` : ''));
     return s;
 }
 
