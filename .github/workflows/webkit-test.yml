@@ -1,0 +1,157 @@
+# Runs the deployed site in Playwright's WebKit build (the engine of iPhone
+# Safari, on Linux) and in Chrome on the same kind of runner, on the phone
+# budget: what the browser supports, a model of QEMU-Wasm's JIT, the resume,
+# a tap on Gallery, JIT statistics and the memory of the browser's processes
+# (tests/boot/webkit-test.mjs).
+#
+# The run never fails, because every failed run emails the repository owner.
+# The outcome of each job is a commit status ("porty/webkit <query>" for
+# WebKit, "porty/webkit-chrome <query>" for Chrome), the job summary and a
+# "RESULT {json}" line in the log:
+#   gh api repos/<owner>/<repo>/commits/<sha>/statuses
+name: WebKit test
+
+on:
+  push:
+    branches: [swarm/webkit]
+    paths:
+      - .github/workflows/webkit-test.yml
+      - tests/boot/webkit-test.mjs
+      - tests/webkit/**
+  workflow_dispatch:
+    inputs:
+      queries:
+        description: Page parameters, one job per space-separated entry
+        type: string
+        default: wasmmem=1280&jitcap=4000 wasmmem=1280&jitcap=8000 wasmmem=1280&jitcap=15000
+      browsers:
+        description: Browsers (webkit, chrome), space separated
+        type: string
+        default: webkit chrome
+      minutes:
+        description: Deadline of one job's test in minutes
+        type: number
+        default: 30
+      probe_seconds:
+        description: Seconds to wait for Gallery after the tap
+        type: number
+        default: 480
+      bench:
+        description: 'JIT model: first (only the first query of each browser), all, none or only (no Android)'
+        type: string
+        default: first
+      device:
+        description: iphone (an iPhone's user agent, so the page takes its phone defaults) or desktop
+        type: string
+        default: iphone
+      coi:
+        description: 'Cross-origin isolation: auto, sw (only the page''s service worker) or route (headers added by the test)'
+        type: string
+        default: auto
+
+permissions:
+  contents: read
+  statuses: write  # the verdicts (tests/boot/webkit-test.mjs)
+
+concurrency:
+  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Matrix
+        id: matrix
+        env:
+          QUERIES: ${{ inputs.queries || 'wasmmem=1280&jitcap=4000 wasmmem=1280&jitcap=8000 wasmmem=1280&jitcap=15000' }}
+          BROWSERS: ${{ inputs.browsers || 'webkit chrome' }}
+          BENCH: ${{ inputs.bench || 'first' }}
+        run: |
+          # Only words of the characters page parameters and browser names need.
+          matrix="$(python3 -I - <<'EOF'
+          import json, os, re
+          word = re.compile(r"^[A-Za-z0-9_=&.,:%+-]{1,90}$")
+          queries = [q for q in os.environ["QUERIES"].split() if word.match(q)][:8] or ["wasmmem=1280&jitcap=4000"]
+          browsers = [b for b in os.environ["BROWSERS"].split() if b in ("webkit", "chrome")] or ["webkit"]
+          bench = os.environ["BENCH"] if os.environ["BENCH"] in ("first", "all", "none", "only") else "first"
+          jobs = []
+          for b in browsers:
+              for i, q in enumerate(queries):
+                  mode = {"all": "1", "none": "0", "only": "only"}.get(bench, "1" if i == 0 else "0")
+                  jobs.append({"browser": b, "query": q, "bench": mode})
+          print(json.dumps({"include": jobs}))
+          EOF
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix"
+
+  test:
+    name: ${{ matrix.browser }} ${{ matrix.query }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The pinned Playwright (tests/webkit/package-lock.json), without its
+      # install scripts.
+      - name: Install playwright-core
+        continue-on-error: true
+        working-directory: tests/webkit
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # Playwright's WebKit build and the system libraries it needs.  The
+      # download is untrusted: it gets a directory of its own outside the
+      # checkout, and nothing in it is run but the browser, by Playwright.
+      - name: Install WebKit
+        if: ${{ matrix.browser == 'webkit' }}
+        continue-on-error: true
+        working-directory: tests/webkit
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: |
+          mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+          npx --no-install playwright-core install --with-deps webkit
+          ls "$PLAYWRIGHT_BROWSERS_PATH"
+
+      - name: Test
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_DIR: ${{ github.workspace }}/tests/webkit
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          GITHUB_TOKEN: ${{ github.token }}
+          BROWSER: ${{ matrix.browser }}
+          QUERY: ${{ matrix.query }}
+          BENCH: ${{ matrix.bench }}
+          MINUTES: ${{ inputs.minutes || 30 }}
+          PROBE_SECONDS: ${{ inputs.probe_seconds || 480 }}
+          DEVICE: ${{ inputs.device || 'iphone' }}
+          COI: ${{ inputs.coi || 'auto' }}
+        run: |
+          # Project site of this repository: https://<owner>.github.io/<repo>/
+          SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          export SITE_URL
+          nproc
+          free -m
+          grep -m1 'model name' /proc/cpuinfo || true
+          # The test ends itself at its deadline; this only stops a hang
+          # before the job's own timeout would turn the run red.
+          timeout -k 30 "$((MINUTES + 25))m" node tests/boot/webkit-test.mjs || echo "the test ended with status $?"
