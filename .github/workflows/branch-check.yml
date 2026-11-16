@@ -47,7 +47,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools
+          sudo apt-get install -y -qq shellcheck xorriso squashfs-tools e2fsprogs qemu-utils cpio
 
       - name: Shell scripts
         id: shellcheck
@@ -112,7 +112,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso squashfs-tools
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
           (cd web && npm ci --ignore-scripts --no-audit --no-fund)
           (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
 
@@ -264,8 +264,9 @@ jobs:
           ISO_NAME: ${{ steps.versions.outputs.iso_name }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xorriso
-          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
+          df -h / /tmp
+          PORTY_QCOW2_SURVEY="16384 131072 262144 1048576" scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image
           rm -rf out/iso
           du -sb out/image out/image/* | sort -k2
 

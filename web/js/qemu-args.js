@@ -90,6 +90,13 @@ export function buildQemuArgs(cfg, manifest, paths) {
     const bus = ide ? 'ide' : 'virtio';
     const media = ide ? 'cdrom' : 'disk';
     const disk = manifest.disk;
+    // What the chunks are (image/manifest.json, scripts/prepare-image.sh):
+    // "qcow2", a compressed qcow2 holding the ext4 system image, which QEMU
+    // inflates itself (block/qcow2.c on top of block/porty.c); or "raw",
+    // the ISO's squashfs as it is (also every manifest before format 2).
+    // Read-only either way: the porty driver cannot write, and a clean qcow2
+    // opened read-only is never written.
+    const diskFormat = disk.format === 'qcow2' ? 'qcow2' : 'raw';
 
     const args = [
         '-M', 'pc,vmport=off',
@@ -121,9 +128,9 @@ export function buildQemuArgs(cfg, manifest, paths) {
         '-initrd', paths.initrd,
         '-append', buildKernelCmdline(cfg, manifest),
 
-        // Disk 0: system.sfs, fetched chunk by chunk (block/porty.c).
+        // Disk 0: the system image, fetched chunk by chunk (block/porty.c).
         '-drive', [
-            `if=${bus}`, 'index=0', `media=${media}`, 'format=raw', 'read-only=on',
+            `if=${bus}`, 'index=0', `media=${media}`, `format=${diskFormat}`, 'read-only=on',
             'file.driver=porty',
             `file.url=${paths.diskUrl.replace(/,/g, ',,')}`,
             `file.size=${disk.size}`,

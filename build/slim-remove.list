@@ -1,0 +1,25 @@
+# Paths removed from Android-x86's system image before it is published
+# (scripts/prepare-image.sh, scripts/slim-system.py).  One absolute path
+# inside the image per line; directories go with everything in them.  A path
+# the image does not have is skipped, so alternative names can be listed.
+#
+# Google's apps (the ISO inherits vendor/google/products/gms.mk).  None of
+# them is needed to boot, and Play services is the most expensive package
+# of a first boot.  Their permission and sysconfig XML files under /etc are
+# left alone: entries for packages that are not installed are ignored.
+/priv-app/PrebuiltGmsCore
+/priv-app/GmsCore
+/priv-app/GmsCoreSetupPrebuilt
+/priv-app/Phonesky
+/priv-app/Vending
+/priv-app/GoogleServicesFramework
+/priv-app/GoogleLoginService
+/priv-app/GoogleBackupTransport
+/priv-app/GoogleFeedback
+/priv-app/GoogleOneTimeInitializer
+/priv-app/GooglePartnerSetup
+/priv-app/AndroidPlatformServices
+/priv-app/ConfigUpdater
+/app/GoogleContactsSyncAdapter
+/app/GoogleCalendarSyncAdapter
+/priv-app/GoogleContactsSyncAdapter

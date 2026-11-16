@@ -168,6 +168,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
         'file.url=https://example.test/porty/image/system,file.size=900000000,' +
         'file.chunk-size=2097152,file.cache-chunks=64,file.parallel=4');
     assert.equal(drives[1], 'if=virtio,index=1,media=disk,format=raw,file=/img/ramdisk.img');
+    // a qcow2 system disk (manifest format 2) is opened as qcow2 over porty, read-only
+    const qcow2 = buildQemuArgs(cfg, { ...manifest, disk: { ...manifest.disk, format: 'qcow2' } }, paths);
+    assert.ok(qcow2.includes(drives[0].replace('format=raw', 'format=qcow2')));
     assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
     assert.ok(!buildQemuArgs(parseConfig('?usb=0', {}), manifest, paths).includes('usb-tablet'));
     // the RTC follows the dilated virtual clock, and only then
