@@ -272,7 +272,9 @@ export function snapshotArgs(snap, paths, indexPath) {
  * @param url   base URL (or directory) of the chunk files; '' leaves it
  *              out, and QEMU then looks next to the index file
  * @param tag   true adds "?v=<hash>" to every file, so that a cache can
- *              never serve a chunk of another snapshot
+ *              never serve a chunk of another snapshot; 16 hex digits
+ *              that name the snapshot add "&s=<them>" as well, which the
+ *              disk cache keys its versions by (diskcache-sw.js)
  */
 export function snapshotIndex(snap, url = '', tag = false) {
     const lines = ['porty-snapshot 1'];
@@ -283,8 +285,9 @@ export function snapshotIndex(snap, url = '', tag = false) {
         lines.push(`url ${url}`);
     }
     lines.push(`chunk-size ${snap.chunk_size}`, `size ${snap.uncompressed_size}`);
+    const version = typeof tag === 'string' && /^[0-9a-f]{16}$/.test(tag) ? `&s=${tag}` : '';
     for (const c of snap.chunks) {
-        lines.push(`chunk ${c.size} ${c.sha256} ${c.file}${tag ? `?v=${c.sha256.slice(0, 16)}` : ''}`);
+        lines.push(`chunk ${c.size} ${c.sha256} ${c.file}${tag ? `?v=${c.sha256.slice(0, 16)}${version}` : ''}`);
     }
     return `${lines.join('\n')}\n`;
 }

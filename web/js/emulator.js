@@ -5,6 +5,7 @@ import { MIB, chooseWasmMemoryMb, fallbackLadder, requiredWasmMemoryMb } from '.
 import { buildKernelCmdline, buildQemuArgs } from './qemu-args.js';
 import { WASM_PAGE, findMemoryImport, setMemoryImportPages } from './wasm-patch.js';
 import { Display } from './display.js';
+import { snapshotVersion } from './diskcache.js';
 import { applyBootDiet, dietFixes, dietProps } from './boot-diet.js';
 import {
     SNAPSHOT_DIR, SNAP_DONE, SNAP_FAILED, STAGE_RESUMING, checkSnapshot, describeResume, readSnapshotStats,
@@ -97,8 +98,12 @@ export class Emulator {
      *        whether a snapshot on the site may be resumed (snapshot.js)
      * @param {(e: Error) => void} [options.onResumeFailed]
      *        QEMU stopped while loading the snapshot; without it, onFatal
+     * @param {object} [options.diskCache]
+     *        a DiskCache (diskcache.js): chunks are kept on the device
      */
-    constructor({ cfg, canvas, serial, baseUrl, onStatus, onFatal, resume = {}, onResumeFailed = null }) {
+    constructor({
+        cfg, canvas, serial, baseUrl, onStatus, onFatal, resume = {}, onResumeFailed = null, diskCache = null,
+    }) {
         this.cfg = { ...cfg };
         this.canvas = canvas;
         this.serial = serial;
@@ -112,6 +117,9 @@ export class Emulator {
         this.notes = [];
         this.resume = { mode: 'auto', veto: '', env: {}, ...resume };
         this.onResumeFailed = onResumeFailed;
+        this.diskCache = diskCache;
+        // Milliseconds from start() to each step, for tests and measurements.
+        this.timings = {};
         // Why this start boots although a snapshot was asked for or on offer.
         this.resumeNote = '';
         this.resuming = false;
@@ -173,6 +181,11 @@ export class Emulator {
                 'in-app browsers often block service workers.');
         }
 
+        const startedAt = performance.now();
+        const mark = (step) => {
+            this.timings[step] = Math.round(performance.now() - startedAt);
+        };
+        this.mark = mark;
         this.status('Reading build information');
         const base = this.baseUrl;
         const [build, manifest, qemuInfo] = await Promise.all([
@@ -184,6 +197,14 @@ export class Emulator {
         this.manifest = manifest;
         this.build = build;
         let plan = await this.planResume(build);
+        if (this.diskCache) {
+            // Before QEMU's threads exist: they inherit the service worker
+            // that answers their chunk requests from the device.
+            const note = await this.diskCache.prepare(manifest.disk).catch((e) => `No disk cache (${e}).`);
+            if (note) {
+                this.notes.push(note);
+            }
+        }
 
         // --- downloads -------------------------------------------------------
         const files = [
@@ -206,6 +227,7 @@ export class Emulator {
         await Promise.all(files.map(async (f) => {
             blobs[f.key] = await fetchBytes(f.url, report);
         }));
+        mark('downloaded');
         for (const part of ['kernel', 'initrd', 'ramdisk']) {
             if (blobs[part].length !== manifest[part].size) {
                 throw new StartError(`${manifest[part].file} has the wrong size ` +
@@ -315,7 +337,7 @@ export class Emulator {
                     `(${plan.snap.query}) give on this page; the snapshot's arguments are used.`);
             }
         }
-        const snapshotIndexText = plan ? snapshotIndex(plan.snap, `${base}${SNAPSHOT_DIR}`, true) : null;
+        const snapshotIndexText = plan ? snapshotIndex(plan.snap, `${base}${SNAPSHOT_DIR}`, snapshotVersion(plan.snap) || true) : null;
         this.args = args;
         this.cmdline = plan ? (args[args.indexOf('-append') + 1] || '') : buildKernelCmdline(this.cfg, manifest);
 
@@ -423,6 +445,7 @@ export class Emulator {
         const instance = await createQemu(Module);
         this.qemuStarted = true;
         this.module = instance;
+        mark('qemu');
 
         // Same workaround as QEMU-Wasm's own example page: never report the
         // PTY as readable when it is not, or QEMU spins on stdin.
@@ -486,6 +509,7 @@ export class Emulator {
         if (stats.state === SNAP_DONE) {
             this.resuming = false;
             this.resumed = true;
+            this.mark('resumed');
             this.status('Android resumed');
             return false;
         }

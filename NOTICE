@@ -50,7 +50,8 @@ Android-x86
 coi-serviceworker 0.1.7
     https://github.com/gzuidhof/coi-serviceworker
     Copyright (c) 2021 Guido Zuidhof.  License: MIT.
-    web/coi-serviceworker.js is an unmodified copy; license text in
+    web/coi-serviceworker.js is a copy with two marked additions (it hands
+    chunk requests to web/js/diskcache-sw.js); license text in
     web/vendor/coi-serviceworker/LICENSE.
 
 xterm.js 5.3.0 and xterm-pty 0.10.1

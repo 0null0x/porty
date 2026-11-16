@@ -1,0 +1,123 @@
+# Does the disk cache work in Safari's engine?  QEMU fetches its disk and
+# snapshot chunks with synchronous XMLHttpRequests from worker threads; the
+# disk cache (web/js/diskcache-sw.js) only sees them if such a request
+# passes through the page's service worker.  The UI tests show that for
+# Chrome.  This runs tests/ui/diskcache-probe.html in Playwright's WebKit
+# (and Firefox, and Chromium as the control) against the miniature site of
+# tests/site-smoke.sh.
+#
+# The run never fails; the verdicts are the commit statuses
+# "porty/diskcache-probe <engine>" and the job summary.
+name: Disk cache probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['swarm/disk-cache']
+    paths:
+      - .github/workflows/diskcache-probe.yml
+      - tests/ui/diskcache-probe*
+      - web/coi-serviceworker.js
+      - web/js/diskcache.js
+      - web/js/diskcache-sw.js
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: diskcache-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  probe:
+    name: Synchronous XHR from workers through the service worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build the miniature site
+        id: site
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          tests/site-smoke.sh "$RUNNER_TEMP/smoke" > "$RUNNER_TEMP/smoke.log" || { tail -20 "$RUNNER_TEMP/smoke.log"; exit 1; }
+          cp tests/ui/diskcache-probe.html tests/ui/diskcache-probe-worker.js "$RUNNER_TEMP/smoke/dist-snapshot/"
+
+      - name: Install Playwright with WebKit, Firefox and Chromium
+        id: playwright
+        if: steps.site.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw"
+          cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.65.1
+          npx playwright install --with-deps webkit firefox chromium
+
+      - name: Probe
+        id: probe
+        if: steps.playwright.outcome == 'success'
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_DIR: ${{ runner.temp }}/pw
+        run: |
+          : > "$RUNNER_TEMP/probe.txt"
+          port=8090
+          for mode in pages isolated; do
+            flag=()
+            [[ "$mode" == pages ]] || flag=(--isolate)
+            python3 tests/ui/serve.py "$RUNNER_TEMP/smoke/dist-snapshot" "$port" "${flag[@]}" &
+            server=$!
+            sleep 1
+            for engine in webkit firefox chromium; do
+              echo "::group::$engine, $mode"
+              timeout 300 node tests/ui/diskcache-probe.mjs "http://localhost:$port/" "$engine" 2>&1 | tee "$RUNNER_TEMP/probe.log" || true
+              echo "::endgroup::"
+              line="$(grep -m1 '^PROBE ' "$RUNNER_TEMP/probe.log" || echo "PROBE $engine: no verdict")"
+              echo "$mode|$line" | tee -a "$RUNNER_TEMP/probe.txt"
+            done
+            kill "$server" 2>/dev/null || true
+            port=$((port + 1))
+          done
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          file="$RUNNER_TEMP/probe.txt"
+          {
+            echo "## Disk cache probe"
+            echo
+            echo "Server mode \"pages\": no COOP/COEP headers, as on GitHub Pages; \"isolated\": the server sends them."
+            echo
+            if [[ -s "$file" ]]; then sed 's/^/- /' "$file"; else echo "- the probe did not run (site or Playwright missing)"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ -s "$file" ]] || exit 0
+          while IFS='|' read -r mode line; do
+            engine="$(sed -E 's/^PROBE ([a-z]+):.*/\1/' <<< "$line")"
+            state=failure
+            case "$line" in *": WORKS:"*) state=success ;; *"could not run"*|*"no verdict"*) state=error ;; esac
+            gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="porty/diskcache-probe $engine $mode" \
+              -f description="$(sed -E 's/^PROBE [a-z]+: //' <<< "$line" | cut -c1-139)" -f target_url="$RUN_URL" >/dev/null || true
+          done < "$file"
+          exit 0

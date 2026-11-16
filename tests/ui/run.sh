@@ -26,10 +26,10 @@ stop() {
     fi
 }
 trap stop EXIT
-serve() { # <site-dir>: with the fake QEMU, on $port
+serve() { # <site-dir> [--isolate]: with the fake QEMU, on $port
     stop
     cp "$here/fake-qemu.js" "$1/qemu/out.js"
-    python3 "$here/serve.py" "$1" "$port" &
+    python3 "$here/serve.py" "$1" "$port" ${2:+"$2"} &
     server=$!
     for _ in $(seq 50); do
         curl -fsS -o /dev/null "http://localhost:$port/index.html" 2>/dev/null && return 0
@@ -46,6 +46,13 @@ node "$here/ui-test.mjs" "http://localhost:$port/" "$query"
 # A site with a snapshot (site-smoke.sh assembled it with --snapshot).
 serve "$work/dist-snapshot"
 node "$here/ui-resume-test.mjs" "http://localhost:$port/" ok
+
+# The disk cache: chunks stay on the device, on a host without COOP/COEP
+# headers (GitHub Pages) and on one that sends them, where the page itself
+# has to register the service worker.
+node "$here/ui-diskcache-test.mjs" "http://localhost:$port/"
+serve "$work/dist-snapshot" --isolate
+node "$here/ui-diskcache-test.mjs" "http://localhost:$port/" isolated
 
 # The same with one chunk file missing.  The trees share hard links, so
 # copy rather than edit in place.

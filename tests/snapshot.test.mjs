@@ -208,6 +208,10 @@ const snapshot = () => ({
         `chunk 30 ${sha('3')} 000002.zz?v=${'3'.repeat(16)}`,
         '',
     ].join('\n'));
+    // The page also names the snapshot ("&s="), for the disk cache.
+    const tagged = snapshotIndex(snap, 'https://example.test/porty/snapshot', 'abcdef0123456789');
+    assert.ok(tagged.includes(`chunk 30 ${sha('3')} 000002.zz?v=${'3'.repeat(16)}&s=abcdef0123456789\n`));
+    assert.ok(!snapshotIndex(snap, 'https://example.test/s', 'not hex').includes('&s='));
     // Natively the chunks sit next to the index and have plain names.
     const local = snapshotIndex(snap);
     assert.ok(!local.includes('url ') && local.includes(`chunk 30 ${sha('3')} 000002.zz\n`));

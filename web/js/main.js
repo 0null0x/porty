@@ -5,6 +5,7 @@ import { PARAM_HELP, PHONE_LEVELS, applyPhoneLevel, parseConfig, requiredWasmMem
 import { RunLog, browserStorage, describeRun, nextLevel } from './crash-guard.js';
 import { Emulator, StartError, checkEnvironment } from './emulator.js';
 import { describeDiet } from './boot-diet.js';
+import { DISKCACHE_HELP, DiskCache, describeUsage, megabytes } from './diskcache.js';
 import { CONTROL, Input } from './input.js';
 import { SerialConsole } from './serial.js';
 import { resumeMode, resumeVeto, storeResumeFailure, takeResumeFailure } from './snapshot.js';
@@ -41,6 +42,8 @@ function sessionStore() {
         return null;
     }
 }
+// Chunks of the image and of the snapshot stay on this device (diskcache.js).
+const diskCache = new DiskCache({ search: location.search, baseUrl });
 const resumeFailure = takeResumeFailure(sessionStore());
 const resume = {
     mode: resumeMode(location.search),
@@ -62,6 +65,7 @@ function describeConfig() {
         (cfg.usb ? '' : ' usb=0') + (cfg.jit >= 0 ? ` jit=${cfg.jit}` : '') +
         (cfg.jitcap > 0 ? ` jitcap=${cfg.jitcap}` : '') + (cfg.jitgc === false ? ' jitgc=0' : '') +
         (cfg.timescale > 1 ? ` timescale=${cfg.timescale}` : '') +
+        (diskCache.setting.enabled ? '' : ' diskcache=0') +
         (cfg.mobile ? (cfg.phoneLevel ? ` (phone, smaller memory step ${cfg.phoneLevel})` : ' (phone defaults)') : '');
 }
 
@@ -97,25 +101,52 @@ function explainLastRun() {
     box.hidden = false;
 }
 
+let lastBuild = null; // promise of build.json
+/** Say how much of Android is stored on this device, and offer to delete it. */
+async function showDiskUsage(buildInfo = lastBuild) {
+    const note = $('diskcache-note');
+    const text = $('diskcache-text');
+    const button = $('diskcache-clear');
+    try {
+        let usage = await diskCache.usage();
+        if (usage.bytes) {
+            // The manifests give the real sizes of what is stored.
+            const json = (path) => fetch(`${baseUrl}${path}`, { cache: 'no-cache' })
+                .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+            const build = await buildInfo;
+            const [image, snap] = await Promise.all([json('image/manifest.json'),
+                build && build.snapshot ? json('snapshot/manifest.json') : null]);
+            usage = await diskCache.usage(image && image.disk, snap);
+        }
+        text.textContent = describeUsage(usage);
+        button.hidden = !usage.bytes;
+        note.hidden = false;
+    } catch (e) {
+        note.hidden = true;
+    }
+}
+
 function fillIntro() {
     explainLastRun();
     $('cfgline').textContent = describeConfig() + describeDiet(cfg);
     $('memnote').textContent =
         `${cfg.mem} MB of RAM is reserved for the guest (about ${requiredWasmMemoryMb(cfg)} MB in total).`;
     const table = $('params');
-    for (const [name, text] of PARAM_HELP) {
+    for (const [name, text] of [...PARAM_HELP, DISKCACHE_HELP]) {
         const row = table.insertRow();
         row.insertCell().textContent = `?${name}=`;
         row.insertCell().textContent = text;
     }
-    fetch(`${baseUrl}build.json`, { cache: 'no-cache' })
+    lastBuild = fetch(`${baseUrl}build.json`, { cache: 'no-cache' })
         .then((r) => (r.ok ? r.json() : null))
         .then((build) => {
             if (build) {
                 $('buildid').textContent = `Build ${String(build.id).slice(0, 10)}, ${build.built_at || ''}.`;
             }
+            return build;
         })
-        .catch(() => {});
+        .catch(() => null);
+    showDiskUsage();
 }
 
 function precheck() {
@@ -248,6 +279,7 @@ function fail(error) {
         `config: ${describeConfig()}${describeDiet(cfg)}`,
         `browser: ${navigator.userAgent}`,
         `crossOriginIsolated: ${globalThis.crossOriginIsolated}`,
+        `service worker: ${navigator.serviceWorker && navigator.serviceWorker.controller ? 'controls the page' : 'none'}`,
         ...(emulator && emulator.wasmMemoryMb ? [`wasm memory: ${emulator.wasmMemoryMb} MiB`] : []),
         ...(heap ? [`QEMU heap: ${heap.used} MiB in use, break at ${heap.brk} MiB` +
             (heap.coroutines !== undefined ? `, ${heap.coroutines} coroutines` : '') +
@@ -271,6 +303,7 @@ function renderLoop() {
     let darkScreen = false;
     let lastContentCheck = 0;
     let lastLogged = 0;
+    let fromDevice = '';
 
     const tick = (now) => {
         if (app.dataset.state !== 'running') {
@@ -311,6 +344,11 @@ function renderLoop() {
                     graphics: graphicsSeen,
                     ...(heap ? { heapUsed: heap.used } : {}),
                 });
+                // How much of that the device's own copy answered.
+                diskCache.stats().then((stats) => {
+                    emulator.diskCacheStats = stats;
+                    fromDevice = stats && stats.hitBytes ? `, ${megabytes(stats.hitBytes)} from this device` : '';
+                }).catch(() => {});
             }
             const beat = display.heartbeat;
             if (beat !== lastBeat) {
@@ -323,7 +361,7 @@ function renderLoop() {
                 paused || stalled ? 'warn' : graphicsSeen ? 'ok' : '');
             $('btn-pause').textContent = paused ? 'Resume' : 'Pause';
             $('stats').textContent = `${frames} fps, disk ${disk.megabytes.toFixed(0)} MB` +
-                (disk.inFlight ? ` (${disk.inFlight} loading)` : '') +
+                fromDevice + (disk.inFlight ? ` (${disk.inFlight} loading)` : '') +
                 (disk.errors ? `, ${disk.errors} retries` : '');
             if (!graphicsSeen) {
                 if (darkScreen) {
@@ -369,6 +407,7 @@ async function start() {
             onFatal: fail,
             resume,
             onResumeFailed: resumeFailed,
+            diskCache,
         });
         // For debugging from the browser console (and for tests/ui).
         globalThis.__porty = emulator;
@@ -468,6 +507,13 @@ function bind() {
         }
     });
     $('fail-reload').addEventListener('click', () => location.reload());
+    $('diskcache-clear').addEventListener('click', () => {
+        $('diskcache-clear').disabled = true;
+        diskCache.clear().catch(() => {}).then(() => {
+            $('diskcache-clear').disabled = false;
+            return showDiskUsage();
+        });
+    });
     $('lastrun-reset').addEventListener('click', () => {
         runLog.setLevel(0);
         location.reload();
