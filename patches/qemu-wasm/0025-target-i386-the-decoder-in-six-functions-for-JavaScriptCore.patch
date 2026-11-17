@@ -1,0 +1,425 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 14:00:00 +0000
+Subject: [PATCH] target/i386: the decoder in six functions, for JavaScriptCore
+
+disas_insn_body() (patch 0021) was 88 KB of WebAssembly: one switch with
+the code of every instruction.  JavaScriptCore never optimizes a function
+over Options::maximumOMGCandidateCost bytes (40000 in WebKit 2.48, 100000
+later), and optimizing one just under the limit with B3 added 1.6 to 2 GB
+to WebKit's peak.  The decoder runs for every guest instruction of every
+translated block, millions of blocks during an app launch, so in Safari
+it either stayed in the baseline tier or cost gigabytes.
+
+The opcode switch is cut into six consecutive parts of 550 to 660 lines,
+each a noinline function with the decoder's locals that it uses (env,
+cpu, b, prefixes and dflag come in a DisasInsnArgs).  A part without a
+case for the opcode returns DISAS_INSN_NOT_MINE before it touches
+anything, so disas_insn_dispatch() asks the parts in turn the first time
+it meets an opcode, remembers in disas_insn_part_of[] which part took it,
+and later calls that part directly.  illegal_op and unknown_op become
+return codes.  The parts are called through disas_insn_parts[], pointers
+indexed at run time, which neither LLVM nor Binaryen inlines (Binaryen
+inlines every function with a single direct caller, whatever its size).
+Three cases that jumped to labels in other parts of the switch (lcall and
+ljmp with an immediate, nop) move next to those labels; the code of every
+case is otherwise unchanged.
+---
+  target/i386/tcg/translate.c | 294 ++++++++++++++++++++++++++++++++++++--------
+  1 file changed, 240 insertions(+), 54 deletions(-)
+
+diff --git a/target/i386/tcg/translate.c b/target/i386/tcg/translate.c
+index 9020c97..5cd9a4f 100644
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -3121,13 +3121,92 @@ static bool disas_insn(DisasContext *s, CPUState *cpu)
+     return disas_insn_body(s, cpu);
+ }
+ 
++/*
++ * Porty: the decoder in pieces, for JavaScriptCore.  In one function the
++ * opcode switch was 88 KB of WebAssembly, and JavaScriptCore never
++ * optimizes a function that large (Options::maximumOMGCandidateCost,
++ * 40000 bytes in WebKit 2.48, 100000 later), or optimizes it at a cost of
++ * gigabytes when it is just under the limit.  The switch is cut into
++ * 6 consecutive parts, each a function with the decoder's locals; a part
++ * that has no case for the opcode returns DISAS_INSN_NOT_MINE at once.
++ * The parts are called through disas_insn_parts[], so that neither the
++ * compiler nor Binaryen inlines them back into one function, and
++ * disas_insn_part_of[] remembers which part took each opcode.
++ */
++typedef struct DisasInsnArgs {
++    CPUX86State *env;
++    CPUState *cpu;
++    int b, prefixes;
++    MemOp dflag;
++} DisasInsnArgs;
++
++enum {
++    DISAS_INSN_DONE,
++    DISAS_INSN_ILLEGAL,
++    DISAS_INSN_UNKNOWN,
++    DISAS_INSN_NOT_MINE,
++};
++
++typedef int (*DisasInsnPart)(DisasContext *s, const DisasInsnArgs *args);
++static int disas_insn_part1(DisasContext *s,
++                            const DisasInsnArgs *args);
++static int disas_insn_part2(DisasContext *s,
++                            const DisasInsnArgs *args);
++static int disas_insn_part3(DisasContext *s,
++                            const DisasInsnArgs *args);
++static int disas_insn_part4(DisasContext *s,
++                            const DisasInsnArgs *args);
++static int disas_insn_part5(DisasContext *s,
++                            const DisasInsnArgs *args);
++static int disas_insn_part6(DisasContext *s,
++                            const DisasInsnArgs *args);
++
++static DisasInsnPart const disas_insn_parts[] = {
++    disas_insn_part1,
++    disas_insn_part2,
++    disas_insn_part3,
++    disas_insn_part4,
++    disas_insn_part5,
++    disas_insn_part6,
++};
++
++/* The part that took each opcode, from 1; 0 not known yet; more: none. */
++static uint8_t disas_insn_part_of[0x200];
++
++static bool disas_insn_dispatch(DisasContext *s, const DisasInsnArgs *args)
++{
++    unsigned part = qatomic_read(&disas_insn_part_of[args->b]);
++    int r = DISAS_INSN_NOT_MINE;
++
++    if (part == 0) {
++        /* The first time: ask each part in turn. */
++        for (part = 1; part <= ARRAY_SIZE(disas_insn_parts); part++) {
++            r = disas_insn_parts[part - 1](s, args);
++            if (r != DISAS_INSN_NOT_MINE) {
++                break;
++            }
++        }
++        qatomic_set(&disas_insn_part_of[args->b], part);
++    } else if (part <= ARRAY_SIZE(disas_insn_parts)) {
++        r = disas_insn_parts[part - 1](s, args);
++    }
++    switch (r) {
++    case DISAS_INSN_ILLEGAL:
++        gen_illegal_opcode(s);
++        break;
++    case DISAS_INSN_UNKNOWN:
++    case DISAS_INSN_NOT_MINE:
++        gen_unknown_opcode(args->env, s);
++        break;
++    }
++    return true;
++}
++
+ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState *cpu)
+ {
+     CPUX86State *env = cpu_env(cpu);
+     int b, prefixes;
+-    int shift;
+-    MemOp ot, aflag, dflag;
+-    int modrm, reg, rm, mod, op, opreg, val;
++    MemOp aflag, dflag;
+ 
+     prefixes = 0;
+ 
+@@ -3233,7 +3312,21 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+     s->aflag = aflag;
+     s->dflag = dflag;
+ 
+-    /* now check op code */
++    /* now check op code (Porty: in parts, see disas_insn_parts[]) */
++    return disas_insn_dispatch(s, &(DisasInsnArgs) {
++        .env = env, .cpu = cpu, .b = b, .prefixes = prefixes,
++        .dflag = dflag,
++    });
++}
++
++static int __attribute__((noinline)) disas_insn_part1(DisasContext *s,
++                                                      const DisasInsnArgs *args)
++{
++    CPUX86State *env = args->env;
++    int b = args->b;
++    MemOp ot, dflag = args->dflag;
++    int modrm, reg, rm, mod, op, opreg, val;
++
+     switch (b) {
+         /**************************/
+         /* arith & logic */
+@@ -3686,6 +3779,34 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+         }
+         break;
+ 
++    case 0x9a: /* lcall im */
++        {
++            unsigned int selector, offset;
++
++            if (CODE64(s))
++                goto illegal_op;
++            ot = dflag;
++            offset = insn_get(env, s, ot);
++            selector = insn_get(env, s, MO_16);
++
++            tcg_gen_movi_tl(s->T0, selector);
++            tcg_gen_movi_tl(s->T1, offset);
++        }
++        goto do_lcall;
++    case 0xea: /* ljmp im */
++        {
++            unsigned int selector, offset;
++
++            if (CODE64(s))
++                goto illegal_op;
++            ot = dflag;
++            offset = insn_get(env, s, ot);
++            selector = insn_get(env, s, MO_16);
++
++            tcg_gen_movi_tl(s->T0, selector);
++            tcg_gen_movi_tl(s->T1, offset);
++        }
++        goto do_ljmp;
+     case 0x84: /* test Ev, Gv */
+     case 0x85:
+         ot = mo_b_d(b, dflag);
+@@ -3840,6 +3961,26 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+         gen_op_update2_cc(s);
+         set_cc_op(s, CC_OP_ADDB + ot);
+         break;
++    default:
++        return DISAS_INSN_NOT_MINE;
++    }
++    return DISAS_INSN_DONE;
++ illegal_op:
++    return DISAS_INSN_ILLEGAL;
++ unknown_op:
++    return DISAS_INSN_UNKNOWN;
++}
++
++static int __attribute__((noinline)) disas_insn_part2(DisasContext *s,
++                                                      const DisasInsnArgs *args)
++{
++    CPUX86State *env = args->env;
++    int b = args->b, prefixes = args->prefixes;
++    int shift;
++    MemOp ot, dflag = args->dflag;
++    int modrm, reg, rm, mod, op, opreg, val;
++
++    switch (b) {
+     case 0x1b0:
+     case 0x1b1: /* cmpxchg Ev, Gv */
+         {
+@@ -4232,6 +4373,22 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+         }
+         break;
+ 
++    case 0x90: /* nop */
++        /* XXX: correct lock test for all insn */
++        if (prefixes & PREFIX_LOCK) {
++            goto illegal_op;
++        }
++        /* If REX_B is set, then this is xchg eax, r8d, not a nop.  */
++        if (REX_B(s)) {
++            goto do_xchg_reg_eax;
++        }
++        if (prefixes & PREFIX_REPZ) {
++            gen_update_cc_op(s);
++            gen_update_eip_cur(s);
++            gen_helper_pause(tcg_env, cur_insn_len_i32(s));
++            s->base.is_jmp = DISAS_NORETURN;
++        }
++        break;
+     case 0x91 ... 0x97: /* xchg R, EAX */
+     do_xchg_reg_eax:
+         ot = dflag;
+@@ -4377,6 +4534,23 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+ 
+         /************************/
+         /* floats */
++    default:
++        return DISAS_INSN_NOT_MINE;
++    }
++    return DISAS_INSN_DONE;
++ illegal_op:
++    return DISAS_INSN_ILLEGAL;
++}
++
++static int __attribute__((noinline)) disas_insn_part3(DisasContext *s,
++                                                      const DisasInsnArgs *args)
++{
++    CPUX86State *env = args->env;
++    int b = args->b;
++    MemOp dflag = args->dflag;
++    int modrm, rm, mod, op, opreg;
++
++    switch (b) {
+     case 0xd8 ... 0xdf:
+         {
+             bool update_fip = true;
+@@ -4937,6 +5111,25 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+         /************************/
+         /* string ops */
+ 
++    default:
++        return DISAS_INSN_NOT_MINE;
++    }
++    return DISAS_INSN_DONE;
++ illegal_op:
++    return DISAS_INSN_ILLEGAL;
++ unknown_op:
++    return DISAS_INSN_UNKNOWN;
++}
++
++static int __attribute__((noinline)) disas_insn_part4(DisasContext *s,
++                                                      const DisasInsnArgs *args)
++{
++    CPUX86State *env = args->env;
++    int b = args->b, prefixes = args->prefixes;
++    MemOp ot, dflag = args->dflag;
++    int modrm, reg, rm, mod, op, val;
++
++    switch (b) {
+     case 0xa4: /* movsS */
+     case 0xa5:
+         ot = mo_b_d(b, dflag);
+@@ -5149,20 +5342,6 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+             gen_jmp_rel(s, dflag, diff, 0);
+         }
+         break;
+-    case 0x9a: /* lcall im */
+-        {
+-            unsigned int selector, offset;
+-
+-            if (CODE64(s))
+-                goto illegal_op;
+-            ot = dflag;
+-            offset = insn_get(env, s, ot);
+-            selector = insn_get(env, s, MO_16);
+-
+-            tcg_gen_movi_tl(s->T0, selector);
+-            tcg_gen_movi_tl(s->T1, offset);
+-        }
+-        goto do_lcall;
+     case 0xe9: /* jmp im */
+         {
+             int diff = (dflag != MO_16
+@@ -5172,20 +5351,6 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+             gen_jmp_rel(s, dflag, diff, 0);
+         }
+         break;
+-    case 0xea: /* ljmp im */
+-        {
+-            unsigned int selector, offset;
+-
+-            if (CODE64(s))
+-                goto illegal_op;
+-            ot = dflag;
+-            offset = insn_get(env, s, ot);
+-            selector = insn_get(env, s, MO_16);
+-
+-            tcg_gen_movi_tl(s->T0, selector);
+-            tcg_gen_movi_tl(s->T1, offset);
+-        }
+-        goto do_ljmp;
+     case 0xeb: /* jmp Jb */
+         {
+             int diff = (int8_t)insn_get(env, s, MO_8);
+@@ -5533,22 +5698,6 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+         break;
+         /************************/
+         /* misc */
+-    case 0x90: /* nop */
+-        /* XXX: correct lock test for all insn */
+-        if (prefixes & PREFIX_LOCK) {
+-            goto illegal_op;
+-        }
+-        /* If REX_B is set, then this is xchg eax, r8d, not a nop.  */
+-        if (REX_B(s)) {
+-            goto do_xchg_reg_eax;
+-        }
+-        if (prefixes & PREFIX_REPZ) {
+-            gen_update_cc_op(s);
+-            gen_update_eip_cur(s);
+-            gen_helper_pause(tcg_env, cur_insn_len_i32(s));
+-            s->base.is_jmp = DISAS_NORETURN;
+-        }
+-        break;
+     case 0x9b: /* fwait */
+         if ((s->flags & (HF_MP_MASK | HF_TS_MASK)) ==
+             (HF_MP_MASK | HF_TS_MASK)) {
+@@ -5562,6 +5711,25 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+     case 0xcc: /* int3 */
+         gen_interrupt(s, EXCP03_INT3);
+         break;
++    default:
++        return DISAS_INSN_NOT_MINE;
++    }
++    return DISAS_INSN_DONE;
++ illegal_op:
++    return DISAS_INSN_ILLEGAL;
++ unknown_op:
++    return DISAS_INSN_UNKNOWN;
++}
++
++static int __attribute__((noinline)) disas_insn_part5(DisasContext *s,
++                                                      const DisasInsnArgs *args)
++{
++    CPUX86State *env = args->env;
++    int b = args->b, prefixes = args->prefixes;
++    MemOp ot, dflag = args->dflag;
++    int modrm, reg, mod, op, val;
++
++    switch (b) {
+     case 0xcd: /* int N */
+         val = x86_ldub_code(env, s);
+         if (check_vm86_iopl(s)) {
+@@ -6163,6 +6331,26 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+             /* nothing to do */
+         }
+         break;
++    default:
++        return DISAS_INSN_NOT_MINE;
++    }
++    return DISAS_INSN_DONE;
++ illegal_op:
++    return DISAS_INSN_ILLEGAL;
++ unknown_op:
++    return DISAS_INSN_UNKNOWN;
++}
++
++static int __attribute__((noinline)) disas_insn_part6(DisasContext *s,
++                                                      const DisasInsnArgs *args)
++{
++    CPUX86State *env = args->env;
++    CPUState *cpu = args->cpu;
++    int b = args->b, prefixes = args->prefixes;
++    MemOp ot, dflag = args->dflag;
++    int modrm, reg, rm, mod, op;
++
++    switch (b) {
+     case 0x63: /* arpl or movslS (x86_64) */
+ #ifdef TARGET_X86_64
+         if (CODE64(s)) {
+@@ -6820,15 +7008,13 @@ static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState
+         disas_insn_new(s, cpu, b);
+         break;
+     default:
+-        goto unknown_op;
++        return DISAS_INSN_NOT_MINE;
+     }
+-    return true;
++    return DISAS_INSN_DONE;
+  illegal_op:
+-    gen_illegal_opcode(s);
+-    return true;
++    return DISAS_INSN_ILLEGAL;
+  unknown_op:
+-    gen_unknown_opcode(env, s);
+-    return true;
++    return DISAS_INSN_UNKNOWN;
+ }
+ 
+ void tcg_x86_init(void)
