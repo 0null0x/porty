@@ -20,6 +20,9 @@
 //                                         the site even without glue
 //                     qemu=local          QEMU-Wasm from LOCAL_QEMU_DIR (this
 //                                         branch's build), the rest from the site
+//                     qemu=alt            QEMU-Wasm from ALT_QEMU_DIR (another
+//                                         build, by its cache key), the rest
+//                                         from the site
 //                     browser=chrome      Chrome instead of WebKit
 //                     mlwait=<ms>         patch 0017: the main loop's longest
 //                                         wait (0: spin as before)
@@ -56,6 +59,8 @@ const localWeb = process.env.LOCAL_WEB || path.join(here, '..', '..', 'web');
 // QEMU-Wasm for qemu=local: a build/build-qemu.sh output (the workflow
 // restores this branch's from branch-check's cache).
 const localQemu = process.env.LOCAL_QEMU_DIR || '';
+// QEMU-Wasm for qemu=alt: another build, restored by its cache key.
+const altQemu = process.env.ALT_QEMU_DIR || '';
 
 // Only the characters page parameters, option names and labels need.
 const WORD = /^[A-Za-z0-9_=&.,:%+-]{1,120}$/;
@@ -92,7 +97,7 @@ export function parseVariant(text, base = '') {
         } else if (key === 'local') {
             v.local = value === '1';
         } else if (key === 'qemu') {
-            v.qemu = value === 'local' ? 'local' : '';
+            v.qemu = value === 'local' || value === 'alt' ? value : '';
         } else if (key === 'browser') {
             v.browser = value === 'chrome' ? 'chrome' : 'webkit';
         } else if (key === 'mlwait') {
@@ -206,7 +211,7 @@ function runOne(v, index) {
             // proxy of the site (site-proxy.mjs); proxy=1 forces it.
             PROXY: v.proxy ? '1' : (v.glue.length || v.local || v.qemu ? '1' : '0'),
             LOCAL_WEB: v.local ? localWeb : '',
-            LOCAL_QEMU: v.qemu === 'local' ? localQemu : '',
+            LOCAL_QEMU: v.qemu === 'local' ? localQemu : (v.qemu === 'alt' ? altQemu : ''),
             MLWAIT: v.mlwait,
             BENCH: '0',
             SCAN: '0',
@@ -319,8 +324,8 @@ async function main() {
     const rows = [];
     for (let i = 0; i < variants.length; i++) {
         const v = variants[i];
-        if (v.qemu === 'local' && !localQemu) {
-            console.log(`variant ${v.name}: skipped, no local QEMU-Wasm build (LOCAL_QEMU_DIR)`);
+        if ((v.qemu === 'local' && !localQemu) || (v.qemu === 'alt' && !altQemu)) {
+            console.log(`variant ${v.name}: skipped, no ${v.qemu} QEMU-Wasm build (${v.qemu === 'alt' ? 'ALT' : 'LOCAL'}_QEMU_DIR)`);
             rows.push({ replica: Number(replica), name: v.name, words: v.words.join(' '), skipped: 'no local QEMU-Wasm build', loops: [], counters: {}, errors: [] });
             continue;
         }

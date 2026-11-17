@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       variants:
-        description: 'Variants, separated by ";". Words: name=<label>, q=<page parameters>, JSC_<option>=<value>, glue=<patch>+<patch>, qemu=local, browser=chrome, local=1, proxy=1, probe=0'
+        description: 'Variants, separated by ";". Words: name=<label>, q=<page parameters>, JSC_<option>=<value>, glue=<patch>+<patch>, qemu=local, qemu=alt, mlwait=<ms>, browser=chrome, local=1, proxy=1, probe=0'
         type: string
         default: 'name=base; name=nostack JSC_exceptionStackTraceLimit=0; name=gclog JSC_logGC=1'
       query:
@@ -46,6 +46,10 @@ on:
         description: Print parts of QEMU's JavaScript glue (1) or not (0)
         type: string
         default: '0'
+      alt_qemu_key:
+        description: 'Cache key of another QEMU-Wasm build, for the variants with qemu=alt (e.g. an earlier commit''s build, from its branch check log)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -152,6 +156,27 @@ jobs:
             echo "wasm_memory_mb=$WASM_MEMORY_MB"
           } >> "$GITHUB_OUTPUT"
 
+      # Another build by its cache key, for the variants with qemu=alt.  The
+      # entry was saved with the path out/qemu, so it is restored there and
+      # moved aside before this branch's build is restored.
+      - name: Restore another QEMU-Wasm build
+        id: alt-cache
+        if: ${{ inputs.alt_qemu_key != '' }}
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: ${{ inputs.alt_qemu_key }}
+
+      - name: Move it aside
+        id: alt-dir
+        if: ${{ steps.alt-cache.outputs.cache-hit == 'true' }}
+        continue-on-error: true
+        run: |
+          mv out/qemu out/qemu-alt
+          ls -l out/qemu-alt
+          echo "dir=$GITHUB_WORKSPACE/out/qemu-alt" >> "$GITHUB_OUTPUT"
+
       # This branch's QEMU-Wasm as branch-check built and cached it (the same
       # key), for the variants with qemu=local.
       - name: Restore this branch's QEMU-Wasm build
@@ -166,6 +191,7 @@ jobs:
         continue-on-error: true
         env:
           LOCAL_QEMU_DIR: ${{ steps.qemu-cache.outputs.cache-hit == 'true' && format('{0}/out/qemu', github.workspace) || '' }}
+          ALT_QEMU_DIR: ${{ steps.alt-dir.outputs.dir }}
           PLAYWRIGHT_DIR: ${{ github.workspace }}/tests/webkit
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
           GITHUB_TOKEN: ${{ github.token }}
