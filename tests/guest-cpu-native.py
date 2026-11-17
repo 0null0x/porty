@@ -8,8 +8,9 @@ uses), lets the guest settle as scripts/snapshot/make-snapshot.py does before
 it saves, and then starts apps one after the other:
 
   - "tap": a finger tap on the home screen, sent through QEMU's input layer
-    to the USB tablet exactly as the page sends it (move, press, move,
-    release), so that Android's pointer moves as it does in the browser;
+    to the page's pointing device as the page sends it: on the touchscreen
+    (the default, touch=1) down and up, on the USB tablet (touch=0) move,
+    press, move, release, so that Android's pointer moves as in the browser;
   - "start": "am start" of the activity, without the launcher.
 
 Before every start the app is stopped (a cold start, as the first tap in a
@@ -209,8 +210,33 @@ class Guest:
         return text.strip().replace("mCurrentFocus=", "")[:120]
 
 
+def touchscreen(vm):
+    """The page's touchscreen (touch=1, web/js/qemu-args.js) rather than the USB tablet."""
+    return any(a.split(",")[0] == "virtio-multitouch-pci" for i, a in enumerate(vm.args) if vm.args[i - 1] == "-device")
+
+
+def finger(vm, kind, fx, fy, slot=0):
+    """One frame of a finger on the touchscreen, as ui/wasmfb.c (patch 0020) sends it:
+    kind "begin", "update" or "end"."""
+    x = max(0, min(ABS_MAX, round(fx * ABS_MAX)))
+    y = max(0, min(ABS_MAX, round(fy * ABS_MAX)))
+    tid = -1 if kind == "end" else slot
+    events = [{"type": "mtt", "data": {"type": kind, "slot": slot, "tracking-id": tid, "axis": "x", "value": 0}}]
+    if kind != "end":
+        events += [{"type": "btn", "data": {"down": True, "button": "touch"}},
+                   {"type": "mtt", "data": {"type": "data", "slot": slot, "tracking-id": tid, "axis": "x", "value": x}},
+                   {"type": "mtt", "data": {"type": "data", "slot": slot, "tracking-id": tid, "axis": "y", "value": y}}]
+    vm.qmp.cmd("input-send-event", {"events": events})
+
+
 def tap(vm, fx, fy):
-    """A finger tap as the page sends it (web/js/input.js): move, press, move, release."""
+    """A finger tap as the page sends it (web/js/input.js): on the touchscreen
+    down and up; on the USB tablet (touch=0) move, press, move, release."""
+    if touchscreen(vm):
+        finger(vm, "begin", fx, fy)
+        time.sleep(0.08)
+        finger(vm, "end", fx, fy)
+        return
     x = max(0, min(ABS_MAX, round(fx * ABS_MAX)))
     y = max(0, min(ABS_MAX, round(fy * ABS_MAX)))
     move = [{"type": "abs", "data": {"axis": "x", "value": x}}, {"type": "abs", "data": {"axis": "y", "value": y}}]
@@ -272,7 +298,16 @@ def abs_at(fx, fy):
 
 
 def drag(vm, fx0, fy0, fx1, fy1, steps=12, pause=0.25):
-    """A finger drag as the page sends it (web/js/input.js): move, press, moves, release."""
+    """A finger drag as the page sends it (web/js/input.js): on the touchscreen
+    down, moves, up; on the USB tablet move, press, moves, release."""
+    if touchscreen(vm):
+        finger(vm, "begin", fx0, fy0)
+        for i in range(1, steps + 1):
+            time.sleep(pause)
+            finger(vm, "update", fx0 + (fx1 - fx0) * i / steps, fy0 + (fy1 - fy0) * i / steps)
+        time.sleep(pause)
+        finger(vm, "end", fx1, fy1)
+        return
     vm.qmp.cmd("input-send-event", {"events": abs_at(fx0, fy0)})
     vm.qmp.cmd("input-send-event", {"events": [{"type": "btn", "data": {"down": True, "button": "left"}}]})
     for i in range(1, steps + 1):
@@ -320,9 +355,12 @@ def ui_check(g, opts, result):
     drag(vm, 0.5, 0.3, 0.5, 0.9)
     shot("scrolled_back")
     ui["scrolled_back_vs_top_pct"] = ppm_diff(shots["scrolled_back"], shots["settings"])
-    vm.qmp.cmd("input-send-event", {"events": abs_at(0.3, 0.45)})
+    # The mouse pointer: only the USB tablet (touch=0) has one.
+    if not touchscreen(vm):
+        vm.qmp.cmd("input-send-event", {"events": abs_at(0.3, 0.45)})
     shot("pointer_a", 2)
-    vm.qmp.cmd("input-send-event", {"events": abs_at(0.7, 0.6)})
+    if not touchscreen(vm):
+        vm.qmp.cmd("input-send-event", {"events": abs_at(0.7, 0.6)})
     shot("pointer_b", 2)
     ui["pointer_moved_pct"] = ppm_diff(shots["pointer_b"], shots["pointer_a"])
     ui["pointer_layers"] = g.sh("dumpsys SurfaceFlinger --list | grep -i -e sprite -e pointer | head -4", 60)[1].strip()

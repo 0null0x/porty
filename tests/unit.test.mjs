@@ -7,10 +7,10 @@ import {
     requiredWasmMemoryMb,
 } from '../web/js/config.js';
 import { LEVEL_KEY, RUN_KEY, RunLog, describeRun, nextLevel } from '../web/js/crash-guard.js';
-import { buildKernelCmdline, buildQemuArgs, vesaMode } from '../web/js/qemu-args.js';
+import { TABLET_DEVICE, TOUCH_DEVICE, buildKernelCmdline, buildQemuArgs, inputArgs, inputDevice, vesaMode } from '../web/js/qemu-args.js';
 import { CODE_TO_EVDEV, KEY, charToKey } from '../web/js/keymap.js';
 import { Display } from '../web/js/display.js';
-import { Input, toTablet } from '../web/js/input.js';
+import { FLING_HORIZON_MS, Input, KEEP_MS, TOUCH_SLOTS, WHEEL_MARGIN, toTablet, touchSlop, wheelPixels } from '../web/js/input.js';
 import { checkEnvironment } from '../web/js/emulator.js';
 
 const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1';
@@ -32,6 +32,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([desktop.mem, desktop.tb, desktop.smp, desktop.width, desktop.height, desktop.dpi],
         [1024, 384, 1, 480, 800, 160]);
     assert.deepEqual([desktop.usb, desktop.jit], [true, -1]);
+    // a touchscreen unless touch=0 (then the USB tablet)
+    assert.deepEqual([desktop.touch, parseConfig('?touch=0', {}).touch, parseConfig('?touch=1', {}).touch], [true, false, true]);
     assert.equal(parseConfig('?jit=0', {}).jit, 0);
     assert.equal(parseConfig('?jit=-5', {}).jit, -1);
     assert.equal(parseConfig('?jit=99999999999', {}).jit, 2147483647);
@@ -160,7 +162,11 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(value('-accel'), 'tcg,tb-size=384');
     assert.equal(value('-display'), 'wasmfb');
     assert.equal(value('-cpu'), 'Nehalem');
-    assert.ok(args.includes('usb-tablet'));
+    // the pointing device: a touchscreen, no USB controller and no tablet
+    assert.equal(value('-device'), 'virtio-multitouch-pci');
+    assert.equal(TOUCH_DEVICE, 'virtio-multitouch-pci');
+    assert.ok(!args.includes('-usb') && !args.includes('usb-tablet'));
+    assert.equal(inputDevice(args), 'touch');
     const drives = args.filter((a, i) => args[i - 1] === '-drive');
     assert.equal(drives.length, 2);
     assert.equal(drives[0],
@@ -173,6 +179,24 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.ok(qcow2.includes(drives[0].replace('format=raw', 'format=qcow2')));
     assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
     assert.ok(!buildQemuArgs(parseConfig('?usb=0', {}), manifest, paths).includes('usb-tablet'));
+    // touch=0: the USB tablet of before, at the same place in the argv
+    const tablet = buildQemuArgs(parseConfig('?touch=0', {}), manifest, paths);
+    assert.deepEqual(tablet.slice(tablet.indexOf('-usb'), tablet.indexOf('-usb') + 3), ['-usb', '-device', TABLET_DEVICE]);
+    assert.ok(!tablet.includes(TOUCH_DEVICE));
+    assert.equal(inputDevice(tablet), 'tablet');
+    assert.deepEqual(args.filter((a) => a !== '-device' && a !== TOUCH_DEVICE),
+        tablet.filter((a) => a !== '-usb' && a !== '-device' && a !== TABLET_DEVICE), 'nothing else differs');
+    // usb=0: no pointing device at all, whichever touch= says
+    for (const q of ['?usb=0', '?usb=0&touch=0', '?usb=0&touch=1']) {
+        const none = buildQemuArgs(parseConfig(q, {}), manifest, paths);
+        assert.ok(!none.includes('-device') && !none.includes('-usb'), q);
+        assert.equal(inputDevice(none), 'none');
+        assert.deepEqual(inputArgs(parseConfig(q, {})), []);
+    }
+    // the device as a snapshot's argv may name it, with properties
+    assert.equal(inputDevice(['-device', 'virtio-multitouch-pci,id=touch0']), 'touch');
+    assert.equal(inputDevice(['-device', 'usb-tablet,bus=usb-bus.0']), 'tablet');
+    assert.equal(inputDevice(['-usb', 'virtio-multitouch-pci']), 'none', 'only a -device counts');
     // the RTC follows the dilated virtual clock (timescale 8 by default), and only then
     assert.equal(value('-rtc'), 'base=utc,clock=vm');
     const realTime = buildQemuArgs(parseConfig('?timescale=1', { userAgent: MAC }), manifest, paths);
@@ -305,6 +329,176 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     const full = new Input(() => 0, {}, {});
     full.back();
     assert.equal(full.dropped, 2, 'a full ring is counted, not thrown');
+}
+
+// --- input: the touchscreen (fingers in slots), the mouse and the wheel, the tablet ----------
+{
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    // Just enough DOM for Input.attach(): event targets and a canvas rectangle.
+    const rect = { left: 10, top: 20, width: 200, height: 400 };
+    const fakeCanvas = () => Object.assign(new EventTarget(), {
+        getBoundingClientRect: () => rect, setPointerCapture() {}, captured: 0,
+    });
+    const field = Object.assign(new EventTarget(), { value: '', setSelectionRange() {}, focus() {}, blur() {} });
+    globalThis.window = globalThis.window || new EventTarget();
+    const pointer = (target, type, props) => {
+        const ev = new Event(type, { cancelable: true });
+        Object.assign(ev, { pointerId: 1, pointerType: 'touch', button: 0, ...props });
+        target.dispatchEvent(ev);
+        return ev;
+    };
+    const wheel = (target, props) => {
+        const ev = new Event('wheel', { cancelable: true });
+        Object.assign(ev, { deltaX: 0, deltaY: 0, deltaMode: 0, shiftKey: false, ctrlKey: false, ...props });
+        target.dispatchEvent(ev);
+        return ev;
+    };
+    const at = (fx, fy) => ({ clientX: rect.left + fx * rect.width, clientY: rect.top + fy * rect.height });
+    const T = (fx, fy) => toTablet(rect.left + fx * rect.width, rect.top + fy * rect.height, rect);
+
+    // Fingers: each pointer its own slot, the lowest free one; moves report
+    // only changes; a lift reports the slot.
+    let sent = [];
+    const canvas = fakeCanvas();
+    const touch = new Input((...ev) => { sent.push(ev); return 1; }, canvas, field, { mode: 'touch', timescale: 1 });
+    touch.attach();
+    const down = pointer(canvas, 'pointerdown', { pointerId: 7, ...at(0.5, 0.25) });
+    assert.ok(down.defaultPrevented);
+    pointer(canvas, 'pointermove', { pointerId: 7, ...at(0.5, 0.25) }); // no change: nothing sent
+    pointer(canvas, 'pointermove', { pointerId: 7, ...at(0.5, 0.5) });
+    pointer(canvas, 'pointerdown', { pointerId: 8, ...at(0.25, 0.75) });
+    pointer(canvas, 'pointermove', { pointerId: 9, ...at(0.1, 0.1) }); // not down: nothing
+    pointer(canvas, 'pointerup', { pointerId: 7, ...at(0.5, 0.5) });
+    pointer(canvas, 'pointerdown', { pointerId: 9, ...at(1, 1) });      // slot 0 is free again
+    pointer(canvas, 'pointercancel', { pointerId: 8 });
+    pointer(canvas, 'pointerup', { pointerId: 9, ...at(0.9, 0.9) });   // moved before it lifted
+    assert.deepEqual(sent, [
+        [5, 0, ...T(0.5, 0.25)], [6, 0, ...T(0.5, 0.5)], [5, 1, ...T(0.25, 0.75)], [7, 0, ...T(0.5, 0.5)],
+        [5, 0, 0x7fff, 0x7fff], [7, 1, ...T(0.25, 0.75)], [6, 0, ...T(0.9, 0.9)], [7, 0, ...T(0.9, 0.9)],
+    ]);
+    assert.equal(touch.fingers.size, 0);
+
+    // At most TOUCH_SLOTS fingers; the eleventh is ignored, also when it moves and lifts.
+    sent = [];
+    for (let id = 1; id <= TOUCH_SLOTS + 1; id++) {
+        pointer(canvas, 'pointerdown', { pointerId: 100 + id, ...at(id / 20, 0.5) });
+    }
+    pointer(canvas, 'pointermove', { pointerId: 100 + TOUCH_SLOTS + 1, ...at(0.9, 0.9) });
+    pointer(canvas, 'pointerup', { pointerId: 100 + TOUCH_SLOTS + 1, ...at(0.9, 0.9) });
+    assert.deepEqual(sent.map((e) => [e[0], e[1]]), [...Array(TOUCH_SLOTS).keys()].map((slot) => [5, slot]));
+    // A lost window focus lifts every finger.
+    sent = [];
+    touch.releaseAll();
+    assert.deepEqual(sent.map((e) => [e[0], e[1]]).sort((a, b) => a[1] - b[1]),
+        [...Array(TOUCH_SLOTS).keys()].map((slot) => [7, slot]));
+
+    // The mouse: its left button is a finger, hovering sends nothing, the
+    // right button is Back, the middle one nothing.
+    sent = [];
+    pointer(canvas, 'pointermove', { pointerType: 'mouse', pointerId: 1, ...at(0.3, 0.3) });
+    pointer(canvas, 'pointerdown', { pointerType: 'mouse', pointerId: 1, button: 0, ...at(0.3, 0.3) });
+    pointer(canvas, 'pointermove', { pointerType: 'mouse', pointerId: 1, ...at(0.3, 0.6) });
+    pointer(canvas, 'pointerup', { pointerType: 'mouse', pointerId: 1, button: 0, ...at(0.3, 0.6) });
+    pointer(canvas, 'pointerdown', { pointerType: 'mouse', pointerId: 1, button: 2, ...at(0.3, 0.6) });
+    pointer(canvas, 'pointerup', { pointerType: 'mouse', pointerId: 1, button: 2, ...at(0.3, 0.6) });
+    pointer(canvas, 'pointerdown', { pointerType: 'mouse', pointerId: 1, button: 1, ...at(0.3, 0.6) });
+    assert.deepEqual(sent, [[5, 0, ...T(0.3, 0.3)], [6, 0, ...T(0.3, 0.6)], [7, 0, ...T(0.3, 0.6)], [3, 158, 1, 0], [3, 158, 0, 0]]);
+
+    // A resting finger keeps reporting (to and fro by one unit), so that
+    // Android's velocity tracker sees it stop; nothing once it lifted.
+    sent = [];
+    pointer(canvas, 'pointerdown', { pointerId: 3, ...at(0.5, 0.5) });
+    await sleep(KEEP_MS * 3.5);
+    const [x5, y5] = T(0.5, 0.5);
+    const kept = sent.slice(1);
+    assert.ok(kept.length >= 2 && kept.length <= 4, `${kept.length} reports while resting`);
+    assert.deepEqual(kept.slice(0, 2), [[6, 0, x5 + 1, y5], [6, 0, x5, y5]]);
+    pointer(canvas, 'pointerup', { pointerId: 3, ...at(0.5, 0.5) });
+    const lifted = sent.length;
+    await sleep(KEEP_MS * 2.5);
+    assert.equal(sent.length, lifted, 'no reports after the lift');
+    assert.equal(touch.keepTimer, 0);
+
+    // The wheel drags with a finger where the pointer is: down a page
+    // (deltaY > 0) moves it up; it stays inside the margins; it lifts after
+    // resting for the fling horizon times the dilation.
+    assert.deepEqual(wheelPixels({ deltaX: 0, deltaY: 3, deltaMode: 1 }, 400), [0, 120]);
+    assert.deepEqual(wheelPixels({ deltaX: 2, deltaY: 1, deltaMode: 2 }, 400), [800, 400]);
+    sent = [];
+    // Android's touch slop (8 dp) and 4 pixels more, in tablet units: the
+    // wheel's first move is that much longer, so a small scroll is no tap.
+    assert.deepEqual(touchSlop(480, 800, 160), [Math.round(12 / 480 * 0x7fff), Math.round(12 / 800 * 0x7fff)]);
+    assert.deepEqual(touchSlop(720, 1280, 240), [Math.round(16 / 720 * 0x7fff), Math.round(16 / 1280 * 0x7fff)]);
+    const slop = [100, 200];
+    const slow = new Input((...ev) => { sent.push(ev); return 1; }, canvas, field, { mode: 'touch', timescale: 2, slop });
+    assert.equal(slow.wheelRestMs(), FLING_HORIZON_MS * 2 + 2 * KEEP_MS);
+    touch.detach();
+    slow.attach();
+    const w = wheel(canvas, { deltaY: 50, ...at(0.5, 0.5) });  // an eighth of the screen
+    assert.ok(w.defaultPrevented);
+    wheel(canvas, { deltaY: 50, ...at(0.5, 0.5) });
+    wheel(canvas, { deltaY: 400, ...at(0.5, 0.5) }); // past the top margin: stops there
+    wheel(canvas, { deltaY: 400, ...at(0.5, 0.5) }); // still there: nothing new
+    const [wx, wy] = T(0.5, 0.5);
+    const eighth = Math.round(0x7fff / 8);
+    assert.deepEqual(sent.slice(0, 4), [[5, 0, wx, wy], [6, 0, wx, wy - eighth - slop[1]], [6, 0, wx, wy - 2 * eighth - slop[1]],
+        [6, 0, wx, WHEEL_MARGIN]]);
+    assert.equal(sent.length, 4);
+    // A finger coming down lifts the wheel's at once.
+    pointer(canvas, 'pointerdown', { pointerId: 4, ...at(0.2, 0.2) });
+    assert.deepEqual(sent.slice(-2), [[7, 0, wx, WHEEL_MARGIN], [5, 0, ...T(0.2, 0.2)]]);
+    wheel(canvas, { deltaY: 100, ...at(0.5, 0.5) }); // not while a finger is down
+    assert.equal(sent.length, 6);
+    pointer(canvas, 'pointerup', { pointerId: 4, ...at(0.2, 0.2) });
+    // Sideways: shift+wheel and deltaX move x; then the rest lifts it.
+    sent = [];
+    wheel(canvas, { deltaY: 50, shiftKey: true, ...at(0.5, 0.5) });
+    assert.deepEqual(sent, [[5, 0, wx, wy], [6, 0, wx - Math.round(0x7fff / 4) - slop[0], wy]]);
+    await sleep(slow.wheelRestMs() + 3 * KEEP_MS);
+    assert.deepEqual(sent[sent.length - 1], [7, 0, wx - Math.round(0x7fff / 4) - slop[0], wy]);
+    assert.ok(sent.slice(2, -1).every((e) => e[0] === 6), 'only resting reports before the lift');
+    // A trackpad's pinch (ctrl+wheel): two fingers spread around the pointer.
+    sent = [];
+    wheel(canvas, { deltaY: -50, ctrlKey: true, ...at(0.5, 0.5) });
+    assert.deepEqual(sent.slice(0, 2).map((e) => [e[0], e[1], e[3]]), [[5, 0, wy], [5, 1, wy]]);
+    assert.ok(sent[0][2] < wx && sent[1][2] > wx);
+    const spread = sent.slice(2).map((e) => e[2]);
+    assert.ok(spread[0] < sent[0][2] && spread[1] > sent[1][2], 'the fingers moved apart');
+    slow.detach();
+    assert.deepEqual(sent.slice(-2).map((e) => [e[0], e[1]]), [[7, 1], [7, 0]], 'detach lifts them');
+
+    // touch=0: the USB tablet as before, one pointer, moves and buttons.
+    sent = [];
+    const tabletInput = new Input((...ev) => { sent.push(ev); return 1; }, canvas, field, { mode: 'tablet' });
+    tabletInput.attach();
+    pointer(canvas, 'pointermove', { pointerType: 'mouse', ...at(0.5, 0.25) });
+    pointer(canvas, 'pointerdown', { pointerType: 'mouse', button: 0, ...at(0.5, 0.25) });
+    pointer(canvas, 'pointerdown', { pointerId: 2, ...at(0.1, 0.1) }); // a second finger is ignored
+    pointer(canvas, 'pointerup', { pointerType: 'mouse', button: 0, ...at(0.5, 0.5) });
+    wheel(canvas, { deltaY: -3 });
+    tabletInput.detach();
+    assert.deepEqual(sent, [[1, ...T(0.5, 0.25), 0], [1, ...T(0.5, 0.25), 0], [2, 0, 1, 0],
+        [1, ...T(0.5, 0.5), 0], [2, 0, 0, 0], [4, 1, 0, 0]]);
+
+    // usb=0: no pointing device, nothing is sent for pointers.
+    sent = [];
+    const none = new Input((...ev) => { sent.push(ev); return 1; }, canvas, field, { mode: 'none' });
+    none.attach();
+    pointer(canvas, 'pointerdown', at(0.5, 0.5));
+    wheel(canvas, { deltaY: 10 });
+    none.detach();
+    assert.deepEqual(sent, []);
+
+    // A lift the ring had no room for is sent again.
+    let room = 0;
+    sent = [];
+    const busy = new Input((...ev) => { if (room > 0) { room--; sent.push(ev); return 1; } return 0; }, canvas, field);
+    busy.fingers.set(1, { slot: 2, x: 5, y: 6, at: 0, jitter: 0 });
+    busy.fingerUp(1);
+    assert.equal(busy.dropped, 1);
+    room = 1;
+    await sleep(120);
+    assert.deepEqual(sent, [[7, 2, 5, 6]]);
 }
 
 // --- environment check ------------------------------------------------------------------------

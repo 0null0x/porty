@@ -34,6 +34,14 @@
 //   PROBE_WAIT     seconds the input probe waits for Gallery (default 240;
 //                  the later steps wait half and three quarters of it)
 //   PROBE_STEPS    "launch": the input probe ends after the Gallery launch
+//   PROBE_SWIPE    0: no swipe on Settings after the launch (default 1: the
+//                  input probe opens the app drawer with a finger swipe up,
+//                  Settings with a tap on its icon, swipes up on Settings and
+//                  scrolls it back with the mouse wheel, and reports how far
+//                  the list moved each time, from the canvas rows; no shell
+//                  needed, which answers late or not at all on slow runners)
+//   PROBE_PINCH    1: then also a picture of that screen in Gallery and two
+//                  fingers spreading on it; how much of the screen changed
 //   PROBE_CONTENT  0: no CPU snapshot and surfaceflinger statistics at the
 //                  moment Gallery's content shows (90% of the screen differs
 //                  from the home screen); by default the report then also
@@ -92,6 +100,8 @@ const netMbps = num('NET_MBPS', 0, 0, 10000);
 const netLatencyMs = num('NET_LATENCY_MS', 0, 0, 5000);
 const probeWaitMs = num('PROBE_WAIT', 240, 30, 7200) * 1000;
 const launchOnly = (process.env.PROBE_STEPS || '') === 'launch';
+const probeSwipe = process.env.PROBE_SWIPE !== '0';
+const probePinch = process.env.PROBE_PINCH === '1';
 const resumeSettleMs = num('RESUME_SETTLE', 120, 0, 3600) * 1000;
 const guestEveryMs = num('PROBE_GUEST_EVERY', 30, 0, 600) * 1000;
 const stressMs = num('STRESS_MINUTES', 0, 0, 600) * 60000;
@@ -566,6 +576,13 @@ async function inputProbe() {
             if (/SFTSDONE:2:END/.test(line)) {
                 marks.sfts = 'done';
             }
+            if (/INLOGDONE:2:END/.test(line)) {
+                marks.inlog = Date.now();
+            }
+            m = line.match(/SPRITES:(\d+):(\d+):END/);
+            if (m) {
+                marks.sprites = { layers: Number(m[1]), pointerMappers: Number(m[2]) };
+            }
             if (/CALDONE:\d+:END/.test(line) && !marks.cal) {
                 marks.cal = Date.now();
             }
@@ -595,7 +612,7 @@ async function inputProbe() {
     log('INPUT PROBE: input devices, the kernel\'s and Android\'s view');
     await send('\rgrep -E "^(N|H|B: (EV|KEY|ABS|REL))" /proc/bus/input/devices\r');
     await sleep(5000);
-    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Mode:" | head -24\r');
+    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Mode:|mode - |DeviceType:|AssociatedDisplay:|Viewport: displayId" | head -40\r');
     await sleep(20000);
     // A dialog for an app that stopped responding, even one not on screen
     // yet, means that app does not answer, and while SystemUI does not,
@@ -1076,20 +1093,346 @@ async function inputProbe() {
     await page.click('#nav-home').catch((e) => log(`INPUT PROBE: no Home button (${e.message})`));
     await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
 
-    const [sx, sy] = at((r.cw || 480) / 2, 91 * (r.ch || 800) / 800);
-    log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the search bar)`);
+    // --- a finger swipe scrolls Settings --------------------------------
+    // How far the list moved: the vertical shift that best lines up the
+    // canvas rows before and after (per-row sums of the green channel).
+    const rowSig = () => page.evaluate(() => {
+        const c = document.getElementById('screen');
+        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        const rows = [];
+        for (let y = 0; y < c.height; y++) {
+            let sum = 0;
+            for (let x = 24; x < c.width - 24; x += 3) {
+                sum += d[(y * c.width + x) * 4 + 1];
+            }
+            rows.push(sum);
+        }
+        return rows;
+    });
+    const vshift = (a, b, top = 90, bottom = 740, limit = 640) => {
+        const err = (sh) => {
+            const lo = Math.max(top, top - sh);
+            const hi = Math.min(bottom, bottom - sh, a.length - sh, b.length);
+            if (hi - lo < 100) {
+                return null;
+            }
+            let e = 0;
+            for (let y = lo; y < hi; y++) {
+                e += Math.abs(b[y] - a[y + sh]);
+            }
+            return e / (hi - lo);
+        };
+        const e0 = err(0);
+        let best = null;
+        let bestErr = null;
+        for (let sh = -limit; sh <= limit; sh++) {
+            const e = err(sh);
+            if (e !== null && (bestErr === null || e < bestErr)) {
+                best = sh;
+                bestErr = e;
+            }
+        }
+        const ok = bestErr !== null && bestErr <= 400 && (best === 0 || bestErr <= 0.25 * Math.max(e0, 1));
+        return { shift: ok ? best : null, err: Math.round(bestErr), err0: Math.round(e0) };
+    };
+    // Rows of the list area that differ from its background (its commonest
+    // row): 0 for an empty list, as Settings shows before its tiles load.
+    const contentRows = (rows, top = 150, bottom = 740) => {
+        const part = rows.slice(top, bottom);
+        const counts = new Map();
+        let bg = part[0];
+        for (const v of part) {
+            counts.set(v, (counts.get(v) || 0) + 1);
+            if (counts.get(v) > counts.get(bg)) {
+                bg = v;
+            }
+        }
+        return part.filter((v) => Math.abs(v - bg) > 500).length;
+    };
+    // Until the list area has drawn rows (or ms pass); seconds, -1 if not.
+    const listWait = async (ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms) {
+            if (contentRows(await rowSig()) >= 40) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+            await sleep(3000);
+        }
+        return -1;
+    };
+    // Until the canvas stops changing (or ms pass): rows of two looks 3 s apart agree.
+    const still = async (ms) => {
+        const t = Date.now();
+        let prev = await rowSig();
+        while (Date.now() - t < ms) {
+            await sleep(3000);
+            const now = await rowSig();
+            const diff = now.reduce((n, v, i) => n + (Math.abs(v - prev[i]) > 200 ? 1 : 0), 0);
+            prev = now;
+            if (diff <= 4) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+        }
+        return -1;
+    };
+    // Until the canvas has not changed for sec seconds (or ms pass).
+    const stillFor = async (sec, ms) => {
+        const t = Date.now();
+        let prev = await rowSig();
+        let since = Date.now();
+        while (Date.now() - t < ms) {
+            await sleep(3000);
+            const now = await rowSig();
+            const diff = now.reduce((n, v, i) => n + (Math.abs(v - prev[i]) > 200 ? 1 : 0), 0);
+            prev = now;
+            if (diff > 4) {
+                since = Date.now();
+            } else if (Date.now() - since >= sec * 1000) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+        }
+        return -1;
+    };
+    const touchResult = { swipe: null };
+    // How much of the canvas differs between two looks (48x80 samples).
+    const canvasSample = () => page.evaluate(() => {
+        const c = document.getElementById('screen');
+        const t = document.createElement('canvas');
+        t.width = 48;
+        t.height = 80;
+        t.getContext('2d').drawImage(c, 0, 0, 48, 80);
+        return Array.from(t.getContext('2d').getImageData(0, 0, 48, 80).data);
+    });
+    const changedPct = (a, b) => {
+        let n = 0;
+        for (let i = 0; i < a.length; i += 4) {
+            n += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]) > 48 ? 1 : 0;
+        }
+        return Math.round((1000 * n) / (a.length / 4)) / 10;
+    };
+    // Two fingers spread on a picture of the screen in Gallery: it zooms.
+    const pinch = async () => {
+        log('INPUT PROBE: a picture of this screen in Gallery, then two fingers spreading on it');
+        await send('mkdir -p /sdcard/Pictures; screencap -p /sdcard/Pictures/porty.png; ' +
+            'am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Pictures/porty.png > /dev/null 2>&1; ' +
+            'am start -a android.intent.action.VIEW -t image/png -d file:///sdcard/Pictures/porty.png ' +
+            '-n com.android.gallery3d/.app.GalleryActivity > /dev/null 2>&1\r');
+        if (!await focusWait('the picture in Gallery', /gallery/i, probeWaitMs)) {
+            touchResult.pinch = { shown: false };
+            return;
+        }
+        const settled = await still(120000);
+        await shot('picture', true);
+        const before = await canvasSample();
+        const [cx, cy] = at(240, 400 * (r.ch || 800) / 800);
+        const [dx] = at(40, 0);
+        const [wide] = at(200, 0);
+        const near = dx - r.x;
+        const far = wide - r.x;
+        const a = await page.touchscreen.touchStart(cx - near, cy - near);
+        const b = await page.touchscreen.touchStart(cx + near, cy + near);
+        for (let i = 1; i <= 8; i++) {
+            await sleep(150);
+            const d = near + ((far - near) * i) / 8;
+            await a.move(cx - d, cy - d);
+            await b.move(cx + d, cy + d);
+        }
+        await sleep(1500);
+        await b.end();
+        await a.end();
+        const quiet = await still(120000);
+        const changed = changedPct(before, await canvasSample());
+        touchResult.pinch = { shown: true, settledS: settled, changedPct: changed, quietS: quiet };
+        log(`INPUT PROBE: two fingers spread on the picture: ${changed}% of the screen changed; still after ${quiet} s`);
+        await shot('picture-pinched', true);
+        await page.click('#nav-back').catch(() => {});
+    };
+    // Until at least pct% of the canvas differs from `base` (or ms pass); seconds, -1 if not.
+    const changeFrom = async (base, pct, ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms) {
+            await sleep(2000);
+            if (changedPct(base, await canvasSample()) >= pct) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+        }
+        return -1;
+    };
+    // A finger along Android's coordinates [[x, y], ...]: down at the first
+    // point, `steps` moves to each next one, `stepMs` apart, a rest, up.
+    const finger = async (points, steps, stepMs, restMs) => {
+        const page2 = (p) => at(p[0], p[1] * (r.ch || 800) / 800);
+        let [x, y] = page2(points[0]);
+        await page.touchscreen.touchStart(x, y);
+        for (let k = 1; k < points.length; k++) {
+            const [x1, y1] = page2(points[k]);
+            for (let i = 1; i <= steps; i++) {
+                await sleep(stepMs);
+                await page.touchscreen.touchMove(x + ((x1 - x) * i) / steps, y + ((y1 - y) * i) / steps);
+            }
+            [x, y] = [x1, y1];
+        }
+        await sleep(restMs);
+        await page.touchscreen.touchEnd();
+    };
+    if (probeSwipe) {
+        log('INPUT PROBE: the app drawer by a finger swipe up, Settings by a tap on its icon, then a swipe on Settings');
+        await still(90000);
+        const home = await canvasSample();
+        await finger([[240, 650], [240, 200]], 6, 60, 0);
+        const drawerS = await changeFrom(home, 30, probeWaitMs / 2);
+        touchResult.drawer = { changedS: drawerS, quietS: await still(90000) };
+        const drawer = await canvasSample();
+        touchResult.drawer.changedPct = changedPct(home, drawer);
+        log(`INPUT PROBE: swipe up on the home screen: ${touchResult.drawer.changedPct}% of the screen changed ` +
+            `after ${drawerS} s (the app drawer)`);
+        await shot('drawer', true);
+        // Settings: the drawer's eleventh app, first of the third row.  A
+        // press of 120 ms, as a finger's (puppeteer's tap lifts at once);
+        // up to three.  Settings and the drawer are both light screens and
+        // differ by about 26% (natively too), so 30% missed it: in
+        // 44088225511 the focus was Settings while the probe saw no change.
+        const settingsPct = 12;
+        const [sx0, sy0] = at(60, 375 * (r.ch || 800) / 800);
+        let settingsS = -1;
+        const tapped = Date.now();
+        for (let i = 0; i < 3 && settingsS < 0; i++) {
+            await page.touchscreen.touchStart(sx0, sy0);
+            await sleep(120);
+            await page.touchscreen.touchEnd();
+            if (await changeFrom(drawer, settingsPct, i < 2 ? 60000 : probeWaitMs) >= 0) {
+                settingsS = Math.round((Date.now() - tapped) / 1000);
+            }
+            touchResult.settingsTaps = i + 1;
+        }
+        touchResult.settings = { changedS: settingsS, taps: touchResult.settingsTaps,
+            changedPct: changedPct(drawer, await canvasSample()) };
+        log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s ` +
+            `(${touchResult.settingsTaps} taps, ${touchResult.settings.changedPct}% of the screen)`);
+        if (settingsS < 0) {
+            // Then the shell, if it answers, so that the swipe is measured anyway.
+            await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
+            const byShell = await changeFrom(drawer, settingsPct, probeWaitMs);
+            touchResult.settings.byShellS = byShell;
+            log(`INPUT PROBE: Settings started from the shell: the screen changed after ${byShell} s`);
+            settingsS = byShell;
+        }
+        if (settingsS >= 0) {
+            // Settings shows its window first and its list later (in
+            // 44092784196 the swipe went over an empty list): wait for rows.
+            const listS = await listWait(480000);
+            touchResult.settings.listS = listS;
+            log(`INPUT PROBE: the Settings list ${listS < 0 ? 'stayed empty for 480 s' : `was drawn after ${listS} s`}`);
+        }
+        if (settingsS >= 0 && touchResult.settings.listS >= 0) {
+            // The list goes on filling in summaries and tiles after it shows:
+            // wait until nothing changed for 30 s.  (In 44096770993 and
+            // 44100096190 the probe swiped while the last tiles, Accounts
+            // to System, were still missing, and a list that fits on the
+            // screen cannot scroll; in 44109487506 they were there, and the
+            // list moved.)
+            const settled = await stillFor(30, 300000);
+            const top = await rowSig();
+            const topSample = await canvasSample();
+            await shot('settings', true);
+            // From 640 to 280 of Android's 800 rows, in 1.2 s, then a rest
+            // before the lift (no fling): the list should follow the finger.
+            const [x0, y0] = at(240, 640 * (r.ch || 800) / 800);
+            const [, y1] = at(240, 280 * (r.ch || 800) / 800);
+            await page.touchscreen.touchStart(x0, y0);
+            for (let i = 1; i <= 8; i++) {
+                await sleep(150);
+                await page.touchscreen.touchMove(x0, y0 + ((y1 - y0) * i) / 8);
+            }
+            await sleep(1500);
+            await page.touchscreen.touchEnd();
+            // A busy main thread takes the touches late: wait up to 60 s
+            // for the list to move (10% of the screen) before measuring.
+            const movedS = await changeFrom(topSample, 10, 60000);
+            const quiet = await stillFor(9, 120000);
+            const moved = vshift(top, await rowSig());
+            touchResult.swipe = { fingerPx: 360, listPx: moved.shift, matchErr: moved.err, unmovedErr: moved.err0,
+                settledS: settled, movedS, quietS: quiet };
+            log(`INPUT PROBE: swipe on Settings: the list moved ${moved.shift === null ? 'farther than 640 px or not at all'
+                : `${moved.shift} px`} for a finger moved 360 px (row match ${moved.err}, unmoved ${moved.err0}); ` +
+                `the screen changed after ${movedS} s and was still after ${quiet} s more`);
+            await shot('after-swipe', true);
+            // The mouse wheel over the list, three notches: the page drags
+            // with a finger of its own (web/js/input.js), which lifts by
+            // itself.  Up (the list back down) if the swipe moved it, else
+            // down, since a list at its top cannot go further up.
+            // (A tile that goes or comes while the list moves defeats the
+            // row match, as Battery did in 44109487506: a large error for
+            // "unmoved" says the list moved all the same.)
+            const back = (moved.shift !== null && Math.abs(moved.shift) > 20) || moved.err0 > 150;
+            const swiped = await rowSig();
+            const swipedSample = await canvasSample();
+            const [wx, wy] = at(240, 400 * (r.ch || 800) / 800);
+            await page.mouse.move(wx, wy);
+            for (let i = 0; i < 3; i++) {
+                await page.mouse.wheel({ deltaY: back ? -100 : 100 });
+                await sleep(100);
+            }
+            const wmovedS = await changeFrom(swipedSample, 10, 60000);
+            const wquiet = await stillFor(9, 120000);
+            const wheeled = vshift(swiped, await rowSig());
+            touchResult.wheel = { wheelPx: back ? -300 : 300, listPx: wheeled.shift, matchErr: wheeled.err,
+                movedS: wmovedS, quietS: wquiet };
+            log(`INPUT PROBE: mouse wheel ${back ? 'up' : 'down'} 3 notches on Settings: the list moved ${wheeled.shift === null
+                ? 'farther than 640 px or not at all' : `${wheeled.shift} px`} (row match ${wheeled.err}); ` +
+                `the screen changed after ${wmovedS} s`);
+            await shot('after-wheel', true);
+            if (probePinch) {
+                await pinch();
+            }
+        }
+        await page.click('#nav-home').catch(() => {});
+        await still(120000);
+    }
+
+    // The mouse: on the touchscreen its button is a finger, so a click on
+    // the Gallery icon opens Gallery (a warm start now).  (The search bar,
+    // clicked here before, opens nothing in this image.)
+    const homeAgain = await canvasSample();
+    const [sx, sy] = at(150, 565 * (r.ch || 800) / 800);
+    log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the Gallery icon)`);
     await page.mouse.move(sx - 20, sy);
     await page.mouse.move(sx, sy, { steps: 4 });
     await page.mouse.down();
     await sleep(150);
     await page.mouse.up();
-    await focusWait('search in front', /search|quicksearchbox|googlequicksearchbox/i, (probeWaitMs * 3) / 4);
+    touchResult.mouseClick = { changedS: await changeFrom(homeAgain, 30, (probeWaitMs * 3) / 4) };
+    log(`INPUT PROBE: mouse click on the Gallery icon: the screen changed after ${touchResult.mouseClick.changedS} s`);
     log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
     await shot('after-mouse', true);
+    await page.click('#nav-home').catch(() => {});
 
-    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); head -40 /data/local/tmp/porty-ev.txt\r');
-    await sleep(20000);
-    log('INPUT PROBE: done');
+    // A mouse pointer, if Android showed one, is a sprite layer; and no
+    // input device but the PC's PS/2 mouse (always there, never moved)
+    // should be in pointer mode.
+    marks.sprites = null;
+    await send('echo SPRITES:$(dumpsys SurfaceFlinger --list | grep -c -i -e sprite -e pointer):' +
+        '$(dumpsys input | grep -c "Mode: pointer"):END\r');
+    for (let i = 0; i < 24 && !marks.sprites; i++) {
+        await sleep(5000);
+    }
+    touchResult.pointerSprites = marks.sprites ? marks.sprites.layers : -1;
+    touchResult.pointerModeDevices = marks.sprites ? marks.sprites.pointerMappers : -1;
+    log(`TOUCH RESULT: ${JSON.stringify(touchResult)}`);
+
+    // What reached the guest's input devices (the touchscreen's lines, and
+    // keys), then what Android's input dispatcher holds and logged.
+    marks.inlog = null;
+    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); ' +
+        'grep -E "EV_(ABS|KEY|SYN)" /data/local/tmp/porty-ev.txt | grep -v -E "REP_|MSC_" | ' +
+        'sed -e "s|/dev/input/||" -e "s/  */ /g" | head -700; ' +
+        'dumpsys input | grep -E -A3 "Last Raw Touch|TouchStates" | head -12; ' +
+        'logcat -d -b main -b system | grep -E "InputDispatcher|InputReader|Dropp" | tail -30; ' +
+        'echo INLOGDONE:$((1+1)):END\r');
+    for (let i = 0; i < 36 && !marks.inlog; i++) {
+        await sleep(5000);
+    }
+    log(`INPUT PROBE: done${marks.inlog ? '' : ' (the guest\'s event lines did not all come in 180 s)'}`);
 }
 
 /**

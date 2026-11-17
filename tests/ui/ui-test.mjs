@@ -2,8 +2,10 @@
 // standing in for QEMU.  Verifies everything on the JavaScript side of
 // Porty in a real browser: service-worker cross-origin isolation, download
 // and memory set-up (including the wasm memory patch and a real
-// WebAssembly.instantiate), the canvas blitter, pointer/keyboard/navigation
-// input, the serial console and the pause control.
+// WebAssembly.instantiate), the canvas blitter, touch (fingers in slots,
+// the mouse as a finger, the wheel as a drag, two fingers at once), the USB
+// tablet of touch=0, keyboard and navigation input, the serial console and
+// the pause control.
 //
 // usage: node ui-test.mjs <url> [query]
 //   PUPPETEER_DIR  directory that has node_modules/puppeteer-core
@@ -137,22 +139,39 @@ try {
     assert.equal(await page.$eval('#overlay', (e) => e.hidden), true);
     ok('boot overlay hides once the guest leaves text mode');
 
-    // 4. pointer -> tablet coordinates
+    // 4. the touchscreen: the mouse is one finger (slot 0) in tablet
+    // coordinates; hovering sends nothing; no tablet events at all
+    const touchMode = !/touch=0/.test(query);
+    assert.ok(p.args.includes(touchMode ? 'virtio-multitouch-pci' : 'usb-tablet'));
     const box = await (await page.$('#screen')).boundingBox();
     const cx = box.x + box.width / 2;
     const cy = box.y + box.height / 4;
+    let mark = (await probe()).events.length;
     await page.mouse.move(cx, cy);
     await page.mouse.down();
     await page.mouse.move(cx + 10, cy + 10);
     await page.mouse.up();
     p = await probe();
-    const abs = p.events.filter((e) => e[0] === 1);
-    const btn = p.events.filter((e) => e[0] === 2);
-    assert.ok(abs.length >= 2);
-    assert.ok(Math.abs(abs[0][1] - 0x7fff / 2) < 200, `x ${abs[0][1]}`);
-    assert.ok(Math.abs(abs[0][2] - 0x7fff / 4) < 200, `y ${abs[0][2]}`);
-    assert.deepEqual(btn, [[2, 0, 1, 0], [2, 0, 0, 0]]);
-    ok('pointer events map to absolute tablet coordinates and a left click');
+    const pointerEvents = p.events.slice(mark).filter((e) => e[0] !== 3 && e[0] !== 10);
+    if (touchMode) {
+        const kinds = pointerEvents.map((e) => e[0]);
+        assert.equal(kinds[0], 5, `events ${JSON.stringify(pointerEvents)}`);
+        assert.equal(kinds[kinds.length - 1], 7);
+        assert.ok(kinds.slice(1, -1).every((k) => k === 6) && kinds.length >= 3);
+        assert.ok(pointerEvents.every((e) => e[1] === 0), 'slot 0');
+        assert.ok(Math.abs(pointerEvents[0][2] - 0x7fff / 2) < 200, `x ${pointerEvents[0][2]}`);
+        assert.ok(Math.abs(pointerEvents[0][3] - 0x7fff / 4) < 200, `y ${pointerEvents[0][3]}`);
+        ok('the mouse is a finger on the touchscreen: down, moves and up in slot 0, no tablet events');
+    } else {
+        const abs = pointerEvents.filter((e) => e[0] === 1);
+        const btn = pointerEvents.filter((e) => e[0] === 2);
+        assert.ok(abs.length >= 2);
+        assert.ok(Math.abs(abs[0][1] - 0x7fff / 2) < 200, `x ${abs[0][1]}`);
+        assert.ok(Math.abs(abs[0][2] - 0x7fff / 4) < 200, `y ${abs[0][2]}`);
+        assert.deepEqual(btn, [[2, 0, 1, 0], [2, 0, 0, 0]]);
+        assert.ok(!pointerEvents.some((e) => e[0] >= 5 && e[0] <= 7));
+        ok('touch=0: pointer events map to absolute tablet coordinates and a left click');
+    }
     const ring = await page.evaluate(() => {
         const r = document.querySelector('#stage .tap-ring');
         const s = document.getElementById('stage').getBoundingClientRect();
@@ -172,9 +191,51 @@ try {
     assert.deepEqual(dot2, [0, 0, 0, 255], `dirty-rectangle update not drawn (was ${dot})`);
     ok('partial (dirty rectangle) updates reach the canvas');
 
-    // 5. keys
+    // 4b. fingers: two at once get two slots; the wheel drags with a
+    // finger that lifts by itself; the right button is Back
     const keysSince = async (n) => (await probe()).events.slice(n).filter((e) => e[0] === 3).map((e) => [e[1], e[2]]);
-    let mark = (await probe()).events.length;
+    if (touchMode) {
+        const cdp = await page.createCDPSession();
+        const touchAt = (type, points) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: points });
+        mark = (await probe()).events.length;
+        const f1 = { x: cx - 40, y: cy + 100, id: 1 };
+        const f2 = { x: cx + 40, y: cy + 200, id: 2 };
+        await touchAt('touchStart', [f1]);
+        await touchAt('touchStart', [f1, f2]);
+        await touchAt('touchMove', [{ ...f1, x: f1.x - 30 }, { ...f2, x: f2.x + 30 }]);
+        await touchAt('touchEnd', [{ ...f2, x: f2.x + 30 }]);
+        await touchAt('touchEnd', []);
+        await new Promise((r) => setTimeout(r, 200));
+        const fingers = (await probe()).events.slice(mark).filter((e) => e[0] >= 5 && e[0] <= 7);
+        const downs = fingers.filter((e) => e[0] === 5).map((e) => e[1]);
+        const ups = fingers.filter((e) => e[0] === 7).map((e) => e[1]).sort();
+        assert.deepEqual(downs, [0, 1], `fingers ${JSON.stringify(fingers)}`);
+        assert.deepEqual(ups, [0, 1]);
+        assert.ok(fingers.some((e) => e[0] === 6 && e[1] === 0) && fingers.some((e) => e[0] === 6 && e[1] === 1));
+        await cdp.detach();
+        ok('two fingers at once are two slots on the touchscreen');
+
+        mark = (await probe()).events.length;
+        await page.mouse.move(cx, cy + 200);
+        await page.mouse.wheel({ deltaY: 120 });
+        await page.mouse.wheel({ deltaY: 120 });
+        const wheeled = (await probe()).events.slice(mark).filter((e) => e[0] >= 5 && e[0] <= 7);
+        assert.equal(wheeled[0][0], 5);
+        const ys = wheeled.filter((e) => e[0] !== 7).map((e) => e[3]);
+        assert.ok(ys.length >= 3 && ys[1] < ys[0] && ys[2] < ys[1], `the wheel's finger moves up: ${JSON.stringify(wheeled)}`);
+        // It lifts once it has rested for the fling horizon (100 ms of guest time) times the dilation.
+        await page.waitForFunction((n) => globalThis.__porty.module.__events.slice(n).some((e) => e[0] === 7), { timeout: 5000 }, mark);
+        ok('the wheel drags with a finger, which lifts by itself');
+
+        mark = (await probe()).events.length;
+        await page.mouse.click(cx, cy, { button: 'right' });
+        assert.deepEqual(await keysSince(mark), [[158, 1], [158, 0]]);
+        assert.ok(!(await probe()).events.slice(mark).some((e) => e[0] >= 5 && e[0] <= 7));
+        ok('the mouse\'s right button is Back');
+    }
+
+    // 5. keys
+    mark = (await probe()).events.length;
     await page.click('#nav-back');
     await page.click('#nav-home');
     await page.click('#nav-recents');
@@ -271,6 +332,29 @@ try {
         assert.equal(await phone.$eval('#lastrun', (e) => e.hidden), true);
         assert.match(await phone.$eval('#cfgline', (e) => e.textContent), /^mem=768 tb=128 cache=16 /);
         ok('"Use the normal memory setting" goes back to the phone defaults');
+    }
+
+    // touch=0: the USB tablet of before (absolute moves and buttons).
+    if (!query) {
+        const tablet = await browser.newPage();
+        await tablet.setViewport({ width: 420, height: 900, hasTouch: false });
+        tablet.on('pageerror', (e) => errors.push(String(e)));
+        await tablet.goto(`${url}?touch=0`, { waitUntil: 'load' });
+        await tablet.waitForFunction(() => globalThis.crossOriginIsolated === true && !document.getElementById('start').disabled,
+            { timeout: 20000 });
+        assert.match(await tablet.$eval('#cfgline', (e) => e.textContent), / touch=0/);
+        await tablet.click('#start');
+        await tablet.waitForFunction(() => document.getElementById('app').dataset.state === 'running', { timeout: 30000 });
+        const tbox = await (await tablet.$('#screen')).boundingBox();
+        await tablet.mouse.click(tbox.x + tbox.width / 2, tbox.y + tbox.height / 2);
+        const t = await tablet.evaluate(() => ({ args: globalThis.__porty.module.__args, events: globalThis.__porty.module.__events,
+            notes: globalThis.__porty.notes }));
+        assert.ok(t.args.includes('usb-tablet') && t.args.includes('-usb') && !t.args.includes('virtio-multitouch-pci'));
+        const kinds = t.events.filter((e) => e[0] !== 3 && e[0] !== 10).map((e) => e[0]);
+        assert.ok(kinds.includes(1) && kinds.includes(2) && !kinds.some((k) => k >= 5 && k <= 7), `events ${kinds}`);
+        assert.ok(t.notes.some((n) => n.startsWith('Android has a USB tablet (touch=0)')));
+        ok('touch=0 gives Android the USB tablet, and the page sends it tablet moves and clicks');
+        await tablet.close();
     }
 
     assert.deepEqual(errors, [], 'page errors');
