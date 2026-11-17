@@ -41,15 +41,15 @@ const DEFAULTS = {
     // JIT cache policies), 0: off, QEMU-Wasm as before.
     desktop: { mem: 1024, tb: 384, cache: 64, jitcap: 0, jitring: 0, jitpolicy: 0 },
     mobile: { ...PHONE_LEVELS[0], jitcap: 4000, jitring: 0, jitpolicy: 0 },
-    // iPhones and iPads, where every browser is WebKit.  There the time of
-    // an app launch went to translating blocks again after the translation
-    // cache was flushed (every 6-10 s, as compiled forms took 80% of it) and
-    // to waiting at the cap for the collector to take dropped blocks.  The
-    // module ring keeps compiled forms out of the cache (one flush per
-    // launch instead of 13), and 8000 blocks hold the launch's working set:
-    // Gallery in 75 s instead of 112 s, with no higher peak memory (WebKit
-    // on Linux, A/B run 44098484966).  Chrome and desktops were not faster.
-    ios: { ...PHONE_LEVELS[0], jitcap: 8000, jitring: 24576, jitpolicy: 6 },
+    // iPhones and iPads, where every browser is WebKit.  There much of an
+    // app launch went to translating blocks again after the translation
+    // cache was flushed (40 times per Gallery launch, as compiled forms took
+    // 80% of it).  The module ring keeps them out of the cache: 3 flushes,
+    // and Gallery 18-22% sooner with a lower peak (WebKit on Linux, x86-64
+    // and ARM64, QEMU patch 0027 in: A/B run 44142674558 and 44142696754).
+    // A cap of 8000 on top was worth 0-5% more for 100-300 MiB more.
+    // Chrome and desktops were not faster with the ring.
+    ios: { ...PHONE_LEVELS[0], jitcap: 4000, jitring: 24576, jitpolicy: 6 },
 };
 
 export const PARAM_HELP = [
@@ -60,7 +60,7 @@ export const PARAM_HELP = [
     ['touch', '1 gives Android a touchscreen (virtio multitouch: taps, swipes and two-finger gestures as on a phone; a mouse acts as one finger, its wheel drags, its right button is Back) instead of the USB tablet (default 0: a mouse, an arrow follows the finger and a tap is a click). Off by default for now: with a touchscreen, apps take about twice as long to draw their first frame.'],
     ['usb', '0 leaves out the pointing device, touchscreen or USB tablet (no touch input; for diagnosis).'],
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
-    ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000, iPhones and iPads 8000).'],
+    ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
     ['jitgcwait', 'ms the cap waits at most for the garbage collector to report dropped compiled blocks gone (default 0: as long as it takes).'],
     ['jitpolicy', 'JIT cache policies, bits (default 0, iPhones and iPads 6): 1 compile at once after a flush what was hot before it, 2 at the cap give the blocks that ran since the last drop a second chance, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before.'],
@@ -184,7 +184,6 @@ export function parseConfig(search, env = {}) {
         // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
         jit: intParam(params, 'jit', -1, -1, 2147483647),
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
-        jitcapExplicit: params.has('jitcap'),
         // false: patch 0010's "do not wait for the garbage collector".
         jitgc: boolParam(params, 'jitgc', true),
         // QEMU patch 0023: how long the cap waits for the collector (0: no limit).
@@ -265,10 +264,7 @@ export function applyPhoneLevel(cfg, level) {
         return cfg;
     }
     const step = PHONE_LEVELS[Math.min(PHONE_LEVELS.length - 1, Math.floor(level))];
-    // After a start the browser killed, iPhones also go back to other
-    // phones' cap on compiled blocks.
-    const cap = !cfg.jitcapExplicit && cfg.jitcap > DEFAULTS.mobile.jitcap ? { jitcap: DEFAULTS.mobile.jitcap } : {};
-    return { ...cfg, ...step, ...cap, phoneLevel: PHONE_LEVELS.indexOf(step) };
+    return { ...cfg, ...step, phoneLevel: PHONE_LEVELS.indexOf(step) };
 }
 
 /**

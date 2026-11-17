@@ -44,8 +44,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     const phone = parseConfig('', { userAgent: IPHONE });
     const android = parseConfig('', { userAgent: ANDROID });
     assert.deepEqual([android.mem, android.tb, android.cache, android.jitcap], [768, 128, 16, 4000]);
-    // iPhones: a cap of 8000 with the module ring and policies 6 (QEMU patches 0022-0024).
-    assert.deepEqual([phone.mem, phone.tb, phone.cache, phone.jitcap], [768, 128, 16, 8000]);
+    // iPhones: the module ring and policies 6 (QEMU patches 0022-0024), the phones' cap.
+    assert.deepEqual([phone.mem, phone.tb, phone.cache, phone.jitcap], [768, 128, 16, 4000]);
     assert.deepEqual([phone.jitring, phone.jitpolicy], [24576, 6]);
     assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
     assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
@@ -97,10 +97,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual(PHONE_LEVELS[0], { mem: phone.mem, tb: phone.tb, cache: phone.cache });
     const step1 = applyPhoneLevel(phone, 1);
     assert.deepEqual([step1.mem, step1.tb, step1.cache, step1.phoneLevel], [640, 96, 12, 1]);
-    // ...and an iPhone goes back to other phones' cap on compiled blocks, unless the URL set one
-    assert.deepEqual([step1.jitcap, step1.jitring], [4000, 24576]);
-    assert.equal(applyPhoneLevel(parseConfig('?jitcap=9000', { userAgent: IPHONE }), 1).jitcap, 9000);
-    assert.equal(applyPhoneLevel(android, 1).jitcap, 4000);
+    // ...and an iPhone keeps its JIT cache settings
+    assert.deepEqual([step1.jitcap, step1.jitring, step1.jitpolicy], [4000, 24576, 6]);
     assert.equal(requiredWasmMemoryMb(step1), 1152);
     assert.equal(applyPhoneLevel(phone, 9).mem, 512, 'clamped to the last step');
     assert.equal(applyPhoneLevel(phone, 0), phone);

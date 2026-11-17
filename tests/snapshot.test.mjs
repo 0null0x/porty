@@ -130,8 +130,7 @@ const snapshot = () => ({
     assert.equal(desktop.cfg.memoryExplicit, true);
     assert.equal(desktop.cfg.resume, true);
 
-    // An iPhone that had stepped down to 640 MiB still resumes with 768
-    // (and keeps the smaller cap on compiled blocks of its step).
+    // An iPhone that had stepped down to 640 MiB still resumes with 768.
     const phoneEnv = { userAgent: IPHONE };
     const phoneUser = applyPhoneLevel(parseConfig('', phoneEnv), 1);
     assert.deepEqual([phoneUser.mem, phoneUser.tb, phoneUser.cache, phoneUser.jitcap], [640, 96, 12, 4000]);
@@ -141,7 +140,7 @@ const snapshot = () => ({
         [768, 128, 16, 4000, true]);
     // A fresh iPhone resumes with its own JIT cache settings.
     const fresh = snapshotConfig(snap, parseConfig('', phoneEnv), phoneEnv);
-    assert.deepEqual([fresh.cfg.jitcap, fresh.cfg.jitring, fresh.cfg.jitpolicy], [8000, 24576, 6]);
+    assert.deepEqual([fresh.cfg.jitcap, fresh.cfg.jitring, fresh.cfg.jitpolicy], [4000, 24576, 6]);
     assert.equal(phone.cfg.phoneLevel, undefined);
     assert.equal(requiredWasmMemoryMb(phone.cfg), 1280);
 
