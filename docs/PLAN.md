@@ -900,6 +900,15 @@ Three agents on Opus (branches `swarm/webkit-memory`, `swarm/qemu-crash`,
   some 25 to 30 helper signatures (SSE-heavy code) overruns them and
   corrupts that block's branches.
 
+- Deployed together (cdfa2c0, snapshot run 44017107437) after branch boot
+  tests of main (44018587461, 44018591571: resumed 6 s after Start, the
+  screen changed 20-35 s after the tap on Gallery, Gallery's own screen by
+  the end of the wait; the old site was still black after 240 s). On the
+  live site with an iPhone user agent (webkit-test.yml run 44021534892,
+  one job per browser and jitcap): Gallery drawn after 53-80 s in Chrome
+  (peak 1.8-2.1 GB) and in WebKit after 107 s at `jitcap=15000` (peak
+  3.2 GB), 229 s at 8000 and 243 s at 4000 (peaks 2.6-2.7 GB).
+
 **Next steps:**
 
 1. The browser A/B of surfaceflinger's fix on one runner (both guests on
