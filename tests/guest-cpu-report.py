@@ -81,6 +81,19 @@ def main(paths):
                   f"| {med([share(x, {'surfaceflinger'}) for x in runs])} | {med([share(x, app_names) for x in runs])} "
                   f"| {med([share(x, {'system_server'}) for x in runs])} | {med([share(x, {'com.android.launcher3'}) for x in runs])} "
                   f"| {med([share(x, {'com.android.systemui'}) for x in runs])} | {top} |")
+    uis = [r for r in results if r.get("ui")]
+    if uis:
+        print()
+        print("### UI check (Settings: two finger drags, two pointer moves, typing in its search)")
+        print()
+        print("| variant | scrolled % | back at the top, % off | pointer moved % | typed % | sf frames | busy ticks "
+              "| surfaceflinger % | focus or error |")
+        print("|---|---|---|---|---|---|---|---|---|")
+        for r in uis:
+            u = r["ui"]
+            print(f"| {r.get('variant')} | {u.get('scrolled_pct')} | {u.get('scrolled_back_vs_top_pct')} "
+                  f"| {u.get('pointer_moved_pct')} | {u.get('typed_pct')} | {u.get('sf_frames')} | {u.get('busy')} "
+                  f"| {u.get('surfaceflinger_pct')} | {(u.get('error') or u.get('search_focus') or '')[:70]} |")
     return 0
 
 

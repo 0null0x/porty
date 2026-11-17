@@ -208,6 +208,20 @@ def tap(vm, fx, fy):
     vm.qmp.cmd("input-send-event", {"events": [{"type": "btn", "data": {"down": False, "button": "left"}}]})
 
 
+def ppm_diff(data, base):
+    """Share (%) of 1/7 of the pixels of `data` that differ from `base` (bytes of two PPMs)."""
+    if not data or not base or len(base) != len(data):
+        return -1.0
+    header = data.split(b"\n", 3)
+    start = len(data) - len(header[3])
+    n = same = 0
+    for i in range(start, len(data) - 2, 21):
+        n += 1
+        if abs(data[i] - base[i]) + abs(data[i + 1] - base[i + 1]) + abs(data[i + 2] - base[i + 2]) <= 48:
+            same += 1
+    return round(100.0 * (n - same) / max(1, n), 1)
+
+
 def screen_diff(vm, name, base):
     """Share (%) of 1/7 of the pixels that differ from `base` (bytes of a PPM), and the new PPM."""
     path = vm.fb_prefix + ".ppm"
@@ -216,16 +230,93 @@ def screen_diff(vm, name, base):
             data = f.read()
     except OSError:
         return -1.0, None
-    if not base or len(base) != len(data):
-        return -1.0, data
-    header = data.split(b"\n", 3)
-    start = len(data) - len(header[3])
-    n = same = 0
-    for i in range(start, len(data) - 2, 21):
-        n += 1
-        if abs(data[i] - base[i]) + abs(data[i + 1] - base[i + 1]) + abs(data[i + 2] - base[i + 2]) <= 48:
-            same += 1
-    return round(100.0 * (n - same) / max(1, n), 1), data
+    return ppm_diff(data, base), data
+
+
+def abs_at(fx, fy):
+    return [{"type": "abs", "data": {"axis": "x", "value": max(0, min(ABS_MAX, round(fx * ABS_MAX)))}},
+            {"type": "abs", "data": {"axis": "y", "value": max(0, min(ABS_MAX, round(fy * ABS_MAX)))}}]
+
+
+def drag(vm, fx0, fy0, fx1, fy1, steps=12, pause=0.25):
+    """A finger drag as the page sends it (web/js/input.js): move, press, moves, release."""
+    vm.qmp.cmd("input-send-event", {"events": abs_at(fx0, fy0)})
+    vm.qmp.cmd("input-send-event", {"events": [{"type": "btn", "data": {"down": True, "button": "left"}}]})
+    for i in range(1, steps + 1):
+        time.sleep(pause)
+        vm.qmp.cmd("input-send-event", {"events": abs_at(fx0 + (fx1 - fx0) * i / steps, fy0 + (fy1 - fy0) * i / steps)})
+    time.sleep(pause)
+    vm.qmp.cmd("input-send-event", {"events": [{"type": "btn", "data": {"down": False, "button": "left"}}]})
+
+
+def type_keys(vm, text):
+    """Lower-case letters typed on the PS/2 keyboard, as the page's keyboard does."""
+    for ch in text:
+        for down in (True, False):
+            vm.qmp.cmd("input-send-event", {"events": [{"type": "key", "data": {"down": down,
+                                                        "key": {"type": "qcode", "data": ch}}}]})
+            time.sleep(0.15)
+
+
+def ui_check(g, opts, result):
+    """After the starts: scrolling (finger drags on Settings), the mouse
+    pointer (two hover moves) and typing (Settings' search, on the PS/2
+    keyboard), each followed by a screenshot in the log and how much of the
+    screen it changed, and surfaceflinger's frames and CPU over all of it:
+    the same steps for every variant, to see that the screen keeps up when a
+    variant changes how surfaceflinger composes."""
+    vm = g.vm
+    ui = {}
+    result["ui"] = ui
+    shots = {}
+
+    def shot(name, wait=3):
+        prov.wait(vm, wait)
+        ui[f"{name}_quiet_s"] = g.quiet(timeout=120)
+        _, shots[name] = screen_diff(vm, name, None)
+        vm.screenshot(f"ui-{name}", show=True)
+
+    g.sh("am force-stop com.android.settings", 60)
+    g.sh("dumpsys SurfaceFlinger --timestats -enable -clear > /dev/null 2>&1", 120)
+    a = g.cpu("uia")
+    vm.sh("(am start -n com.android.settings/.Settings > /dev/null 2>&1 &)", 30)
+    shot("settings", 10)
+    drag(vm, 0.5, 0.8, 0.5, 0.3)
+    shot("scrolled")
+    ui["scrolled_pct"] = ppm_diff(shots["scrolled"], shots["settings"])
+    drag(vm, 0.5, 0.3, 0.5, 0.9)
+    shot("scrolled_back")
+    ui["scrolled_back_vs_top_pct"] = ppm_diff(shots["scrolled_back"], shots["settings"])
+    vm.qmp.cmd("input-send-event", {"events": abs_at(0.3, 0.45)})
+    shot("pointer_a", 2)
+    vm.qmp.cmd("input-send-event", {"events": abs_at(0.7, 0.6)})
+    shot("pointer_b", 2)
+    ui["pointer_moved_pct"] = ppm_diff(shots["pointer_b"], shots["pointer_a"])
+    ui["pointer_layers"] = g.sh("dumpsys SurfaceFlinger --list | grep -i -e sprite -e pointer | head -4", 60)[1].strip()
+    vm.sh("(am start -a android.settings.APP_SEARCH_SETTINGS > /dev/null 2>&1 &)", 30)
+    shot("search", 10)
+    ui["search_focus"] = g.focus()
+    type_keys(vm, "wifi")
+    shot("typed", 4)
+    ui["typed_pct"] = ppm_diff(shots["typed"], shots["search"])
+    ui["ime"] = g.sh("dumpsys input_method | grep -e mInputShown -e mCurFocusedWindow | head -3 | cut -c1-140", 60)[1].strip()
+    b = g.cpu("uib")
+    ui["sf_timestats"] = g.sh("dumpsys SurfaceFlinger --timestats -dump -maxlayers 8 2>&1 | grep -E"
+                              " 'totalFrames|clientCompositionFrames|statsStart|statsEnd' | head -4 | cut -c1-120", 120)[1]
+    m = re.search(r"totalFrames\s*=\s*(\d+)", ui["sf_timestats"])
+    ui["sf_frames"] = int(m.group(1)) if m else None
+    d = cpu_delta(a, b)
+    if d:
+        busy = max(1, d["busy"])
+        ui["busy"] = d["busy"]
+        ui["total"] = d["total"]
+        ui["surfaceflinger_pct"] = round(100.0 * sum(p["ticks"] for p in d["procs"] if p["comm"] == "surfaceflinger") / busy, 1)
+    log(f"ui check: scrolled {ui['scrolled_pct']}%, back at the top {ui['scrolled_back_vs_top_pct']}% off,"
+        f" pointer moved {ui['pointer_moved_pct']}% ({ui['pointer_layers'] or 'no pointer layer'}),"
+        f" typed {ui['typed_pct']}% (focus {ui['search_focus']}; {ui['ime']}); sf frames {ui['sf_frames']},"
+        f" {describe(d) if d else 'no CPU snapshot'}")
+    g.sh("input keyevent 3", 60)
+    prov.wait(vm, 2)
 
 
 def launch(g, app, opts, index):
@@ -506,6 +597,13 @@ def main():
                         snap.write_json(os.path.join(opts.work, "result.json"), result)
             if opts.profile and apps:
                 profile(g, apps[0], opts, result)
+                snap.write_json(os.path.join(opts.work, "result.json"), result)
+            if plan.get("ui"):
+                try:
+                    ui_check(g, opts, result)
+                except Exception as e:  # the starts above still count
+                    result.setdefault("ui", {})["error"] = f"{type(e).__name__}: {e}"
+                    log(f"ui check: {result['ui']['error']}")
                 snap.write_json(os.path.join(opts.work, "result.json"), result)
             result["reboots"] = list(vm.reboots)
             run("crashes", "logcat -b crash -d | grep -e 'Process: ' -e '>>> ' | cut -c1-200 | head -20")
