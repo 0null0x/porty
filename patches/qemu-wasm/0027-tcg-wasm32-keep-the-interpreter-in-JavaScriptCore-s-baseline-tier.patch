@@ -1,0 +1,133 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 15:20:00 +0000
+Subject: [PATCH] tcg/wasm32: keep the interpreter in JavaScriptCore's
+ baseline tier
+
+JavaScriptCore compiles a hot WebAssembly function with its baseline
+compiler (BBQ) and later with its optimizing tier (OMG), unless the
+function body is over Options::maximumOMGCandidateCost bytes (100000;
+40000 in WebKit 2.48).  For the interpreter, tcg_qemu_tb_exec_tci(),
+OMG is a loss: in Playwright's WebKit with QEMU's JIT off, it ran 68000
+blocks a second with OMG and 117000 without, and with the JIT on a
+Gallery start took 99 s when the interpreter (9971 bytes) was left to
+OMG (maximumOMGCandidateCost=10000) and 61 s when it was not (9000; it
+is the only hot function between the two).  Why OMG's code is slower is
+not known.
+
+A page cannot set JavaScriptCore's options, so the interpreter is made
+too big for OMG instead: the helper-call switch of patch 0015,
+porty_tci_call_direct() (about 106000 bytes of WebAssembly once Asyncify
+has instrumented its 765 indirect calls), is inlined into it, which puts
+it well over 100000 bytes.  porty_tci_call_code() now calls the switch
+once instead of twice, so that it is inlined once, and
+tcg_qemu_tb_exec_tci() is noinline so that it stays one function.
+Porty's scripts/wasm-info.py warns when it is under 110000 bytes.  In
+every browser a helper call is one call shorter.
+---
+ tcg/wasm32-tci-calls.h | 44 +++++++++++++++++++++++++-------------------
+ tcg/wasm32.c           | 19 +++++++++++++++++--
+ 2 files changed, 42 insertions(+), 21 deletions(-)
+
+diff --git a/tcg/wasm32-tci-calls.h b/tcg/wasm32-tci-calls.h
+index d049ed4..6d1cfe8 100644
+--- a/tcg/wasm32-tci-calls.h
++++ b/tcg/wasm32-tci-calls.h
+@@ -107,10 +107,16 @@ static int porty_tci_code(const ffi_cif *cif)
+  * Call a helper of signature code, as porty_tci_code() gave it, with the
+  * arguments av[0..nargs) point to, putting its result where libffi would;
+  * false if the switch has no case for it.
++ *
++ * Porty (patch 0027): both are inlined into the interpreter, the switch
++ * once, so that tcg_qemu_tb_exec_tci() stays over 100000 bytes of
++ * WebAssembly (see the comment there).
+  */
+-static bool porty_tci_call_direct(int code, void *f, void *ret, void **av);
++static inline __attribute__((always_inline))
++bool porty_tci_call_direct(int code, void *f, void *ret, void **av);
+ 
+-static bool porty_tci_call_code(int code, unsigned nargs, void *f, void *ret, void **av)
++static inline __attribute__((always_inline))
++bool porty_tci_call_code(int code, unsigned nargs, void *f, void *ret, void **av)
+ {
+     unsigned i128 = (unsigned)code >> PORTY_TCI_I128_SHIFT & 0xff;
+     bool sret = code & PORTY_TCI_SRET;
+@@ -119,25 +125,25 @@ static bool porty_tci_call_code(int code, unsigned nargs, void *f, void *ret, vo
+     uint64_t copy[PORTY_TCI_MAX_ARGS][2];
+     unsigned i, k = 0;
+ 
+-    if (!i128 && !sret) {
+-        return porty_tci_call_direct(PORTY_TCI_CASE(code), f, ret, av);
+-    }
+-    if (sret) {
+-        ptr[0] = (uint32_t)(uintptr_t)ret;
+-        av2[0] = &ptr[0];
+-        k = 1;
+-    }
+-    for (i = 0; i < nargs && k < PORTY_TCI_MAX_ARGS; i++, k++) {
+-        if (i128 >> i & 1) {
+-            /* By value: the helper gets a copy it may change. */
+-            memcpy(copy[i], av[i], 16);
+-            ptr[k] = (uint32_t)(uintptr_t)copy[i];
+-            av2[k] = &ptr[k];
+-        } else {
+-            av2[k] = av[i];
++    if (i128 || sret) {
++        if (sret) {
++            ptr[0] = (uint32_t)(uintptr_t)ret;
++            av2[0] = &ptr[0];
++            k = 1;
++        }
++        for (i = 0; i < nargs && k < PORTY_TCI_MAX_ARGS; i++, k++) {
++            if (i128 >> i & 1) {
++                /* By value: the helper gets a copy it may change. */
++                memcpy(copy[i], av[i], 16);
++                ptr[k] = (uint32_t)(uintptr_t)copy[i];
++                av2[k] = &ptr[k];
++            } else {
++                av2[k] = av[i];
++            }
+         }
++        av = av2;
+     }
+-    return porty_tci_call_direct(PORTY_TCI_CASE(code), f, ret, av2);
++    return porty_tci_call_direct(PORTY_TCI_CASE(code), f, ret, av);
+ }
+ 
+ /*
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index 3e19669..f318f90 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -91,7 +91,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t *porty_tci_stats(void)
+     return porty_tci_calls;
+ }
+ 
+-static void porty_tci_call(ffi_cif *cif, void *func, void *ret, void **av)
++static inline __attribute__((always_inline))
++void porty_tci_call(ffi_cif *cif, void *func, void *ret, void **av)
+ {
+     /* QEMU makes its ffi_cif records once; remember the codes of a few. */
+     static __thread const ffi_cif *seen_cif[16];
+@@ -815,7 +816,21 @@ static void tci_qemu_st(CPUArchState *env, uint64_t taddr, uint64_t val,
+ 
+ __thread tcg_target_ulong regs[TCG_TARGET_NB_REGS];
+ 
+-static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
++/*
++ * Porty (patch 0027): this function is over 100000 bytes of WebAssembly on
++ * purpose.  JavaScriptCore never compiles a function body over
++ * Options::maximumOMGCandidateCost bytes (100000; 40000 in WebKit 2.48)
++ * with its optimizing tier (OMG), and leaves it in its baseline compiler
++ * (BBQ).  In Playwright's WebKit this interpreter ran 1.7 times slower once
++ * OMG had compiled it (68000 blocks a second against 117000 with QEMU's JIT
++ * off), and with the JIT on, a Gallery start took 99 s when OMG compiled
++ * it and 61 s when it did not (maximumOMGCandidateCost 10000 against 9000:
++ * it is the only hot function between).  Its size is the helper-call
++ * switch, porty_tci_call_direct() of wasm32-tci-calls.h (about 106000
++ * bytes), inlined into it through porty_tci_call(); noinline keeps it one
++ * function.  scripts/wasm-info.py warns when it is under 110000 bytes.
++ */
++static uintptr_t __attribute__((noinline)) tcg_qemu_tb_exec_tci(CPUArchState *env)
+ {
+     uint32_t *tb_ptr = (uint8_t*)ctx.tb_ptr + *(uint32_t*)ctx.tb_ptr;
+     uint64_t *stack = ctx.stack;

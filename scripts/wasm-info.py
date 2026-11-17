@@ -6,11 +6,13 @@ the expected limits (web/js/wasm-patch.js rewrites exactly those limits in
 the browser) and to show where the bytes of the .wasm file go.
 
 It also lists the largest function bodies, and the hot functions of the
-translator and the interpreter: JavaScriptCore never compiles a body over
-Options::maximumOMGCandidateCost bytes (40000 in WebKit 2.48, 100000
-later) with its optimizing tier, and compiles one just under it at a high
-transient cost in memory.  A hot function over WATCH_LIMIT bytes is
-reported with a warning (never an error).
+translator and the interpreter, because body sizes decide how
+JavaScriptCore compiles them: it never compiles a body over
+Options::maximumOMGCandidateCost bytes (100000; 40000 in WebKit 2.48)
+with its optimizing tier (OMG), only with its baseline compiler (BBQ).
+The interpreter, tcg_qemu_tb_exec_tci(), must stay over that on purpose
+(QEMU patch 0027): OMG made it 1.7 times slower than BBQ.  A warning
+(never an error) says when it is under BASELINE_ONLY's 110000 bytes.
 
 usage: wasm-info.py <file.wasm> [--json out.json] [--expect-memory-mb N]
 SPDX-License-Identifier: GPL-2.0-or-later
@@ -35,6 +37,9 @@ WATCH = re.compile(
     r"|cpu_exec_loop|tb_gen_code|tb_lookup|helper_lookup_tb_ptr|mmu_translate"
     r"|x86_cpu_tlb_fill|(do|helper)_(ld|st)[0-9_])")
 WATCH_LIMIT = 40000
+# Functions JavaScriptCore must leave in its baseline tier, and the size
+# they must keep for that (over maximumOMGCandidateCost, with a margin).
+BASELINE_ONLY = {"tcg_qemu_tb_exec_tci": 110000}
 
 
 def leb(buf, pos):
@@ -174,6 +179,9 @@ def inspect(buf):
         "largest_functions": [{"name": n, "bytes": b} for b, n in functions[:40]],
         "hot_functions": [{"name": n, "bytes": b} for b, n in functions
                           if WATCH.match(n)][:40],
+        "baseline_only": [{"name": n, "min_bytes": m,
+                           "bytes": next((b for b, f in functions if f == n), None)}
+                          for n, m in BASELINE_ONLY.items()],
     }
 
 
@@ -197,11 +205,20 @@ def main():
         print(f"  {f['bytes']:>12}  {f['name']}")
     print("  hot functions (translator, interpreter, execution loop, soft MMU):")
     for f in info["hot_functions"][:25]:
-        print(f"  {f['bytes']:>12}  {f['name']}")
-        if f["bytes"] > WATCH_LIMIT:
-            print(f"::warning::{f['name']} is {f['bytes']} bytes of WebAssembly, over "
-                  f"{WATCH_LIMIT}: JavaScriptCore may never optimize it, or "
-                  f"optimize it at a high cost in memory")
+        note = ""
+        if f["name"] in BASELINE_ONLY:
+            note = f"  (must stay over {BASELINE_ONLY[f['name']]})"
+        elif f["bytes"] > 100000:
+            note = "  (over 100000: never optimized by JavaScriptCore)"
+        elif f["bytes"] > WATCH_LIMIT:
+            note = f"  (over {WATCH_LIMIT}: never optimized by WebKit 2.48)"
+        print(f"  {f['bytes']:>12}  {f['name']}{note}")
+    for f in info["baseline_only"]:
+        if f["bytes"] is None or f["bytes"] < f["min_bytes"]:
+            size = "is missing" if f["bytes"] is None else f"is {f['bytes']} bytes of WebAssembly"
+            print(f"::warning::{f['name']} {size}, under {f['min_bytes']}: JavaScriptCore "
+                  f"may compile it with its optimizing tier, which made it 1.7 times slower "
+                  f"(QEMU patch 0027 keeps it over 100000 bytes)")
 
     if memory is None:
         sys.exit("error: the module does not import its memory")
