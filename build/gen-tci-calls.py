@@ -10,7 +10,9 @@ interpreter dispatches on a code for it:
     code = return kind << 10 | number of arguments << 7 | 64-bit argument mask
 
 (return kind 0 void, 1 i32, 2 i64; bit i of the mask: argument i is 64-bit)
-and calls the helper through a pointer of that type.  This prints every
+and calls the helper through a pointer of that type.  Int128 results and
+arguments (QEMU's struct form under Emscripten) travel as i32 pointers in
+the wasm32 C ABI, so they map onto the same cases.  This prints every
 code for up to MAX_CALL_IARGS (7) arguments; the output is in patch 0015.
 
 usage: build/gen-tci-calls.py > tcg/wasm32-tci-calls.h
@@ -38,24 +40,43 @@ def main() -> None:
 #define PORTY_TCI_MAX_ARGS %d
 
 /*
- * The code of a libffi signature, or -1 when the switch has none for it:
- * Int128 (a struct), floating point, more than PORTY_TCI_MAX_ARGS
- * arguments.  Pointers are i32 on wasm32 (elsewhere they are left to libffi).
+ * Int128 (QEMU's struct form, which it uses under Emscripten): libffi's
+ * ffi_type for it is a struct of two uint64.  In the wasm32 C ABI, as in
+ * libffi's wasm32 port, an Int128 result is returned through a pointer
+ * passed as a first argument, and an Int128 argument is passed as a
+ * pointer to a copy: both are i32s, so the switch below covers them too.
+ */
+static bool porty_tci_is_i128(const ffi_type *t)
+{
+    return t->type == FFI_TYPE_STRUCT && t->size == 16 && t->elements &&
+           t->elements[0] && t->elements[0]->type == FFI_TYPE_UINT64 &&
+           t->elements[1] && t->elements[1]->type == FFI_TYPE_UINT64 &&
+           !t->elements[2];
+}
+
+#define PORTY_TCI_SRET (1 << 20)       /* the Int128 result comes back through a pointer */
+#define PORTY_TCI_I128_SHIFT 12        /* bit 12 + i: argument i is an Int128 */
+#define PORTY_TCI_CASE(code) ((code) & 0xfff)
+
+/*
+ * The code of a libffi signature (with PORTY_TCI_SRET and the Int128
+ * argument bits), or -1 when the switch has none for it: floating point,
+ * more than PORTY_TCI_MAX_ARGS arguments in WebAssembly.  Pointers and
+ * Int128 are taken as described above on wasm32 only (elsewhere such
+ * signatures are left to libffi).
  */
 static int porty_tci_code(const ffi_cif *cif)
 {
-    unsigned n = cif->nargs, i;
-    int r, mask = 0;
+    unsigned n = cif->nargs, i, k;
+    int r, mask = 0, i128 = 0, sret = 0;
+    bool wasm32 = sizeof(void *) == 4;
 
-    if (n > PORTY_TCI_MAX_ARGS) {
-        return -1;
-    }
     switch (cif->rtype->type) {
     case FFI_TYPE_VOID:
         r = 0;
         break;
     case FFI_TYPE_POINTER:
-        if (sizeof(void *) != 4) {
+        if (!wasm32) {
             return -1;
         }
         /* fall through */
@@ -69,12 +90,21 @@ static int porty_tci_code(const ffi_cif *cif)
         r = 2;
         break;
     default:
+        if (!wasm32 || !porty_tci_is_i128(cif->rtype)) {
+            return -1;
+        }
+        r = 0;
+        sret = 1;
+        break;
+    }
+    if (n + sret > PORTY_TCI_MAX_ARGS) {
         return -1;
     }
     for (i = 0; i < n; i++) {
+        k = i + sret;
         switch (cif->arg_types[i]->type) {
         case FFI_TYPE_POINTER:
-            if (sizeof(void *) != 4) {
+            if (!wasm32) {
                 return -1;
             }
             break;
@@ -84,13 +114,55 @@ static int porty_tci_code(const ffi_cif *cif)
             break;
         case FFI_TYPE_UINT64:
         case FFI_TYPE_SINT64:
-            mask |= 1 << i;
+            mask |= 1 << k;
             break;
         default:
-            return -1;
+            if (!wasm32 || !porty_tci_is_i128(cif->arg_types[i])) {
+                return -1;
+            }
+            i128 |= 1 << i;
+            break;
         }
     }
-    return PORTY_TCI_CODE(r, (int)n, mask);
+    return PORTY_TCI_CODE(r, (int)(n + sret), mask) | i128 << PORTY_TCI_I128_SHIFT |
+           (sret ? PORTY_TCI_SRET : 0);
+}
+
+/*
+ * Call a helper of signature code, as porty_tci_code() gave it, with the
+ * arguments av[0..nargs) point to, putting its result where libffi would;
+ * false if the switch has no case for it.
+ */
+static bool porty_tci_call_direct(int code, void *f, void *ret, void **av);
+
+static bool porty_tci_call_code(int code, unsigned nargs, void *f, void *ret, void **av)
+{
+    unsigned i128 = (unsigned)code >> PORTY_TCI_I128_SHIFT & 0xff;
+    bool sret = code & PORTY_TCI_SRET;
+    void *av2[PORTY_TCI_MAX_ARGS];
+    uint32_t ptr[PORTY_TCI_MAX_ARGS];
+    uint64_t copy[PORTY_TCI_MAX_ARGS][2];
+    unsigned i, k = 0;
+
+    if (!i128 && !sret) {
+        return porty_tci_call_direct(PORTY_TCI_CASE(code), f, ret, av);
+    }
+    if (sret) {
+        ptr[0] = (uint32_t)(uintptr_t)ret;
+        av2[0] = &ptr[0];
+        k = 1;
+    }
+    for (i = 0; i < nargs && k < PORTY_TCI_MAX_ARGS; i++, k++) {
+        if (i128 >> i & 1) {
+            /* By value: the helper gets a copy it may change. */
+            memcpy(copy[i], av[i], 16);
+            ptr[k] = (uint32_t)(uintptr_t)copy[i];
+            av2[k] = &ptr[k];
+        } else {
+            av2[k] = av[i];
+        }
+    }
+    return porty_tci_call_direct(PORTY_TCI_CASE(code), f, ret, av2);
 }
 
 /*

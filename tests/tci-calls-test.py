@@ -88,7 +88,7 @@ static int check(int r, int n, int mask, void *f)
     ffi_call(&cif, FFI_FN(f), ret_ffi, av);
     memcpy(seen_ffi, seen, sizeof(seen));
     memset(seen, 0, sizeof(seen));
-    if (!porty_tci_call_direct(code, f, ret_direct, av)) {
+    if (!porty_tci_call_code(code, n, f, ret_direct, av)) {
         printf("FAIL  r=%d n=%d mask=%d: no case\\n", r, n, mask);
         return 1;
     }
@@ -172,5 +172,145 @@ int main(void)
         return subprocess.run([exe]).returncode
 
 
+WASM_TEST = r"""
+/* wasm32: Int128 helpers (QEMU's struct form) through the switch, against
+ * the compiler's own calls of the same helpers.  A cast that does not
+ * match clang's wasm32 ABI makes call_indirect trap (signature mismatch). */
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef long long int64_t;
+typedef unsigned long size_t;
+typedef unsigned long uintptr_t;
+#define bool _Bool
+#define true 1
+#define false 0
+void *memcpy(void *d, const void *s, size_t n) { char *a = d; const char *b = s; while (n--) *a++ = *b++; return d; }
+void *memset(void *d, int c, size_t n) { char *a = d; while (n--) *a++ = (char)c; return d; }
+#define FFI_TYPE_VOID 0
+#define FFI_TYPE_INT 1
+#define FFI_TYPE_UINT32 9
+#define FFI_TYPE_SINT32 10
+#define FFI_TYPE_UINT64 11
+#define FFI_TYPE_SINT64 12
+#define FFI_TYPE_STRUCT 13
+#define FFI_TYPE_POINTER 14
+typedef struct _ffi_type { size_t size; unsigned short alignment; unsigned short type; struct _ffi_type **elements; } ffi_type;
+typedef struct { int abi; unsigned nargs; ffi_type **arg_types; ffi_type *rtype; unsigned bytes; unsigned flags; } ffi_cif;
+#include "tci-calls.h"
+
+typedef struct Int128 { uint64_t lo; int64_t hi; } Int128;
+static ffi_type u32 = { 4, 4, FFI_TYPE_UINT32, 0 }, u64 = { 8, 8, FFI_TYPE_UINT64, 0 }, ptr = { 4, 4, FFI_TYPE_POINTER, 0 };
+static ffi_type v = { 1, 1, FFI_TYPE_VOID, 0 };
+static ffi_type *pair[3] = { &u64, &u64, 0 };
+static ffi_type i128 = { 16, 8, FFI_TYPE_STRUCT, pair };
+static uint64_t seen[8];
+
+/* helper_ld_i128-like: Int128 (env, addr, oi) */
+Int128 ld(uint32_t env, uint64_t addr, uint32_t oi)
+{
+    Int128 r = { addr ^ env, (int64_t)(addr + oi) };
+    seen[0] = env; seen[1] = addr; seen[2] = oi;
+    return r;
+}
+/* helper_st_i128-like: void (env, addr, Int128 val, oi) */
+void st(uint32_t env, uint64_t addr, Int128 val, uint32_t oi)
+{
+    seen[0] = env; seen[1] = addr; seen[2] = val.lo; seen[3] = (uint64_t)val.hi; seen[4] = oi;
+    val.lo = 0;  /* a copy: the caller's must not change */
+}
+/* cmpxchg128-like: Int128 (env, addr, Int128 cmp, Int128 new, oi) */
+Int128 cx(uint32_t env, uint64_t addr, Int128 cmp, Int128 nv, uint32_t oi)
+{
+    Int128 r = { cmp.lo + nv.lo, cmp.hi - nv.hi };
+    seen[0] = env; seen[1] = addr; seen[2] = cmp.lo; seen[3] = (uint64_t)nv.hi; seen[4] = oi;
+    return r;
+}
+
+int run(void)
+{
+    int fail = 0;
+    uint64_t slots[8][2];
+    void *av[8];
+    uint64_t ret[2];
+    ffi_cif cif;
+    ffi_type *a3[3] = { &ptr, &u64, &u32 };
+    ffi_type *a4[4] = { &ptr, &u64, &i128, &u32 };
+    ffi_type *a5[5] = { &ptr, &u64, &i128, &i128, &u32 };
+    int i, code;
+
+    for (i = 0; i < 8; i++) { slots[i][0] = 0x1111111111111111ULL * (i + 1); slots[i][1] = 0x0123456789abcdefULL + i; av[i] = slots[i]; }
+
+    /* ld */
+    cif.nargs = 3; cif.arg_types = a3; cif.rtype = &i128;
+    code = porty_tci_code(&cif);
+    if (code < 0 || !(code & PORTY_TCI_SRET)) return 100;
+    ret[0] = ret[1] = 0;
+    if (!porty_tci_call_code(code, 3, (void *)ld, ret, av)) return 101;
+    {
+        Int128 want = ld((uint32_t)slots[0][0], slots[1][0], (uint32_t)slots[2][0]);
+        if (ret[0] != want.lo || ret[1] != (uint64_t)want.hi) fail++;
+    }
+
+    /* st */
+    cif.nargs = 4; cif.arg_types = a4; cif.rtype = &v;
+    code = porty_tci_code(&cif);
+    if (code < 0 || (code & PORTY_TCI_SRET) || !(code >> PORTY_TCI_I128_SHIFT & 4)) return 102;
+    if (!porty_tci_call_code(code, 4, (void *)st, ret, av)) return 103;
+    if (seen[0] != (uint32_t)slots[0][0] || seen[1] != slots[1][0] || seen[2] != slots[2][0] || seen[3] != slots[2][1] ||
+        seen[4] != (uint32_t)slots[3][0]) fail++;
+    if (slots[2][0] != 0x3333333333333333ULL) fail++;  /* untouched */
+
+    /* cx */
+    cif.nargs = 5; cif.arg_types = a5; cif.rtype = &i128;
+    code = porty_tci_code(&cif);
+    if (code < 0) return 104;
+    ret[0] = ret[1] = 0;
+    if (!porty_tci_call_code(code, 5, (void *)cx, ret, av)) return 105;
+    {
+        Int128 c = { slots[2][0], (int64_t)slots[2][1] }, nv = { slots[3][0], (int64_t)slots[3][1] };
+        Int128 want = cx((uint32_t)slots[0][0], slots[1][0], c, nv, (uint32_t)slots[4][0]);
+        if (ret[0] != want.lo || ret[1] != (uint64_t)want.hi) fail++;
+    }
+    return fail;
+}
+"""
+
+
+def wasm32_check() -> int:
+    """The Int128 cases on real wasm32 (clang and node), if both are here."""
+    import shutil
+    clang, node = shutil.which('clang'), shutil.which('node')
+    if not clang or not node:
+        print('tci-calls: no clang or node here, wasm32 Int128 check skipped')
+        return 0
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'tci-calls.h'), 'w') as f:
+            subprocess.run([sys.executable, os.path.join(HERE, '..', 'build', 'gen-tci-calls.py')], stdout=f, check=True,
+                           stderr=subprocess.DEVNULL)
+        with open(os.path.join(tmp, 'w.c'), 'w') as f:
+            f.write(WASM_TEST)
+        wasm = os.path.join(tmp, 'w.wasm')
+        cc = subprocess.run([clang, '--target=wasm32', '-O1', '-nostdlib', '-ffreestanding', '-Wall', '-Wno-unused-function',
+                             '-Wl,--no-entry', '-Wl,--export=run', '-o', wasm, os.path.join(tmp, 'w.c'), '-I', tmp],
+                            capture_output=True, text=True)
+        if cc.returncode:
+            if 'wasm-ld' in cc.stderr or 'unable to execute' in cc.stderr or 'not found' in cc.stderr:
+                print('tci-calls: no wasm linker here, wasm32 Int128 check skipped')
+                return 0
+            print(cc.stderr[-3000:])
+            print('tci-calls: the wasm32 Int128 check does not compile')
+            return 1
+        js = ("const fs = require('fs'); WebAssembly.instantiate(fs.readFileSync(process.argv[1])).then(({instance}) => {"
+              "const r = instance.exports.run(); console.log(r); process.exit(r === 0 ? 0 : 1); })"
+              ".catch((e) => { console.log('trap: ' + e.message); process.exit(1); });")
+        run = subprocess.run([node, '-e', js, wasm], capture_output=True, text=True)
+        if run.returncode:
+            print(f'tci-calls: wasm32 Int128 check FAILED: {run.stdout.strip()} {run.stderr.strip()[:300]}')
+            return 1
+        print('tci-calls: wasm32 Int128 helpers (load, store, cmpxchg shapes) agree with the compiler\'s own calls')
+        return 0
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    rc = main()
+    sys.exit(rc or wasm32_check())
