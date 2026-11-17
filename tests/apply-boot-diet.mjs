@@ -15,4 +15,4 @@ const before = new Uint8Array(readFileSync(input));
 const after = applyBootDiet(before, props, fixes);
 writeFileSync(output, after);
 console.log(`${output}: ${before.length} -> ${after.length} bytes, ${props.map((p) => p.join('=')).join(' ') || 'no properties'}`
-    + `, ttm.ko ${fixes.ttm ? 'fixed' : 'as shipped'}`);
+    + `, ttm.ko ${fixes.ttm ? 'fixed' : 'as shipped'}, libsurfaceflinger.so ${fixes.sf ? 'fixed' : 'as shipped'}`);
