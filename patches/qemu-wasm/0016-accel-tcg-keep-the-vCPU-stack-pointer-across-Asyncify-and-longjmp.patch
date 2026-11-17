@@ -5,10 +5,7 @@ Subject: [PATCH] accel/tcg: keep the vCPU's stack pointer across Asyncify
 
 QEMU-Wasm's vCPU thread died now and then with "Uncaught Infinity" (an
 Emscripten longjmp that no setjmp frame caught) or "memory access out of
-bounds" while reading a jmp_buf after tcg_gen_code().  All four crashes
-seen were in full boots, each after minutes with the JIT at its cap
-waiting for the garbage collector, while tcg_qemu_tb_exec() calls
-emscripten_sleep(0) every 50000 blocks.
+bounds" while reading a jmp_buf after tcg_gen_code().
 
 Emscripten (3.1.50, setjmp/longjmp without Wasm exceptions) calls every
 function a setjmp caller calls through a JavaScript invoke_* wrapper,
@@ -17,24 +14,28 @@ puts it back when it catches a longjmp.  Asyncify unwinds the stack for
 emscripten_sleep() and coroutine switches and later rewinds it by calling
 the same functions again; the invoke_* around cpu_exec_loop() is then
 entered again while __stack_pointer still points where the stack was
-unwound from, deep in cpu_exec_loop().  The next cpu_loop_exit() it
+unwound from, deeper in cpu_exec_loop().  The next cpu_loop_exit() it
 catches leaves the vCPU thread's stack that much lower, and so on until
-cpu_exec() returns.  Every pthread has a 64 KiB C stack (Emscripten's
-default; QEMU sets none), directly above its TLS block, whose last words
-are __THREW__ and __threwValue: frames below the stack's end overwrite
-them, and the next setjmp check sees a longjmp nobody threw.
+cpu_exec() returns.  At its cap the JIT sleeps in tcg_qemu_tb_exec()
+every 50000 blocks; when no interrupt ended cpu_exec() for a while,
+Porty's crash hunt saw the stack pointer walk from 57 KiB free to 1 KiB
+past the end of the thread's 64 KiB stack (Emscripten's default; QEMU
+sets none) in 45 s and in 6 min, and the uncaught longjmp follow.  Below
+the stack's end lie the thread's TSD and TLS blocks; the TLS block's last
+words are __THREW__ and __threwValue, and the next setjmp check then sees
+a longjmp nobody threw.
 
  - cpu_exec_setjmp() and cpu_exec_step_atomic() note the stack pointer
    before sigsetjmp() and put it back when a longjmp lands;
- - vCPU threads get a 1 MiB stack (virtqueue_pop() alone has a 16 KiB
-   frame, and the vCPU thread runs device emulation);
+ - vCPU threads get a 1 MiB stack (they need about 4 KiB; the rest is
+   margin for whatever else rewinds them);
  - the vCPU thread paints its stack when it starts: after each cpu_exec()
    QEMU stops with a message if the lowest words were overwritten, and
    porty_stack_stats() tells the page how deep the stack has been used.
 
-libffi's ffi_call_js (TCI's helper calls) has the same habit; with the
-above its effect is bounded and is left to whatever replaces it.  Native
-builds are unchanged.
+libffi's ffi_call_js (TCI's helper calls) has the same habit; its effect
+lasts until the block's interpretation returns or the next longjmp lands.
+Native builds are unchanged.
 ---
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
 index c938eb9..5b47362 100644
@@ -223,10 +224,10 @@ index 1b57290..f87b528 100644
  
 diff --git a/include/qemu/porty-stack.h b/include/qemu/porty-stack.h
 new file mode 100644
-index 0000000..da7eb6c
+index 0000000..6873513
 --- /dev/null
 +++ b/include/qemu/porty-stack.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,65 @@
 +/*
 + * Porty: the C stack of QEMU-Wasm's threads.
 + *
@@ -248,14 +249,20 @@ index 0000000..da7eb6c
 + * there, until the function that called setjmp returns.  The functions
 + * that call sigsetjmp around code that can unwind (cpu_exec_setjmp(),
 + * cpu_exec_step_atomic()) save the stack pointer first and put it back
-+ * when a longjmp lands.  (libffi's ffi_call_js, which TCI calls helpers
++ * when a longjmp lands.  (libffi's ffi_call_js, which TCI can call helpers
 + * through, also saves and restores it around the helper: after a helper
 + * that switched coroutines, TCI runs on with it too deep until it returns
 + * or the next longjmp lands.)
 + *
-+ * Every pthread of this build has a 64 KiB C stack, directly above its
-+ * TLS block; the last words of that block are Emscripten's __THREW__ and
-+ * __threwValue, which every setjmp caller checks after each call.
++ * QEMU-Wasm's JIT sleeps (emscripten_sleep(0)) every 50000 blocks while it
++ * is at its cap, and each sleep followed by a longjmp moved the vCPU's
++ * stack pointer down: with no interrupt to end cpu_exec() for a while it
++ * walked off the end of the stack (Porty's crash hunt, 2026-11).
++ *
++ * A pthread gets a 64 KiB C stack by default (vCPU threads 1 MiB, see
++ * util/qemu-thread-posix.c), directly above its TLS block; the last words
++ * of that block are Emscripten's __THREW__ and __threwValue, which every
++ * setjmp caller checks after each call.
 + *
 + * Copyright (c) 2026 The Porty contributors
 + * SPDX-License-Identifier: GPL-2.0-or-later
@@ -287,20 +294,22 @@ index 0000000..da7eb6c
 +
 +#endif
 diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
-index b2e26e2..bcdf146 100644
+index b2e26e2..b8114bf 100644
 --- a/util/qemu-thread-posix.c
 +++ b/util/qemu-thread-posix.c
-@@ -564,6 +564,19 @@ void qemu_thread_create(QemuThread *thread, const char *name,
+@@ -564,6 +564,21 @@ void qemu_thread_create(QemuThread *thread, const char *name,
          pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
      }
  
 +#ifdef __EMSCRIPTEN__
 +    /*
 +     * Porty: Emscripten gives every pthread a 64 KiB C stack, right above
-+     * the thread's TLS block.  A vCPU thread also runs the device models
-+     * of the I/O the guest does, and virtqueue_pop() alone has a frame of
-+     * 16 KiB (two arrays of VIRTQUEUE_MAX_SIZE entries): give vCPU threads
-+     * 1 MiB.  The thread pool's workers and the others keep the default.
++     * the thread's TLS block (see include/qemu/porty-stack.h).  A vCPU
++     * thread needs about 4 KiB of it, but Asyncify rewinds its stack
++     * through JavaScript wrappers that can leave the stack pointer deeper
++     * than it was (cpu_exec_setjmp() undoes that for the longjmps it
++     * catches): give vCPU threads 1 MiB of margin.  The thread pool's
++     * workers and the others keep the default.
 +     */
 +    if (name && g_str_has_prefix(name, "CPU ")) {
 +        pthread_attr_setstacksize(&attr, 1024 * 1024);
