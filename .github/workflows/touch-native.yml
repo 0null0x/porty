@@ -215,7 +215,7 @@ jobs:
           w="$RUNNER_TEMP/apks"
           mkdir -p "$w/fs"
           command -v qemu-img > /dev/null || sudo apt-get install -y -qq qemu-utils > /dev/null
-          cat out/image/system/*.bin > "$w/system.qcow2"
+          cat out/image/system-*/*.bin > "$w/system.qcow2"
           qemu-img convert -f qcow2 -O raw "$w/system.qcow2" "$w/system.raw"
           rm -f "$w/system.qcow2"
           debugfs -R "rdump /app /priv-app /framework /system/app /system/priv-app /system/framework $w/fs" "$w/system.raw" > /dev/null 2>&1 || true
