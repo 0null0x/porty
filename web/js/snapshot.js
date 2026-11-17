@@ -24,7 +24,8 @@ const MACHINE_PARAMS = ['mem', 'smp', 'usb', 'touch', 'cpu', 'res', 'dpi', 'gfx'
     'cache', 'parallel', 'append', 'cmdline', 'qemu', 'timescale', 'diet', 'props', 'lowmem', 'ttmfix', 'sffix',
     'anrtraces'];
 // Settings of the page and of this device that a resume keeps.
-const PAGE_KEYS = ['mobile', 'serial', 'fps', 'prefetch', 'wasmmem', 'wasmmemExplicit', 'jit', 'jitcap', 'jitgc'];
+const PAGE_KEYS = ['mobile', 'serial', 'fps', 'prefetch', 'wasmmem', 'wasmmemExplicit', 'jit', 'jitcap', 'jitgc',
+    'jitpolicy', 'jitring'];
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const CHUNK_FILE = /^[0-9A-Za-z_-][0-9A-Za-z._-]*$/;

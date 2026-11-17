@@ -42,6 +42,10 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
     assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
     assert.deepEqual([desktop.jitgc, parseConfig('?jitgc=0', {}).jitgc], [true, false]);
+    // QEMU patches 0022-0024: -1 keeps the build's defaults.
+    assert.deepEqual([desktop.jitpolicy, desktop.jitring], [-1, -1]);
+    assert.deepEqual([parseConfig('?jitpolicy=0&jitring=0', {}).jitpolicy, parseConfig('?jitpolicy=0&jitring=0', {}).jitring], [0, 0]);
+    assert.deepEqual([parseConfig('?jitpolicy=9&jitring=999999', {}).jitpolicy, parseConfig('?jitpolicy=9&jitring=999999', {}).jitring], [7, 262144]);
     // time dilation: 8 by default (phones too), an integer from 1 (off) to 16
     assert.deepEqual([desktop.timescale, phone.timescale], [8, 8]);
     assert.deepEqual(['?timescale=1', '?timescale=0', '?timescale=99', '?timescale=x', '?timescale=2.9']

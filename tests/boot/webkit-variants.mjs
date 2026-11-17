@@ -311,6 +311,8 @@ function row(v, r) {
         phases: res.phases ? res.phases.launch : null,
         phasesToLauncherGone: res.phases ? res.phases.toLauncherGone : null,
         biggest: res.qemu && res.qemu.functions ? (res.qemu.functions.hot || []).slice(0, 8) : [],
+        // Patches 0022-0024: the module ring and the cache policies, at the end of the run.
+        ring: res.ring || null,
         exit: r.code,
     };
 }
@@ -322,7 +324,7 @@ export function phaseCell(d) {
     }
     const short = { other: 'oth', wasm: 'wasm', tci: 'tci', tciCap: 'cap', compile: 'comp', translate: 'tr', sleep: 'slp', idle: 'idle', bql: 'bql' };
     return Object.entries(d.shares).filter(([, v]) => v >= 1).map(([k, v]) => `${short[k] || k} ${Math.round(v)}`).join(' ') +
-        ` (${d.counts.compiled} comp, ${d.counts.translated} tr)`;
+        ` (${d.counts.compiled} comp, ${d.counts.translated} tr, ${d.counts.flushes} fl)`;
 }
 
 const fmt = (x) => (x === null || x === undefined || x === '' ? '-' : String(x));
@@ -391,7 +393,7 @@ async function main() {
         '| variant | browser | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | tap to arrow ms | typing echo ms | disk MB | JIT alive/compiled | vCPU % tap to Gallery | CPU by thread | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
         '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows.map((r) => `| ${r.name} (\`${r.words || '-'}\`) | ${(r.version || '').split(' ')[0] || '-'} | ${fmt(r.peakRss)} | ${fmt(r.steadyRss)} | ${fmt(r.peakHeaps)} | ` +
-            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ${phaseCell(r.phases)} | ` +
+            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ${phaseCell(r.phases)}${r.ring ? `; ring ${r.ring.kb} KiB, ${r.ring.gone} gone` : ''} | ` +
             `${(r.threadCpu || '').replace(/\|/g, '/') || '-'} | ` +
             `${(r.gc || []).filter((h) => h.allocatedMb > 50).slice(0, 4).map((h) => `${h.mbPerSecond ?? '?'}/s, ${Math.round(h.maxAllocatedKb / 1024)}`).join('; ') || '-'} | ` +
             `${Object.entries(r.counters).map(([t, row]) => `${t}: ${Object.entries(row).map(([k, x]) => `${k} ${x}`).join(' ')}`).join('; ') || '-'} | ` +

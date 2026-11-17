@@ -423,6 +423,23 @@ export class Emulator {
                         this.notes.push('This QEMU build cannot skip the garbage-collector wait; ?jitgc= ignored.');
                     }
                 }
+                // QEMU patches 0022-0024: the JIT cache's policies and module ring.
+                if (this.cfg.jitpolicy >= 0) {
+                    if (typeof Module._porty_set_jit_policy === 'function') {
+                        const n = Module._porty_set_jit_policy(this.cfg.jitpolicy);
+                        this.notes.push(`JIT cache policies: ${n} (jitpolicy).`);
+                    } else {
+                        this.notes.push('This QEMU build has no JIT cache policies; ?jitpolicy= ignored.');
+                    }
+                }
+                if (this.cfg.jitring >= 0) {
+                    if (typeof Module._porty_set_jit_ring_kb === 'function') {
+                        const n = Module._porty_set_jit_ring_kb(this.cfg.jitring);
+                        this.notes.push(n ? `Compiled forms of code blocks in a ${n} KiB ring.` : 'No module ring (jitring=0).');
+                    } else {
+                        this.notes.push('This QEMU build has no module ring; ?jitring= ignored.');
+                    }
+                }
                 if (this.cfg.timescale > 1) {
                     if (typeof Module._porty_set_time_scale === 'function') {
                         const n = Module._porty_set_time_scale(this.cfg.timescale);

@@ -51,7 +51,8 @@ done
 for sym in porty_fb_poll porty_input_event porty_abi_version porty_disk_stats porty_set_jit_threshold \
            porty_heap_stats porty_coroutine_count porty_set_jit_max_instances porty_jit_stats \
            porty_set_jit_wait_gc porty_set_time_scale \
-           porty_snapshot_stats porty_stack_stats porty_tcg_stats porty_prof_ptr; do
+           porty_snapshot_stats porty_stack_stats porty_tcg_stats porty_prof_ptr \
+           porty_set_jit_policy porty_set_jit_ring_kb porty_jit_ring_stats; do
     grep -q -F -e "Module['_${sym}']" -e "Module[\"_${sym}\"]" /build/qemu-system-x86_64 \
         || { echo "::error::Module._${sym} is missing from the JS glue" >&2; exit 1; }
 done

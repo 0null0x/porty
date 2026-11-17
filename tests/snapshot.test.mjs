@@ -56,6 +56,7 @@ const snapshot = () => ({
 
     assert.equal(resumeVeto({ search: '' }), '');
     assert.equal(resumeVeto({ search: '?serial=1&fps=10&jitcap=2000' }), '', 'page settings do not matter');
+    assert.equal(resumeVeto({ search: '?jitpolicy=0&jitring=0' }), '', 'nor the JIT cache settings');
     assert.match(resumeVeto({ search: '?resume=0' }), /resume=0/);
     assert.match(resumeVeto({ search: '?mem=1024&smp=2' }), /sets mem=, smp=/);
     assert.equal(resumeVeto({ search: '?mem=1024&resume=1' }), '', 'resume=1 overrides machine parameters');
@@ -119,12 +120,13 @@ const snapshot = () => ({
     const snap = snapshot();
     // A desktop whose own defaults are 1024/384/64 gets the snapshot's 768/128/16.
     const env = { userAgent: MAC };
-    const user = parseConfig('?serial=1&fps=12&jitcap=2000', env);
+    const user = parseConfig('?serial=1&fps=12&jitcap=2000&jitpolicy=2&jitring=64', env);
     const desktop = snapshotConfig(snap, user, env);
     assert.deepEqual(desktop.problems, []);
     assert.deepEqual([desktop.cfg.mem, desktop.cfg.tb, desktop.cfg.cache], [768, 128, 16]);
     assert.deepEqual([desktop.cfg.serial, desktop.cfg.fps, desktop.cfg.jitcap, desktop.cfg.mobile],
         [true, 12, 2000, false], 'page settings stay the visitor\'s');
+    assert.deepEqual([desktop.cfg.jitpolicy, desktop.cfg.jitring], [2, 64], 'so do the JIT cache settings');
     assert.equal(desktop.cfg.memoryExplicit, true);
     assert.equal(desktop.cfg.resume, true);
 

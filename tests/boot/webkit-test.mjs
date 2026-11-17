@@ -1485,6 +1485,8 @@ async function pageState() {
         let tci = null;
         let mainLoop = null;
         let tcg = null;
+        let ring = null;
+        let jitx = null;
         try {
             heap = e && e.module && e.heapStats ? e.heapStats() : null;
             disk = e && e.module && e.diskStats ? e.diskStats() : null;
@@ -1495,6 +1497,12 @@ async function pageState() {
             // Patch 0017: the main loop's polls, waits and wakes.
             if (e && e.module && typeof e.module._porty_main_loop_stats === 'function') {
                 mainLoop = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_main_loop_stats() >>> 0, 3));
+            }
+            // Patches 0022-0024: porty_jit_stats() [4] translations compiled at once
+            // after a flush, [5] blocks kept at a drop; the module ring's counts.
+            if (e && e.module && typeof e.module._porty_jit_ring_stats === 'function') {
+                ring = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_ring_stats() >>> 0, 5));
+                jitx = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_stats() >>> 0, 6));
             }
             // Patch 0018: how full the wasm32 backend's per-TB tables get (tests/boot/tcg-tables.mjs).
             if (e && e.module && typeof e.module._porty_tcg_stats === 'function') {
@@ -1520,6 +1528,8 @@ async function pageState() {
             tci,
             mainLoop,
             tcg,
+            ring,
+            jitx,
             resumed: e ? !!e.resumed : false,
             resuming: e ? !!e.resuming : false,
             resumeNote: e ? e.resumeNote || '' : '',
@@ -1570,14 +1580,23 @@ async function sample(label, every = 10000) {
         ...(s.tci ? { tci: s.tci } : {}),
         ...(s.mainLoop ? { mainLoop: s.mainLoop } : {}),
         ...(phases ? { phases: { s: phases.seconds, ...phases.shares, ...phases.counts } } : {}),
+        ...(s.ring ? { ring: s.ring, jitx: s.jitx } : {}),
     };
     result.jit.push(row);
+    if (s.ring) {
+        // [0] ring KiB, [1] modules stashed, [2] KiB stashed, [3] laps, [4] modules gone;
+        // porty_jit_stats() [4] compiled at once after a flush, [5] kept at a drop.
+        result.ring = { kb: s.ring[0], stashed: s.ring[1], stashedKb: s.ring[2], laps: s.ring[3], gone: s.ring[4],
+            rehot: s.jitx[4], kept: s.jitx[5] };
+    }
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
         `${s.mainLoop ? ` mainloop=${s.mainLoop.join('/')}` : ''} | ${describeMemory(m)}` +
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
         (cpu ? ` | threads ${cpu}` : '') +
-        (phases ? ` | PHASES ${describePhases(phases)}` : ''));
+        (phases ? ` | PHASES ${describePhases(phases)}` : '') +
+        (s.ring ? ` | RING ${s.ring[0]} KiB: ${s.ring[1]} modules (${s.ring[2]} KiB) in ${s.ring[3]} laps, ${s.ring[4]} gone; ` +
+            `compiled at once after a flush ${s.jitx[4]}, kept at drops ${s.jitx[5]}` : ''));
     const tcg = tcgTables(s.tcg);
     if (tcg && JSON.stringify(tcg) !== JSON.stringify(result.tcg)) {
         log(`TCG TABLES: ${describeTcgTables(tcg)} ${JSON.stringify(tcg)}`);

@@ -51,6 +51,8 @@ export const PARAM_HELP = [
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
+    ['jitpolicy', 'JIT cache policies, bits (default all, 7): 1 compile at once after a flush what was hot before it, 2 at the cap keep the blocks that ran since the last drop, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before.'],
+    ['jitring', 'KiB of the ring that keeps the compiled forms of code blocks out of the translation cache (default 24576; 0 = in the cache, as before).'],
     ['timescale', 'guest time runs this many times slower than real time (1-16, default 8; 1 = real time), so Android\'s timeouts allow for a slow emulator. The guest\'s clock then falls behind.'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
@@ -163,6 +165,9 @@ export function parseConfig(search, env = {}) {
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
         // false: patch 0010's "do not wait for the garbage collector".
         jitgc: boolParam(params, 'jitgc', true),
+        // -1: the build's defaults (QEMU patches 0022-0024; see PARAM_HELP).
+        jitpolicy: intParam(params, 'jitpolicy', -1, -1, 7),
+        jitring: intParam(params, 'jitring', -1, -1, 262144),
         // Patch 0011's time dilation: the guest's clocks (and with them
         // Android's 60 s Watchdog) run this many times slower. 1: off.
         // Default 8: the first boots to sys.boot_completed in a browser
