@@ -293,7 +293,10 @@ def ui_check(g, opts, result):
     shot("pointer_b", 2)
     ui["pointer_moved_pct"] = ppm_diff(shots["pointer_b"], shots["pointer_a"])
     ui["pointer_layers"] = g.sh("dumpsys SurfaceFlinger --list | grep -i -e sprite -e pointer | head -4", 60)[1].strip()
-    vm.sh("(am start -a android.settings.APP_SEARCH_SETTINGS > /dev/null 2>&1 &)", 30)
+    # Settings' own search bar, at the top of its first page (back at the
+    # top after the second drag): a tap opens the search with its text
+    # field focused.
+    tap(vm, 0.5, 0.08)
     shot("search", 10)
     ui["search_focus"] = g.focus()
     type_keys(vm, "wifi")
