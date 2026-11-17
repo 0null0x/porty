@@ -95,6 +95,21 @@ jobs:
           objdump -d --start-address=$((16#964a0)) --stop-address=$((16#964c1)) "$RUNNER_TEMP/patched.so" | tail -n +7
           cmp -l "$so" "$RUNNER_TEMP/patched.so"
           echo "::endgroup::"
+          # Where the ANR trace settings come from (ActivityManager reads
+          # dalvik.vm.stack-trace-dir / -file at every ANR).
+          echo "::group::ANR trace properties in init scripts and property files"
+          for d in /etc/init /etc /etc/init/hw; do
+            for f in $(debugfs -R "ls $d" "$img" 2>/dev/null | tr ' ' '\n' | grep -E '\.(rc|prop)$'); do
+              debugfs -R "cat $d/$f" "$img" 2>/dev/null | grep -n -e stack-trace -e 'dalvik.vm.stack' | sed "s|^|$d/$f: |"
+            done
+          done
+          grep -n -e stack-trace out/facts/build.prop
+          # The ramdisk's own init scripts and properties.
+          rd="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["ramdisk"]["file"])' out/image/manifest.json)"
+          mkdir -p "$RUNNER_TEMP/ramdisk"
+          (cd "$RUNNER_TEMP/ramdisk" && { zcat "$GITHUB_WORKSPACE/out/image/$rd" 2>/dev/null || cat "$GITHUB_WORKSPACE/out/image/$rd"; } | cpio -id --quiet 2>/dev/null)
+          grep -rn -e stack-trace -e 'dalvik.vm.stack' "$RUNNER_TEMP/ramdisk" --include='*.rc' --include='*.prop' --include='prop.default' | sed "s|$RUNNER_TEMP/ramdisk||"
+          echo "::endgroup::"
           echo "::group::surfaceflinger.rc and properties"
           cat out/facts/surfaceflinger.rc || true
           grep -i -e privapp -e control_ -e hwui -e 'ro.sf' -e 'debug.sf' -e opengles out/facts/build.prop || true
