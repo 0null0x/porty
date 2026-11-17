@@ -53,9 +53,13 @@ on:
         type: number
         default: 45
       trace:
-        description: 'Instrument the glue: 0 off, 1 report an uncaught longjmp, 2 also the last 8 longjmps'
+        description: 'Instrument the glue (tests/boot/longjmp-trace.mjs flags): 0 off, 1 report an uncaught longjmp, +2 the last 8 longjmps (allocates per longjmp), +4 C stack depth'
         type: string
         default: '1'
+      patches_from:
+        description: Commit whose QEMU-Wasm build (patches and build script) to test, e.g. a main commit for the build without this branch's patches; empty is this commit's
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -81,6 +85,7 @@ jobs:
       minutes: ${{ steps.s.outputs.minutes }}
       stress_minutes: ${{ steps.s.outputs.stress_minutes }}
       trace: ${{ steps.s.outputs.trace }}
+      patches_from: ${{ steps.s.outputs.patches_from }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -95,6 +100,7 @@ jobs:
           I_MINUTES: ${{ inputs.minutes }}
           I_STRESS: ${{ inputs.stress_minutes }}
           I_TRACE: ${{ inputs.trace }}
+          I_PATCHES_FROM: ${{ inputs.patches_from }}
         run: |
           if [[ "$EVENT" == workflow_dispatch ]]; then
             python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
@@ -105,6 +111,8 @@ jobs:
           print('minutes=%d' % int(float(os.environ['I_MINUTES'] or 70)))
           print('stress_minutes=%d' % int(float(os.environ['I_STRESS'] or 45)))
           print('trace=%d' % (int(os.environ['I_TRACE']) if os.environ['I_TRACE'].isdigit() else 0))
+          ref = os.environ.get('I_PATCHES_FROM', '').strip()
+          print('patches_from=' + (ref if all(c in '0123456789abcdefABCDEF' for c in ref) and len(ref) <= 40 else ''))
           EOF
           else
             python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
@@ -116,6 +124,7 @@ jobs:
           print('minutes=%d' % int(c.get('minutes', 70)))
           print('stress_minutes=%d' % int(c.get('stress_minutes', 45)))
           print('trace=%d' % int(c.get('trace', 1)))
+          print('patches_from=' + str(c.get('patches_from', '')))
           EOF
           fi
           cat "$GITHUB_OUTPUT"
@@ -181,6 +190,20 @@ jobs:
         continue-on-error: true
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      # The QEMU-Wasm build of another commit (patches_from), with this
+      # commit's page and tests: the caches are keyed by the patches.
+      - name: Take the QEMU-Wasm patches of another commit
+        id: patches
+        if: steps.checkout.outcome == 'success' && needs.setup.outputs.patches_from != ''
+        continue-on-error: true
+        env:
+          FROM: ${{ needs.setup.outputs.patches_from }}
+        run: |
+          rm -rf patches/qemu-wasm
+          git checkout "$FROM" -- patches/qemu-wasm build/build-qemu.sh build/pc-bios.list scripts/wasm-info.py
+          ls patches/qemu-wasm
 
       - name: Read pinned versions
         id: versions
@@ -307,6 +330,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           VARIANT: ${{ matrix.variant }}
           REP: ${{ matrix.rep }}
+          FROM: ${{ needs.setup.outputs.patches_from }}
           SITE: ${{ steps.site.outcome }}
           SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
           CPU: ${{ steps.boot.outputs.cpu }}
@@ -335,6 +359,9 @@ jobs:
             grep -q DIED <<< "$text" && state=failure
           fi
           [[ "$SNAPSHOT" == true ]] && text="$text (resumed snapshot)"
+          build="this commit's QEMU-Wasm"
+          [[ -n "$FROM" ]] && build="QEMU-Wasm of ${FROM:0:7}"
+          text="$text; $build"
           echo "$state: $text; CPU $CPU"
           {
             echo "## $VARIANT $REP"
@@ -344,7 +371,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [[ -n "${SHA:-}" ]]; then
             gh api "repos/$REPO/statuses/$SHA" -f state="$state" \
-              -f context="$(printf 'porty/crash %s %s' "$VARIANT" "$REP" | cut -c1-100)" \
+              -f context="$(printf 'porty/crash %s %s%s' "$VARIANT" "$REP" "${FROM:+ qemu@${FROM:0:7}}" | cut -c1-100)" \
               -f description="$(printf '%s' "$text" | cut -c1-139)" -f target_url="$RUN_URL" >/dev/null || true
           fi
           exit 0

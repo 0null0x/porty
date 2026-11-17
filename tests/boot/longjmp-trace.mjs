@@ -2,23 +2,29 @@
 // a longjmp no setjmp frame will catch says where it was thrown from, and
 // so that each thread's C stack depth is watched.
 //
-// usage: node tests/boot/longjmp-trace.mjs <out.js> [level]
-//   level 1  count the invoke_* frames (each is the JavaScript try/catch of
-//            a C function that called setjmp) on every thread's stack; when
-//            __emscripten_throw_longjmp throws with none of them on the
-//            stack, nothing can catch it: print the JavaScript and
-//            WebAssembly call frames with "PORTY-LONGJMP-ESCAPE".
-//   level 2  also keep the call frames of the last 8 longjmps of the
-//            thread and print them with the escape, oldest first.  The
-//            first of a chain is where the longjmp started; the later ones
-//            are rethrows by setjmp frames whose buffer it did not match.
-//   level 3  also watch each thread's C stack (64 KiB per pthread in this
-//            build): the lowest stack pointer seen at longjmps, fiber
-//            swaps, sleeps and invoke_* calls, the stack pointer each
-//            invoke_* would restore after catching a longjmp (it is taken
-//            when the invoke_* is entered, also when Asyncify re-enters it
-//            on a rewind), and a canary in the stack's lowest 256 bytes.
-//            "PORTY-STACK" lines report new lows and a damaged canary.
+// usage: node tests/boot/longjmp-trace.mjs <out.js> [flags]
+//   flags is the sum of:
+//   1  count the invoke_* frames (each is the JavaScript try/catch of a C
+//      function that called setjmp) on every thread's stack; when
+//      __emscripten_throw_longjmp throws with none of them on the stack,
+//      nothing can catch it: print the JavaScript and WebAssembly call
+//      frames with "PORTY-LONGJMP-ESCAPE".  Allocates nothing per longjmp.
+//   2  also keep the call frames of the last 8 longjmps of the thread and
+//      print them with the escape, oldest first.  The first of a chain is
+//      where the longjmp started; the later ones are rethrows by setjmp
+//      frames whose buffer it did not match.  This allocates an Error per
+//      longjmp in the worker, and that garbage makes the worker collect
+//      more often, which also lets QEMU-Wasm's JIT see dropped compiled
+//      blocks freed (a FinalizationRegistry) sooner: it changes how often
+//      the JIT sits at its cap.
+//   4  also watch each thread's C stack (64 KiB per pthread in the build
+//      before patch 0016): the lowest stack pointer seen at longjmps, fiber
+//      swaps, sleeps and invoke_* calls, the stack pointer each invoke_*
+//      would restore after catching a longjmp (it is taken when the
+//      invoke_* is entered, also when Asyncify re-enters it on a rewind),
+//      and a canary in the stack's lowest 256 bytes.  "PORTY-STACK" lines
+//      report new lows and a damaged canary.  Allocates only to report.
+//   Earlier runs used 1, 2 (1+2) and 3 (1+2+4).
 //
 // Emscripten's setjmp/longjmp without Wasm exceptions: longjmp is "throw
 // Infinity"; every call made by a function that called setjmp goes through
@@ -32,7 +38,9 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const file = process.argv[2];
-const level = Number(process.argv[3] || 1);
+let level = Number(process.argv[3] || 1);
+// The first runs' levels: 2 meant 1+2, 3 meant 1+2+4.
+const flags = level === 2 ? 3 : level === 3 ? 7 : level;
 if (!file) {
     console.error('usage: longjmp-trace.mjs <out.js> [level]');
     process.exit(2);
@@ -50,7 +58,7 @@ src = src.replace(
     /function (invoke_\w+)\(([^)]*)\) \{\n var sp = stackSave\(\);\n try \{\n([\s\S]*?)\n \} catch \(e\) \{\n([\s\S]*?)\n \}\n\}/g,
     (m, name, args, body, katch) => {
         wrapped++;
-        return `function ${name}(${args}) {\n var sp = stackSave();\n __portyInvokeDepth++;\n if (__portyLevel >= 3) __portyInvokeSp(sp);\n try {\n${body}\n } catch (e) {\n${katch}\n } finally {\n  __portyInvokeDepth--;\n }\n}`;
+        return `function ${name}(${args}) {\n var sp = stackSave();\n __portyInvokeDepth++;\n if (__portyFlags & 4) __portyInvokeSp(sp);\n try {\n${body}\n } catch (e) {\n${katch}\n } finally {\n  __portyInvokeDepth--;\n }\n}`;
     });
 if (wrapped < 5) {
     fail(`only ${wrapped} invoke wrappers`);
@@ -72,8 +80,8 @@ const sleepRe = /var _emscripten_sleep = ms => Asyncify\.handleSleep\(/;
 if (!src.includes(swapAnchor) || !sleepRe.test(src)) {
     fail('no _emscripten_fiber_swap or _emscripten_sleep');
 }
-src = src.replace(swapAnchor, `${swapAnchor} if (__portyLevel >= 3 && Asyncify.state === Asyncify.State.Normal) __portySp("fiber_swap");\n`);
-src = src.replace(sleepRe, 'var _emscripten_sleep = ms => (__portyLevel >= 3 && Asyncify.state === Asyncify.State.Normal && __portySp("sleep"), Asyncify.handleSleep(');
+src = src.replace(swapAnchor, `${swapAnchor} if ((__portyFlags & 4) && Asyncify.state === Asyncify.State.Normal) __portySp("fiber_swap");\n`);
+src = src.replace(sleepRe, 'var _emscripten_sleep = ms => ((__portyFlags & 4) && Asyncify.state === Asyncify.State.Normal && __portySp("sleep"), Asyncify.handleSleep(');
 src = src.replace('Asyncify.handleSleep(wakeUp => safeSetTimeout(wakeUp, ms));', 'Asyncify.handleSleep(wakeUp => safeSetTimeout(wakeUp, ms)));');
 
 // 4. The helpers, at the top of the module (one copy per thread).
@@ -82,7 +90,7 @@ var __portyInvokeDepth = 0;
 var __portyLongjmps = 0;
 var __portyEscapes = 0;
 var __portyRing = [];
-var __portyLevel = ${level};
+var __portyFlags = ${flags};
 var __portyStack = null;
 function __portyFrames(e) {
  return String(e && e.stack || e).split("\\n").slice(1).map(l => l.trim().replace(/^at /, "").replace(/ \\(.*\\/([^/]+)\\)$/, " ($1)")).join(" < ");
@@ -99,7 +107,10 @@ function __portyStackInfo() {
   if (!high || !size || size > 64 * 1048576) return __portyStack;
   var s = { tid: p, low: high - size, high: high, size: size, minFree: size, minInvokeFree: size, reportedFree: size, reportedInvoke: size, canary: false, canaryBroken: false, at: Date.now(), n: 0 };
   var sp = stackSave();
-  if (sp > s.low + 4096 && sp <= high) {
+  if (HEAPU32[s.low >>> 2] === 0x5afe57ac && HEAPU32[(s.low + 252) >>> 2] === 0x5afe57ac) {
+   /* QEMU patch 0016 painted this stack and guards its lowest words: check its paint, write nothing. */
+   s.canary = "qemu";
+  } else if (sp > s.low + 4096 && sp <= high) {
    for (var a = s.low; a < s.low + 256; a += 4) HEAPU32[a >>> 2] = 0x5afe57ac ^ a;
    s.canary = true;
   }
@@ -111,7 +122,7 @@ function __portyStackInfo() {
 function __portyCanary(s) {
  if (!s.canary || s.canaryBroken) return true;
  for (var a = s.low; a < s.low + 256; a += 64) {
-  if (HEAPU32[a >>> 2] !== ((0x5afe57ac ^ a) >>> 0)) { s.canaryBroken = true; return false; }
+  if (HEAPU32[a >>> 2] !== (s.canary === "qemu" ? 0x5afe57ac : ((0x5afe57ac ^ a) >>> 0))) { s.canaryBroken = true; return false; }
  }
  return true;
 }
@@ -141,13 +152,13 @@ function __portyInvokeSp(sp) {
 }
 function __portyLongjmp() {
  __portyLongjmps++;
- if (__portyLevel >= 3) __portySp("longjmp");
- if (__portyLevel >= 2) {
+ if (__portyFlags & 4) __portySp("longjmp");
+ if (__portyFlags & 2) {
   var saved = Error.stackTraceLimit;
   Error.stackTraceLimit = 60;
   var e = new Error("longjmp");
   Error.stackTraceLimit = saved;
-  __portyRing.push({ n: __portyLongjmps, t: Date.now(), depth: __portyInvokeDepth, sp: __portyLevel >= 3 ? stackSave() : 0, e: e });
+  __portyRing.push({ n: __portyLongjmps, t: Date.now(), depth: __portyInvokeDepth, sp: (__portyFlags & 4) ? stackSave() : 0, e: e });
   if (__portyRing.length > 8) __portyRing.shift();
  }
  if (__portyInvokeDepth === 0) {
@@ -173,4 +184,4 @@ if (!src.includes(anchor)) {
 }
 src = src.replace(anchor, `${helpers}\n${anchor}`);
 writeFileSync(file, src);
-console.log(`longjmp-trace: level ${level}, ${wrapped} invoke wrappers counted in ${file}`);
+console.log(`longjmp-trace: flags ${flags}, ${wrapped} invoke wrappers counted in ${file}`);
