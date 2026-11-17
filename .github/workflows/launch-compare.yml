@@ -170,9 +170,13 @@ jobs:
             echo "iso_sha1=$ANDROID_ISO_SHA1"
           } >> "$GITHUB_OUTPUT"
           git -C base log -1 --oneline
-          echo "QEMU patches only in the test ref:"; diff <(ls patches/qemu-wasm) <(ls base/patches/qemu-wasm) | sed -n 's/^< /  /p'
-          echo "QEMU patches only in the baseline:"; diff <(ls patches/qemu-wasm) <(ls base/patches/qemu-wasm) | sed -n 's/^> /  /p'
-          echo "changed patches:"; for f in $(ls base/patches/qemu-wasm); do [[ -f patches/qemu-wasm/$f ]] && ! cmp -s patches/qemu-wasm/$f base/patches/qemu-wasm/$f && echo "  $f"; done || true
+          # A report only: diff and cmp say "differ" with status 1.
+          echo "QEMU patches only in the test ref:"; { diff <(ls patches/qemu-wasm) <(ls base/patches/qemu-wasm) || true; } | sed -n 's/^< /  /p'
+          echo "QEMU patches only in the baseline:"; { diff <(ls patches/qemu-wasm) <(ls base/patches/qemu-wasm) || true; } | sed -n 's/^> /  /p'
+          echo "changed patches:"
+          for f in $(ls base/patches/qemu-wasm); do
+            if [[ -f patches/qemu-wasm/$f ]] && ! cmp -s patches/qemu-wasm/$f base/patches/qemu-wasm/$f; then echo "  $f"; fi
+          done
 
       - name: Make room for the baseline's builds
         id: base-room
