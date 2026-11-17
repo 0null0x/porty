@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       variants:
-        description: 'Variants, separated by ";". Words: name=<label>, q=<page parameters>, JSC_<option>=<value>, glue=<patch>+<patch>, probe=0'
+        description: 'Variants, separated by ";". Words: name=<label>, q=<page parameters>, JSC_<option>=<value>, glue=<patch>+<patch>, qemu=local, browser=chrome, local=1, proxy=1, probe=0'
         type: string
         default: 'name=base; name=nostack JSC_exceptionStackTraceLimit=0; name=gclog JSC_logGC=1'
       query:
@@ -143,9 +143,29 @@ jobs:
           npx --no-install playwright-core install --with-deps webkit
           ls "$PLAYWRIGHT_BROWSERS_PATH"
 
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+          } >> "$GITHUB_OUTPUT"
+
+      # This branch's QEMU-Wasm as branch-check built and cached it (the same
+      # key), for the variants with qemu=local.
+      - name: Restore this branch's QEMU-Wasm build
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
       - name: Variants
         continue-on-error: true
         env:
+          LOCAL_QEMU_DIR: ${{ steps.qemu-cache.outputs.cache-hit == 'true' && format('{0}/out/qemu', github.workspace) || '' }}
           PLAYWRIGHT_DIR: ${{ github.workspace }}/tests/webkit
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
           GITHUB_TOKEN: ${{ github.token }}

@@ -6,10 +6,13 @@
 //     loads it: the page, QEMU's worker threads and service workers alike;
 //   - serve the page's own files (index.html, js/, css/, the service
 //     workers) from a local directory, so that page changes on a branch run
-//     against the deployed QEMU, image and snapshot.
+//     against the deployed QEMU, image and snapshot;
+//   - serve qemu/ from a local QEMU-Wasm build (build/build-qemu.sh's
+//     output), so that a branch's QEMU patches run with the deployed page,
+//     image and snapshot (as long as the device state still fits).
 // localhost is a secure context, so isolation works there over plain HTTP.
 // SPDX-License-Identifier: GPL-2.0-or-later
-import { createReadStream, statSync } from 'node:fs';
+import { createReadStream, readFileSync, statSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 
@@ -34,13 +37,41 @@ const PASS = ['content-type', 'cache-control', 'etag', 'last-modified', 'content
  * directories) instead of the upstream's.
  * Returns { url, close(), stats }.
  */
-export async function startSiteProxy({ upstream, rewrite = null, localDir = '', log = () => {} }) {
-    const stats = { requests: 0, upstreamBytes: 0, rewritten: 0, local: 0, errors: 0 };
+export async function startSiteProxy({ upstream, rewrite = null, localDir = '', localQemu = '', log = () => {} }) {
+    const stats = { requests: 0, upstreamBytes: 0, rewritten: 0, local: 0, localQemu: 0, errors: 0 };
     const big = /^\/(image|snapshot|qemu)\//;
     const server = http.createServer(async (req, res) => {
         stats.requests++;
         const pathname = decodeURIComponent(new URL(req.url, 'http://x').pathname);
         try {
+            // QEMU-Wasm from a local build (the output of build/build-qemu.sh).
+            if (localQemu && pathname.startsWith('/qemu/') && !pathname.includes('..')) {
+                const file = path.join(localQemu, pathname.slice('/qemu/'.length));
+                let st = null;
+                try {
+                    st = statSync(file);
+                } catch (e) {
+                    st = null;
+                }
+                if (st && st.isFile()) {
+                    stats.localQemu++;
+                    const type = TYPES[path.extname(file)] || 'application/octet-stream';
+                    if (rewrite && pathname === '/qemu/out.js') {
+                        const body = Buffer.from(rewrite(pathname, readFileSync(file, 'utf8')));
+                        stats.rewritten++;
+                        res.writeHead(200, { 'content-type': type, 'content-length': body.length, 'cache-control': 'no-cache', ...ISOLATION });
+                        res.end(req.method === 'HEAD' ? undefined : body);
+                        return;
+                    }
+                    res.writeHead(200, { 'content-type': type, 'content-length': st.size, 'cache-control': 'no-cache', ...ISOLATION });
+                    if (req.method === 'HEAD') {
+                        res.end();
+                    } else {
+                        createReadStream(file).pipe(res);
+                    }
+                    return;
+                }
+            }
             if (localDir && !big.test(pathname) && !pathname.includes('..')) {
                 const file = path.join(localDir, pathname.endsWith('/') ? `${pathname}index.html` : pathname);
                 let st = null;

@@ -102,8 +102,9 @@ params.set('serial', '1');
 // its headers and rewrites qemu/out.js for every context, service workers
 // and QEMU's threads included, which the test's routes cannot.
 const localWeb = (process.env.LOCAL_WEB || '').trim();
+const localQemu = (process.env.LOCAL_QEMU || '').trim();
 const useProxy = process.env.PROXY === '1' ||
-    (process.env.PROXY !== '0' && (glue.length > 0 || tableGrow > 0 || !!localWeb));
+    (process.env.PROXY !== '0' && (glue.length > 0 || tableGrow > 0 || !!localWeb || !!localQemu));
 let url = `${siteUrl}?${params}`;
 const statusContext = (process.env.STATUS_CONTEXT ? `${process.env.STATUS_CONTEXT}`
     : `${browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome'} ${queryText || 'defaults'}` +
@@ -343,11 +344,13 @@ if (useProxy) {
             upstream: siteUrl,
             rewrite: (pathname, text) => rewriteOutJs(text),
             localDir: localWeb,
+            localQemu,
             log,
         });
         url = `${proxy.url}?${params}`;
-        result.proxy = { local: localWeb || '', upstream: siteUrl };
-        log(`site proxy at ${proxy.url} for ${siteUrl}${localWeb ? `, page files from ${localWeb}` : ''}`);
+        result.proxy = { local: localWeb || '', qemu: localQemu || '', upstream: siteUrl };
+        log(`site proxy at ${proxy.url} for ${siteUrl}${localWeb ? `, page files from ${localWeb}` : ''}` +
+            `${localQemu ? `, QEMU-Wasm from ${localQemu}` : ''}`);
     } catch (e) {
         note(`site proxy did not start: ${String(e.message || e).split('\n')[0]}`);
     }
@@ -1337,9 +1340,14 @@ async function pageState() {
         }
         let heap = null;
         let disk = null;
+        let tci = null;
         try {
             heap = e && e.module && e.heapStats ? e.heapStats() : null;
             disk = e && e.module && e.diskStats ? e.diskStats() : null;
+            // Patch 0015: the interpreter's helper calls, direct and through libffi.
+            if (e && e.module && typeof e.module._porty_tci_stats === 'function') {
+                tci = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_tci_stats() >>> 0, 2));
+            }
         } catch (err) {
             heap = null;
         }
@@ -1357,6 +1365,7 @@ async function pageState() {
             screen: c ? `${c.width}x${c.height}` : '',
             heap,
             disk,
+            tci,
             resumed: e ? !!e.resumed : false,
             resuming: e ? !!e.resuming : false,
             resumeNote: e ? e.resumeNote || '' : '',
@@ -1401,10 +1410,11 @@ async function sample(label, every = 10000) {
         ...(m && m.bigRss !== undefined ? { wasmRss: m.bigRss, rest: m.rest, code: m.code, heaps: m.heaps, giant: m.giant, names: m.names } : {}),
         ...(counters && counters.rate ? { rates: counters.rate } : {}),
         ...(cpu ? { cpu } : {}),
+        ...(s.tci ? { tci: s.tci } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
-        `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}" | ${describeMemory(m)}` +
+        `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''} | ${describeMemory(m)}` +
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
         (cpu ? ` | threads ${cpu}` : ''));
     return s;

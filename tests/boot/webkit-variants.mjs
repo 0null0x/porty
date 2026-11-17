@@ -18,6 +18,9 @@
 //                     loops=<n>           shell loop rounds (default 3)
 //                     proxy=1             through the test's local proxy of
 //                                         the site even without glue
+//                     qemu=local          QEMU-Wasm from LOCAL_QEMU_DIR (this
+//                                         branch's build), the rest from the site
+//                     browser=chrome      Chrome instead of WebKit
 //                     local=1             the page's own files from this
 //                                         checkout's web/ (LOCAL_WEB), the
 //                                         rest from the site (site-proxy.mjs)
@@ -48,6 +51,9 @@ const minutes = Math.max(4, Math.min(60, Number(process.env.MINUTES) || 14));
 const probeSeconds = Math.max(30, Math.min(1800, Number(process.env.PROBE_SECONDS) || 360));
 // The page files for local=1: this checkout's web/ unless LOCAL_WEB names another.
 const localWeb = process.env.LOCAL_WEB || path.join(here, '..', '..', 'web');
+// QEMU-Wasm for qemu=local: a build/build-qemu.sh output (the workflow
+// restores this branch's from branch-check's cache).
+const localQemu = process.env.LOCAL_QEMU_DIR || '';
 
 // Only the characters page parameters, option names and labels need.
 const WORD = /^[A-Za-z0-9_=&.,:%+-]{1,120}$/;
@@ -55,7 +61,10 @@ const WORD = /^[A-Za-z0-9_=&.,:%+-]{1,120}$/;
 /** "name=x q=a=1&b=2 JSC_y=0 glue=count+ffi" -> {name, query, env, glue, probe, loops, words} */
 export function parseVariant(text, base = '') {
     const words = text.trim().split(/\s+/).filter(Boolean);
-    const v = { name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, proxy: false, local: false, words: [] };
+    const v = {
+        name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, proxy: false, local: false,
+        qemu: '', browser: 'webkit', words: [],
+    };
     for (const w of words) {
         if (!WORD.test(w)) {
             continue;
@@ -80,6 +89,10 @@ export function parseVariant(text, base = '') {
             v.proxy = value === '1';
         } else if (key === 'local') {
             v.local = value === '1';
+        } else if (key === 'qemu') {
+            v.qemu = value === 'local' ? 'local' : '';
+        } else if (key === 'browser') {
+            v.browser = value === 'chrome' ? 'chrome' : 'webkit';
         } else if (key === 'loops') {
             v.loops = Math.max(1, Math.min(12, Number(value) || 3));
         }
@@ -180,15 +193,16 @@ function runOne(v, index) {
         const gcLog = v.env.some((e) => e.startsWith('JSC_logGC='));
         const env = {
             ...process.env,
-            BROWSER: 'webkit',
+            BROWSER: v.browser,
             DEVICE: 'iphone',
             QUERY: v.query,
             BROWSER_ENV: v.env.join(' '),
             GLUE: v.glue.join(','),
             // Glue rewrites and page files go through the test's local
             // proxy of the site (site-proxy.mjs); proxy=1 forces it.
-            PROXY: v.proxy ? '1' : (v.glue.length || v.local ? '1' : '0'),
+            PROXY: v.proxy ? '1' : (v.glue.length || v.local || v.qemu ? '1' : '0'),
             LOCAL_WEB: v.local ? localWeb : '',
+            LOCAL_QEMU: v.qemu === 'local' ? localQemu : '',
             BENCH: '0',
             SCAN: '0',
             MINUTES: String(minutes),
@@ -297,6 +311,11 @@ async function main() {
     const rows = [];
     for (let i = 0; i < variants.length; i++) {
         const v = variants[i];
+        if (v.qemu === 'local' && !localQemu) {
+            console.log(`variant ${v.name}: skipped, no local QEMU-Wasm build (LOCAL_QEMU_DIR)`);
+            rows.push({ replica: Number(replica), name: v.name, words: v.words.join(' '), skipped: 'no local QEMU-Wasm build', loops: [], counters: {}, errors: [] });
+            continue;
+        }
         console.log(`::group::variant ${i + 1}/${variants.length}: ${v.name}`);
         const t = Date.now();
         const r = await runOne(v, i);
