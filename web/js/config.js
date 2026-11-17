@@ -51,7 +51,7 @@ export const PARAM_HELP = [
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
-    ['jitpolicy', 'JIT cache policies, bits (default all, 7): 1 compile at once after a flush what was hot before it, 2 at the cap keep the blocks that ran since the last drop, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before.'],
+    ['jitpolicy', 'JIT cache policies, bits (default 6): 1 compile at once after a flush what was hot before it, 2 at the cap give the blocks that ran since the last drop a second chance, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before (with jitring=0).'],
     ['jitring', 'KiB of the ring that keeps the compiled forms of code blocks out of the translation cache (default 24576; 0 = in the cache, as before).'],
     ['timescale', 'guest time runs this many times slower than real time (1-16, default 8; 1 = real time), so Android\'s timeouts allow for a slow emulator. The guest\'s clock then falls behind.'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],

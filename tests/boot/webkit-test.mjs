@@ -1501,7 +1501,7 @@ async function pageState() {
             // Patches 0022-0024: porty_jit_stats() [4] translations compiled at once
             // after a flush, [5] blocks kept at a drop; the module ring's counts.
             if (e && e.module && typeof e.module._porty_jit_ring_stats === 'function') {
-                ring = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_ring_stats() >>> 0, 5));
+                ring = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_ring_stats() >>> 0, 6));
                 jitx = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_stats() >>> 0, 6));
             }
             // Patch 0018: how full the wasm32 backend's per-TB tables get (tests/boot/tcg-tables.mjs).
@@ -1584,10 +1584,11 @@ async function sample(label, every = 10000) {
     };
     result.jit.push(row);
     if (s.ring) {
-        // [0] ring KiB, [1] modules stashed, [2] KiB stashed, [3] laps, [4] modules gone;
-        // porty_jit_stats() [4] compiled at once after a flush, [5] kept at a drop.
+        // [0] ring KiB, [1] modules stashed, [2] KiB stashed, [3] laps, [4] modules gone,
+        // [5] translated again after that and compiled at once; porty_jit_stats() [4]
+        // compiled at once after a flush, [5] kept at a drop.
         result.ring = { kb: s.ring[0], stashed: s.ring[1], stashedKb: s.ring[2], laps: s.ring[3], gone: s.ring[4],
-            rehot: s.jitx[4], kept: s.jitx[5] };
+            regone: s.ring[5], rehot: s.jitx[4], kept: s.jitx[5] };
     }
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
@@ -1595,7 +1596,8 @@ async function sample(label, every = 10000) {
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
         (cpu ? ` | threads ${cpu}` : '') +
         (phases ? ` | PHASES ${describePhases(phases)}` : '') +
-        (s.ring ? ` | RING ${s.ring[0]} KiB: ${s.ring[1]} modules (${s.ring[2]} KiB) in ${s.ring[3]} laps, ${s.ring[4]} gone; ` +
+        (s.ring ? ` | RING ${s.ring[0]} KiB: ${s.ring[1]} modules (${s.ring[2]} KiB) in ${s.ring[3]} laps, ${s.ring[4]} gone ` +
+            `(${s.ring[5]} translated again and compiled at once); ` +
             `compiled at once after a flush ${s.jitx[4]}, kept at drops ${s.jitx[5]}` : ''));
     const tcg = tcgTables(s.tcg);
     if (tcg && JSON.stringify(tcg) !== JSON.stringify(result.tcg)) {
