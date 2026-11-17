@@ -180,6 +180,12 @@
     },
     "gal-touch-tablet": {
       "query": "qemu=-usb+-device+usb-tablet"
+    },
+    "gal-touch-unbound": {
+      "query": "",
+      "after_settle": [
+        "for d in /sys/bus/virtio/drivers/virtio_input/virtio*; do n=$(cat $d/input/input*/name 2>/dev/null); case \"$n\" in *MultiTouch*) echo unbind ${d##*/} $n; echo ${d##*/} > /sys/bus/virtio/drivers/virtio_input/unbind;; esac; done; sleep 20; grep -c MultiTouch /proc/bus/input/devices; dumpsys input | grep -c 'QEMU Virtio MultiTouch'"
+      ]
     }
   }
 }
