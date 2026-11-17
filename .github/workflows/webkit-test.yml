@@ -4,6 +4,12 @@
 # a tap on Gallery, JIT statistics and the memory of the browser's processes
 # (tests/boot/webkit-test.mjs).
 #
+# With qemu=cache the QEMU-Wasm under test is the one built for the
+# dispatching ref's patches (build-and-deploy on main, branch-check on a
+# branch, both under the same cache key), served by a local proxy of the
+# site in place of the deployed one; the page, snapshot and disk are still
+# the deployed ones.  A ref whose build is not in the cache tests nothing.
+#
 # The run never fails, because every failed run emails the repository owner.
 # The outcome of each job is a commit status ("porty/webkit <query>" for
 # WebKit, "porty/webkit-chrome <query>" for Chrome), the job summary and a
@@ -56,13 +62,17 @@ on:
         description: 'Experiment: QEMU''s function table grows by this many entries at a time (0: as built, one per compiled block)'
         type: number
         default: 0
+      qemu:
+        description: 'QEMU-Wasm: deployed (the site''s) or cache (the build of this ref''s patches, from the Actions cache)'
+        type: string
+        default: deployed
 
 permissions:
   contents: read
   statuses: write  # the verdicts (tests/boot/webkit-test.mjs)
 
 concurrency:
-  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}-${{ inputs.table_grow }}-${{ inputs.browser_env }}
+  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}-${{ inputs.table_grow }}-${{ inputs.browser_env }}-${{ inputs.qemu }}
   cancel-in-progress: true
 
 defaults:
@@ -141,9 +151,32 @@ jobs:
           npx --no-install playwright-core install --with-deps webkit
           ls "$PLAYWRIGHT_BROWSERS_PATH"
 
+      - name: Read pinned versions
+        id: versions
+        if: ${{ inputs.qemu == 'cache' }}
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+          } >> "$GITHUB_OUTPUT"
+
+      # The key of build-and-deploy.yml and branch-check.yml.  A branch
+      # sees its own caches and main's.
+      - name: Restore this ref's QEMU-Wasm build
+        id: qemu-cache
+        if: ${{ inputs.qemu == 'cache' }}
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
       - name: Test
         continue-on-error: true
         env:
+          QEMU_SOURCE: ${{ inputs.qemu || 'deployed' }}
+          LOCAL_QEMU: ${{ steps.qemu-cache.outputs.cache-hit == 'true' && format('{0}/out/qemu', github.workspace) || '' }}
           PLAYWRIGHT_DIR: ${{ github.workspace }}/tests/webkit
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
           GITHUB_TOKEN: ${{ github.token }}
@@ -160,6 +193,11 @@ jobs:
           # Project site of this repository: https://<owner>.github.io/<repo>/
           SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
           export SITE_URL
+          if [ "$QEMU_SOURCE" = cache ] && [ -z "$LOCAL_QEMU" ]; then
+            echo "::warning title=Porty WebKit test::qemu=cache, but the cache has no QEMU-Wasm build for this ref's patches: nothing tested"
+            echo "qemu=cache, but the cache has no QEMU-Wasm build for this ref's patches (build it with branch-check or build-and-deploy first): nothing tested." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           nproc
           free -m
           grep -m1 'model name' /proc/cpuinfo || true

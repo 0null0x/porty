@@ -27,10 +27,27 @@
 //   BENCH_MODULES   modules in part 2 (default 8000)
 //   COI             sw (the page's service worker), route (the test adds
 //                   COOP/COEP to the responses itself) or auto (default:
-//                   sw, then route if the page does not become isolated)
+//                   sw, then route if the page does not become isolated);
+//                   in Playwright's WebKit, route did not give the page
+//                   SharedArrayBuffer, so the experiments below use PROXY
 //   TABLE_GROW      experiment: QEMU's function table grows by this many
 //                   entries at a time instead of one per compiled block
-//                   (the test rewrites qemu/out.js on its way to the browser)
+//                   (qemu/out.js rewritten on its way to the browser)
+//   PROXY           1: the page through a local proxy of the site on
+//                   127.0.0.1 (site-proxy.mjs), which adds COOP/COEP and
+//                   is the only way a rewrite of qemu/out.js reaches every
+//                   context (the page's service workers fetch it, and the
+//                   test's routes do not see those fetches); on by itself
+//                   for TABLE_GROW, GLUE, LOCAL_WEB and LOCAL_QEMU
+//   LOCAL_QEMU      directory of a QEMU-Wasm build (build/build-qemu.sh's
+//                   output, e.g. the Actions cache of a ref's build) served
+//                   as qemu/ in place of the deployed one; the page,
+//                   snapshot and disk stay the deployed ones
+//   LOCAL_WEB       directory of page files served in place of the deployed
+//                   ones (not the large files)
+//   MLWAIT          patch 0017: the main loop's wait in ms, set through
+//                   porty_set_main_loop_wait() once QEMU runs (0: it spins
+//                   as before the patch)
 //   BROWSER_ENV     experiment: options of WebKit's JavaScript engine, set
 //                   as environment variables of the browser, e.g.
 //                   "JSC_useOMGJIT=0" (space separated, JSC_name=value only)
@@ -43,6 +60,8 @@
 //                     ffi     libffi's ffi_call_js (every helper call of QEMU's
 //                             interpreter) without the arrays it allocates
 //                     slice   instantiate_wasm copies a block's bytes once
+//                     pace, pace-<ms>, pollwait, pollwait-<ms>: see
+//                             tests/boot/webkit-glue.mjs
 //   SCAN            0 skips the scan of compiled blocks at the end
 //   PROBE           0 skips the tap on Gallery
 //   LOOP_ROUNDS     rounds of the shell loop (default 3)
@@ -111,7 +130,8 @@ const useProxy = process.env.PROXY === '1' ||
 let url = `${siteUrl}?${params}`;
 const statusContext = (process.env.STATUS_CONTEXT ? `${process.env.STATUS_CONTEXT}`
     : `${browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome'} ${queryText || 'defaults'}` +
-    `${tableGrow ? ` tablegrow=${tableGrow}` : ''}${envText ? ` ${envText}` : ''}${glue.length ? ` glue=${glue.join('+')}` : ''}`).slice(0, 100);
+    `${tableGrow ? ` tablegrow=${tableGrow}` : ''}${envText ? ` ${envText}` : ''}${glue.length ? ` glue=${glue.join('+')}` : ''}` +
+    `${localQemu ? ' qemu=local' : ''}`).slice(0, 100);
 
 const t0 = Date.now();
 const elapsed = () => {
