@@ -951,6 +951,7 @@ async function stressLoop() {
     let aliveAsked = 0;
     let lastAliveOk = Date.now();
     let crash = null;
+    let stackSeen = null;
     log(`STRESS: ${stressInput ? 'input' : 'no input'} for ${Math.round(stressMs / 60000)} min, seed ${stressSeed}, canvas ${JSON.stringify(r)}`);
     const act = async () => {
         const k = rand();
@@ -1048,10 +1049,20 @@ async function stressLoop() {
             nextLine = Date.now() + 60000;
             const st = await page.evaluate(() => {
                 const e = globalThis.__porty;
-                return { heap: e && e.heapStats ? e.heapStats() : null, exited: e ? !!e.exited : false };
+                const m = e && e.module;
+                // QEMU patch 0015: the vCPU thread's C stack, size and most used.
+                let stack = null;
+                if (m && typeof m._porty_stack_stats === 'function' && e.memory) {
+                    stack = Array.from(new Uint32Array(e.memory.buffer, m._porty_stack_stats() >>> 0, 2));
+                }
+                return { heap: e && e.heapStats ? e.heapStats() : null, stack, exited: e ? !!e.exited : false };
             }).catch(() => ({}));
+            if (st.stack) {
+                stackSeen = st.stack;
+            }
             log(`STRESS: ${Math.round((Date.now() - t0s) / 1000)} s, actions ${JSON.stringify(counts)}, ` +
-                `guest answered ${Math.round((Date.now() - (alive || t0s)) / 1000)} s ago, heap ${JSON.stringify(st.heap)}`);
+                `guest answered ${Math.round((Date.now() - (alive || t0s)) / 1000)} s ago, heap ${JSON.stringify(st.heap)}` +
+                (st.stack ? `, vCPU stack used ${st.stack[1]} of ${st.stack[0]} bytes` : ''));
             if (st.exited) {
                 crash = { at: Date.now(), text: 'QEMU exited', afterS: Math.round((Date.now() - t0s) / 1000) };
                 break;
@@ -1071,6 +1082,7 @@ async function stressLoop() {
         crash,
         lastAliveS: Math.round((Date.now() - (lastAliveOk || t0s)) / 1000),
         workerErrors: workerErrors.length,
+        vcpuStack: stackSeen ? { size: stackSeen[0], used: stackSeen[1] } : undefined,
         hostCpu,
         query: String(params),
     };
