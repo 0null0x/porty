@@ -715,6 +715,9 @@ def main():
                     run(key, command)
             if variant.get("browser_like"):
                 browser_like(vm, float(variant["browser_like"]), result)
+            # Experiments on the settled guest (setup runs right after boot).
+            for i, command in enumerate(variant.get("after_settle", [])):
+                run(f"after_settle_{i}", command)
             result["home_screen"] = vm.screenshot("home", show=True)
             result["focus_home"] = g.focus()
             apps = []
