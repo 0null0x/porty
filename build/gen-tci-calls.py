@@ -14,6 +14,9 @@ and calls the helper through a pointer of that type.  Int128 results and
 arguments (QEMU's struct form under Emscripten) travel as i32 pointers in
 the wasm32 C ABI, so they map onto the same cases.  This prints every
 code for up to MAX_CALL_IARGS (7) arguments; the output is in patch 0015.
+Patch 0027 then changes porty_tci_call_code() and the declaration of
+porty_tci_call_direct() in it, so that the interpreter inlines the switch
+(for JavaScriptCore); keep its hunks applying when this template changes.
 
 usage: build/gen-tci-calls.py > tcg/wasm32-tci-calls.h
 """

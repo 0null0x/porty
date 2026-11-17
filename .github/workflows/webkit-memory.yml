@@ -50,6 +50,11 @@ on:
         description: 'Cache key of another QEMU-Wasm build, for the variants with qemu=alt (e.g. an earlier commit''s build, from its branch check log)'
         type: string
         default: ''
+      runner:
+        description: 'Runner of the variants: x86-64, or ARM64 like the iPhone (for WebKit; browser=chrome variants need an installed Google Chrome)'
+        type: choice
+        options: [ubuntu-24.04, ubuntu-24.04-arm]
+        default: ubuntu-24.04
 
 permissions:
   contents: read
@@ -113,7 +118,7 @@ jobs:
   test:
     name: variants (${{ matrix.replica }})
     needs: plan
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 330
     strategy:
       fail-fast: false

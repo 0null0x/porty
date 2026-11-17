@@ -4,7 +4,8 @@
 generated helper is called both ways with the same arguments, and the
 arguments it sees and the result where TCI reads it must match.  Also
 checks that signatures the switch does not cover (Int128 as a struct,
-floating point, too many arguments) are refused.
+floating point, too many arguments) are refused.  The header checked is
+the one QEMU compiles: patch 0015's, as later patches (0027) change it.
 
 usage: tests/tci-calls-test.py   (needs cc and libffi-dev)
 """
@@ -48,12 +49,36 @@ def patch_header() -> str:
     return ''
 
 
+def shipped_header() -> str:
+    """Patch 0015's header as the later patches leave it (0027 changes it)."""
+    patches = os.path.join(HERE, '..', 'patches', 'qemu-wasm')
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'tcg', 'wasm32-tci-calls.h')
+        os.makedirs(os.path.dirname(path))
+        with open(path, 'w') as f:
+            f.write(patch_header())
+        for name in sorted(os.listdir(patches)):
+            if name[:4] <= '0015':
+                continue
+            section, inside = [], False
+            for line in open(os.path.join(patches, name)):
+                if line.startswith('diff --git '):
+                    inside = line.rstrip().endswith('b/tcg/wasm32-tci-calls.h')
+                if inside:
+                    section.append(line)
+            if section:
+                subprocess.run(['patch', '-s', '-p1', '-d', tmp], input=''.join(section), text=True, check=True)
+        with open(path) as f:
+            return f.read()
+
+
 def main() -> int:
     generated = subprocess.run([sys.executable, os.path.join(HERE, '..', 'build', 'gen-tci-calls.py')],
                                capture_output=True, text=True, check=True).stdout
     if patch_header() != generated:
         print('tci-calls: tcg/wasm32-tci-calls.h in patch 0015 is not what build/gen-tci-calls.py prints')
         return 1
+    header = shipped_header()
     cases = [(r, n, m) for r in (0, 1, 2) for n in range(MAX_ARGS + 1) for m in range(1 << n)]
     src = ['#include <stdbool.h>', '#include <stdint.h>', '#include <stdio.h>', '#include <string.h>', '#include <ffi.h>',
            '#include "tci-calls.h"', 'static uint64_t seen[8]; static int nseen;']
@@ -162,8 +187,7 @@ int main(void)
 ''')
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, 'tci-calls.h'), 'w') as f:
-            subprocess.run([sys.executable, os.path.join(HERE, '..', 'build', 'gen-tci-calls.py')], stdout=f, check=True,
-                           stderr=subprocess.DEVNULL)
+            f.write(header)
         with open(os.path.join(tmp, 't.c'), 'w') as f:
             f.write('\n'.join(src))
         cflags = subprocess.run(['pkg-config', '--cflags', '--libs', 'libffi'], capture_output=True, text=True).stdout.split() or ['-lffi']
@@ -290,8 +314,7 @@ def wasm32_check() -> int:
         return 0
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, 'tci-calls.h'), 'w') as f:
-            subprocess.run([sys.executable, os.path.join(HERE, '..', 'build', 'gen-tci-calls.py')], stdout=f, check=True,
-                           stderr=subprocess.DEVNULL)
+            f.write(shipped_header())
         with open(os.path.join(tmp, 'w.c'), 'w') as f:
             f.write(WASM_TEST)
         wasm = os.path.join(tmp, 'w.wasm')
