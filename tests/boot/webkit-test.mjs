@@ -1367,7 +1367,6 @@ async function pageState() {
         let tci = null;
         let mainLoop = null;
         let tcg = null;
-        let tbs = null;
         try {
             heap = e && e.module && e.heapStats ? e.heapStats() : null;
             disk = e && e.module && e.diskStats ? e.diskStats() : null;
@@ -1382,10 +1381,6 @@ async function pageState() {
             // Patch 0018: how full the wasm32 backend's per-TB tables get (tests/boot/tcg-tables.mjs).
             if (e && e.module && typeof e.module._porty_tcg_stats === 'function') {
                 tcg = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_tcg_stats() >>> 0, 2 + 6 * 6));
-            }
-            // EXPERIMENT (patch 0099): TB flushes, invalidations, TBs, code KiB, capacity KiB.
-            if (e && e.module && typeof e.module._porty_tb_stats === 'function') {
-                tbs = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_tb_stats() >>> 0, 5));
             }
         } catch (err) {
             heap = null;
@@ -1407,7 +1402,6 @@ async function pageState() {
             tci,
             mainLoop,
             tcg,
-            tbs,
             resumed: e ? !!e.resumed : false,
             resuming: e ? !!e.resuming : false,
             resumeNote: e ? e.resumeNote || '' : '',
@@ -1458,7 +1452,7 @@ async function sample(label, every = 10000) {
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
-        `${s.mainLoop ? ` mainloop=${s.mainLoop.join('/')}` : ''}${s.tbs ? ` tbstats=${s.tbs.join('/')}` : ''} | ${describeMemory(m)}` +
+        `${s.mainLoop ? ` mainloop=${s.mainLoop.join('/')}` : ''} | ${describeMemory(m)}` +
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
         (cpu ? ` | threads ${cpu}` : ''));
     const tcg = tcgTables(s.tcg);
