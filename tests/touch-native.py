@@ -407,34 +407,6 @@ def main():
         moved = result["scroll"]["drag_shift"][0]
         check("swipe_scrolls", moved is not None and moved >= 100 and back_pct < 1.0, json.dumps(result["scroll"]))
 
-        # --- a long list: resting before the lift, with and without reports ---
-        # Developer options: whatever activity takes the action (its class
-        # name differs between Android versions), started by its name.
-        run("dev_options", "settings put global development_settings_enabled 1; am force-stop com.android.settings; "
-                           "c=$(cmd package resolve-activity --brief -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS "
-                           "| tail -1); echo $c; am start -W -n $c 2>&1 | tail -4")
-        prov.wait(vm, 10)
-        fl_focus = g.focus()
-        fl = {}
-        s0 = shot_pair(vm, g, "dev-top")
-        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=True)
-        s1 = shot_pair(vm, g, "dev-rest-kept")
-        fl["drag_rest_kept"] = vshift(s0, s1)
-        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=False)
-        s2 = shot_pair(vm, g, "dev-rest-silent")
-        fl["drag_rest_silent"] = vshift(s1, s2)
-        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=0, keep=False)
-        s3 = shot_pair(vm, g, "dev-drag-lift")
-        fl["drag_lift"] = vshift(s2, s3)
-        touch.drag(0.5, 0.75, 0.5, 0.45, steps=4, pause=0.03, rest=0, keep=False)
-        s4 = shot_pair(vm, g, "dev-swipe")
-        fl["swipe"] = vshift(s3, s4)
-        fl["finger_px"] = round(0.3 * 800)
-        fl["focus"] = fl_focus
-        result["fling"] = fl
-        log("fling: " + json.dumps(fl))
-        kept = fl["drag_rest_kept"][0]
-        check("rest_then_lift_no_fling", kept is not None and 120 <= kept <= 300, json.dumps(fl))
         g.sh("input keyevent 3", 60)
         prov.wait(vm, 3)
         g.quiet(timeout=90)
@@ -484,6 +456,39 @@ def main():
             result["pinch"] = {"uri": uri, "focus": g.focus(), "changed_pct": gcpu.ppm_diff(zoomed, photo)}
             check("pinch_zooms", result["pinch"]["changed_pct"] >= 20, json.dumps(result["pinch"]))
             g.sh("input keyevent 3", 60)
+
+
+        # --- a long list: resting before the lift, with and without reports ---
+        # Developer options: Settings keeps the activity disabled until they
+        # are switched on (Settings$DevelopmentSettingsDashboardActivity,
+        # android:enabled="false"), so enable it; no "am start -W", which
+        # waited for good on the activity that says they are off (run
+        # 44036404159) and held up the shell for every later step.
+        run("dev_options", "settings put global development_settings_enabled 1; am force-stop com.android.settings; "
+                           "pm enable com.android.settings/.Settings\\$DevelopmentSettingsDashboardActivity 2>&1 | tail -1; "
+                           "am start -n com.android.settings/.Settings\\$DevelopmentSettingsDashboardActivity 2>&1 | tail -2")
+        prov.wait(vm, 10)
+        fl_focus = g.focus()
+        fl = {}
+        s0 = shot_pair(vm, g, "dev-top")
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=True)
+        s1 = shot_pair(vm, g, "dev-rest-kept")
+        fl["drag_rest_kept"] = vshift(s0, s1)
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=False)
+        s2 = shot_pair(vm, g, "dev-rest-silent")
+        fl["drag_rest_silent"] = vshift(s1, s2)
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=0, keep=False)
+        s3 = shot_pair(vm, g, "dev-drag-lift")
+        fl["drag_lift"] = vshift(s2, s3)
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=4, pause=0.03, rest=0, keep=False)
+        s4 = shot_pair(vm, g, "dev-swipe")
+        fl["swipe"] = vshift(s3, s4)
+        fl["finger_px"] = round(0.3 * 800)
+        fl["focus"] = fl_focus
+        result["fling"] = fl
+        log("fling: " + json.dumps(fl))
+        kept = fl["drag_rest_kept"][0]
+        check("rest_then_lift_no_fling", kept is not None and 120 <= kept <= 300, json.dumps(fl))
 
         run("crashes", "logcat -b crash -d | grep -e 'Process: ' -e '>>> ' | cut -c1-200 | head -20")
         run("input_log", "logcat -d -s InputReader:* InputDispatcher:* EventHub:* | tail -40 | cut -c1-200")
