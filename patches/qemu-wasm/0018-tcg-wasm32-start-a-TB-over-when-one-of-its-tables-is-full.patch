@@ -1,0 +1,344 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 09:00:00 +0000
+Subject: [PATCH] tcg/wasm32: start a TB over when one of its tables is full
+
+The wasm32 backend builds each TB's WebAssembly module in fixed-size
+thread-local tables: the helpers the TB imports (200) and their types
+(200 bytes, the types of some 25 helpers), the labels placed (100), label
+ids (200), branches to labels (200) and the function body (100000 bytes).
+Nothing bounded the first five: their tcg_debug_assert()s are
+__builtin_unreachable() in this build, and NDEBUG drops assert().  A TB
+that needed more wrote past the table into the thread-local variables
+after it: the types into the labels placed so far, then into their count,
+which then indexes a write anywhere; past the labels lie Emscripten's
+__THREW__ and __threwValue.  The body was checked after the write and
+exit(1)ed QEMU.
+
+Every writer now checks for room first.  When a table is full,
+wasm_table_full() starts the TB over with fewer guest instructions, as
+TCG does for a TB whose code is too big: tcg_gen_code() fails with -2 and
+tb_gen_code() halves max_insns.  If a single instruction ever filled a
+table, it aborts with a message instead, because the retry would loop for
+ever (tb_gen_code()'s assert(max_insns > 1) is compiled out here).
+
+The tables are larger: 127 helpers (the import section writes each type
+index as one byte of LEB128) and room for all their types, 1024 label
+ids, labels placed and branches; the body stays at 100000 bytes.  The
+code buffer checks now also cover the import section (13 bytes a helper,
+more than TCG_HIGHWATER with 127 helpers) and the TB's header, which
+grows with the number of cores.  label_to_block[] and target_helper_funcs[]
+are reset whole for each TB (the memset counted entries as bytes).
+
+porty_tcg_stats() reports TBs built, TBs started over, and for each table
+its largest fill, its size, its size before this patch, the TBs that
+needed more than that and more than half of it, and the restarts it
+caused.
+---
+  tcg/tcg.c                   | 192 +++++++++++++++++++++++++++++++++++++++++---
+  tcg/wasm32/tcg-target.c.inc |   8 +-
+  2 files changed, 185 insertions(+), 15 deletions(-)
+
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index 7a24a24..9824802 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -428,17 +428,67 @@ tlb_mask_table_ofs(TCGContext *s, int which)
+ 
+ #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+ 
++#include <emscripten.h>
++
++/*
++ * Porty: the wasm32 backend builds each TB's WebAssembly module in the
++ * fixed-size thread-local tables below, and nothing bounded them:
++ * tcg_debug_assert() is __builtin_unreachable() in this build and NDEBUG
++ * drops assert().  A TB with many helpers, labels or branches wrote past a
++ * table into the thread-local variables after it (the labels placed so far,
++ * their count, then Emscripten's longjmp state).  Now every writer checks
++ * for room first.  When a table is full, wasm_table_full() starts the TB
++ * over with fewer guest instructions, as TCG does for a TB whose code is too
++ * big: tcg_gen_code() fails with -2 and tb_gen_code() halves max_insns.
++ * One guest instruction needs a small part of any table.
++ * porty_tcg_stats() reports how full the tables get.
++ */
++enum {
++    WASM_TAB_TYPES,     /* target_helper_types[]: bytes */
++    WASM_TAB_HELPERS,   /* target_helper_funcs[]: helpers the TB imports */
++    WASM_TAB_LABEL_IDS, /* label_to_block[]: the largest label id + 2 */
++    WASM_TAB_LABELS,    /* current_label[]: labels placed */
++    WASM_TAB_BRANCHES,  /* block_ptr_placeholder[]: branches to labels */
++    WASM_TAB_BODY,      /* sub_buf[]: bytes of the function body */
++    WASM_TAB_N
++};
++#define WASM_TAB_WORDS 6
++static uint32_t porty_tcg_counts[2 + WASM_TAB_N * WASM_TAB_WORDS];
++
++static G_NORETURN void tcg_raise_tb_overflow(TCGContext *s);
++
++static G_NORETURN void wasm_table_full(TCGContext *s, int table)
++{
++    static const char *const name[WASM_TAB_N] = {
++        "helper type", "helper", "label id", "label", "branch",
++        "function body",
++    };
++
++    qatomic_inc(&porty_tcg_counts[1]);
++    qatomic_inc(&porty_tcg_counts[2 + table * WASM_TAB_WORDS + 5]);
++    if (s->gen_tb->icount <= 1) {
++        /*
++         * Starting over would loop for ever: without assert(),
++         * tb_gen_code() goes on with max_insns 0, which is one instruction.
++         */
++        fprintf(stderr, "porty: one guest instruction overflows the wasm32 "
++                "backend's %s table\n", name[table]);
++        abort();
++    }
++    tcg_raise_tb_overflow(s);
++}
++
+ #define SUB_BUF_MAX 100000
+ __thread uint8_t sub_buf[SUB_BUF_MAX];
+ __thread uint8_t *sub_buf_ptr;
+ 
+ static inline void tcg_sub_out8(TCGContext *s, uint8_t v)
+ {
+-    *sub_buf_ptr++ = v;
+-    if ((sub_buf_ptr - sub_buf) > SUB_BUF_MAX) {
+-        printf("buffer too small\n"); fflush(stdout);
+-        exit(1);
++    /* Porty: room first (this checked after the write, then exit(1)). */
++    if (unlikely(sub_buf_ptr == sub_buf + SUB_BUF_MAX)) {
++        wasm_table_full(s, WASM_TAB_BODY);
+     }
++    *sub_buf_ptr++ = v;
+ }
+ 
+ static inline void tcg_sub_out32(TCGContext *s, uint32_t v)
+@@ -457,7 +507,12 @@ static inline int cur_sub_buf_off_rel()
+     return (int)sub_buf_ptr - (int)sub_buf;
+ }
+ 
+-#define LABEL_MAX 200
++/*
++ * Porty: room for label ids up to LABEL_MAX - 2 (label_to_block[] is indexed
++ * by id + 1), as many labels placed (current_label[], tcg-target.c.inc) and
++ * LABEL_MAX branches to labels; QEMU-Wasm had 200, 100 and 200.
++ */
++#define LABEL_MAX 1024
+ 
+ struct label_placeholder {
+     int label;
+@@ -468,8 +523,18 @@ struct label_context {
+     int block_idx;
+ };
+ 
+-#define WASM_NUM_HELPER_FUNCS_MAX 200
+-#define WASM_HELPER_ADDED_TYPES_SECTION_MAX 200
++/*
++ * Porty: at most 127 helpers per TB (QEMU-Wasm had 200): tcg_out_import_entry()
++ * writes each one's type index, 1 to 127, as one byte of LEB128.  Each helper
++ * adds a type of at most 16 bytes (gen_func_type(): 0x60, a count, the
++ * pointer for an Int128 result and at most 10 parameters, 3 bits each in the
++ * typemask, a count, a result), so the types fit too (QEMU-Wasm had 200
++ * bytes, the types of some 25 helpers).
++ */
++#define WASM_NUM_HELPER_FUNCS_MAX 127
++#define WASM_HELPER_TYPE_MAX 16
++#define WASM_HELPER_ADDED_TYPES_SECTION_MAX \
++    (WASM_NUM_HELPER_FUNCS_MAX * WASM_HELPER_TYPE_MAX)
+ __thread uint32_t num_helper_funcs;
+ __thread uint32_t target_helper_funcs[WASM_NUM_HELPER_FUNCS_MAX];
+ __thread uint8_t target_helper_types[WASM_HELPER_ADDED_TYPES_SECTION_MAX];
+@@ -516,6 +581,11 @@ static int write_uint32_leb128(uintptr_t bi, uint32_t v) {
+ 
+ static uint8_t * wasm_get_helper_types_begin(TCGContext *s)
+ {
++    /* Porty: room for the largest type first (this asserted afterwards). */
++    if (target_helper_types_pos + WASM_HELPER_TYPE_MAX >
++        WASM_HELPER_ADDED_TYPES_SECTION_MAX) {
++        wasm_table_full(s, WASM_TAB_TYPES);
++    }
+     return &(target_helper_types[target_helper_types_pos]);
+ }
+ 
+@@ -527,7 +597,10 @@ static void wasm_add_helper_types_pos(TCGContext *s, int i)
+ 
+ static int wasm_register_helper_alloc_num(TCGContext *s)
+ {
+-    tcg_debug_assert(num_helper_funcs <= WASM_NUM_HELPER_FUNCS_MAX);
++    /* Porty: room first (this asserted num_helper_funcs <= 200, a no-op). */
++    if (num_helper_funcs == WASM_NUM_HELPER_FUNCS_MAX) {
++        wasm_table_full(s, WASM_TAB_HELPERS);
++    }
+     return num_helper_funcs++;
+ }
+ 
+@@ -549,14 +622,26 @@ static int get_wasm_helper_idx(TCGContext *s, int helper_idx_on_qemu)
+ 
+ static void wasm_add_label_context(TCGContext *s, int label, int block)
+ {
+-    tcg_debug_assert(label <= LABEL_MAX);
++    /* Porty: room first (this asserted label <= LABEL_MAX, a no-op). */
++    if (label >= LABEL_MAX) {
++        wasm_table_full(s, WASM_TAB_LABEL_IDS);
++    }
+     label_to_block[label] = block;
+ }
+ 
+ static void wasm_add_label_block_ptr_placeholder(int label, uintptr_t code_ptr)
+ {
++    /*
++     * Porty: room first (this asserted i <= LABEL_MAX, a no-op).  The label
++     * indexes label_to_block[] when tcg_gen_code() fills the branches in.
++     */
++    if (block_ptr_placeholder_idx_pos == LABEL_MAX) {
++        wasm_table_full(tcg_ctx, WASM_TAB_BRANCHES);
++    }
++    if (label >= LABEL_MAX) {
++        wasm_table_full(tcg_ctx, WASM_TAB_LABEL_IDS);
++    }
+     int i = block_ptr_placeholder_idx_pos++;
+-    tcg_debug_assert(i <= LABEL_MAX);
+     block_ptr_placeholder[i].label = label;
+     block_ptr_placeholder[i].ptr = code_ptr;
+ }
+@@ -6113,6 +6198,71 @@ uint8_t *tcg_out_import_entry(TCGContext *s, uint8_t* wasm_blob_ptr, int i, int
+     return wasm_blob_ptr;
+ }
+ 
++/* Porty: the sizes of the tables, and in QEMU-Wasm before patch 0018. */
++static const uint32_t wasm_tab_size[WASM_TAB_N] = {
++    [WASM_TAB_TYPES] = WASM_HELPER_ADDED_TYPES_SECTION_MAX,
++    [WASM_TAB_HELPERS] = WASM_NUM_HELPER_FUNCS_MAX,
++    [WASM_TAB_LABEL_IDS] = LABEL_MAX,
++    [WASM_TAB_LABELS] = ARRAY_SIZE(current_label),
++    [WASM_TAB_BRANCHES] = LABEL_MAX,
++    [WASM_TAB_BODY] = SUB_BUF_MAX,
++};
++static const uint32_t wasm_tab_size_before[WASM_TAB_N] = {
++    200, 200, 200, 100, 200, 100000,
++};
++
++/*
++ * Porty: how full a TB's tables got, for porty_tcg_stats().  Statistics only:
++ * with several vCPU threads an update may be lost.
++ */
++static void wasm_tables_note(void)
++{
++    uint32_t fill[WASM_TAB_N] = {
++        [WASM_TAB_TYPES] = target_helper_types_pos,
++        [WASM_TAB_HELPERS] = num_helper_funcs,
++        [WASM_TAB_LABELS] = current_label_pos,
++        [WASM_TAB_BRANCHES] = block_ptr_placeholder_idx_pos,
++        [WASM_TAB_BODY] = sub_buf_ptr - sub_buf,
++    };
++
++    for (int i = 0; i < current_label_pos; i++) {
++        fill[WASM_TAB_LABEL_IDS] = MAX(fill[WASM_TAB_LABEL_IDS],
++                                       current_label[i] + 2);
++    }
++    qatomic_inc(&porty_tcg_counts[0]);
++    for (int t = 0; t < WASM_TAB_N; t++) {
++        uint32_t *c = &porty_tcg_counts[2 + t * WASM_TAB_WORDS];
++
++        if (fill[t] > qatomic_read(&c[0])) {
++            qatomic_set(&c[0], fill[t]);
++        }
++        if (fill[t] > wasm_tab_size_before[t]) {
++            qatomic_inc(&c[3]);
++        }
++        if (fill[t] > wasm_tab_size_before[t] / 2) {
++            qatomic_inc(&c[4]);
++        }
++    }
++}
++
++/*
++ * Porty: [0] TBs built, [1] TBs started over because one of the wasm32
++ * backend's tables was full (wasm_table_full()), then WASM_TAB_WORDS words
++ * for each table, in the order of WASM_TAB_*: the largest fill of a TB
++ * built, the table's size, its size before this patch, TBs built that
++ * needed more than that (they overflowed it), TBs that needed more than
++ * half of it, and TBs started over because this table was full.
++ */
++uint32_t *porty_tcg_stats(void);
++EMSCRIPTEN_KEEPALIVE uint32_t *porty_tcg_stats(void)
++{
++    for (int t = 0; t < WASM_TAB_N; t++) {
++        porty_tcg_counts[2 + t * WASM_TAB_WORDS + 1] = wasm_tab_size[t];
++        porty_tcg_counts[2 + t * WASM_TAB_WORDS + 2] = wasm_tab_size_before[t];
++    }
++    return porty_tcg_counts;
++}
++
+ #endif
+ 
+ static void tcg_out_ld_helper_ret(TCGContext *s, const TCGLabelQemuLdst *ldst,
+@@ -6399,9 +6549,18 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+     wasm_block_idx = 0;
+     block_ptr_placeholder_idx_pos = 0;
+     target_helper_types_pos = 0;
+-    memset(label_to_block, -1, LABEL_MAX);
+-    memset(target_helper_funcs, -1, WASM_NUM_HELPER_FUNCS_MAX);
++    /* Porty: whole tables (this reset 200 bytes of each, a quarter). */
++    memset(label_to_block, -1, sizeof(label_to_block));
++    memset(target_helper_funcs, -1, sizeof(target_helper_funcs));
+ 
++    /*
++     * Porty: the header grows with the cores, and only TCG_HIGHWATER bytes
++     * past the high-water mark are safe; check that it fits.
++     */
++    if (unlikely((void *)s->code_ptr + 4 * 4 + get_core_nums() * 8 >
++                 s->code_gen_highwater)) {
++        return -1;
++    }
+     uint32_t *tci_code_off = (uint32_t*)s->code_ptr;
+     s->code_ptr += 4;
+     uint32_t *size_base = (uint32_t*)s->code_ptr;
+@@ -6569,7 +6728,13 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+     wasm_blob_ptr += target_helper_types_pos;
+     write_wasm_type_section_size(s, header_a_base, target_helper_types_pos);
+     
+-    if (unlikely(((void *)wasm_blob_ptr + sizeof(mod_header_b)) > s->code_gen_highwater)) {
++    /*
++     * Porty: and the import entries, at most 13 bytes each
++     * (tcg_out_import_entry()): with 127 helpers, more than the
++     * TCG_HIGHWATER bytes that are safe past the high-water mark.
++     */
++    if (unlikely(((void *)wasm_blob_ptr + sizeof(mod_header_b) +
++                  num_helper_funcs * 13) > s->code_gen_highwater)) {
+         return -1;
+     }
+     uint8_t *header_b_base = wasm_blob_ptr;
+@@ -6626,6 +6791,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+     if (unlikely((void *)s->code_ptr > s->code_gen_highwater)) {
+         return -1;
+     }
++    wasm_tables_note();
+ #endif
+ 
+     return tcg_current_code_size(s);
+diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
+index 6823295..f952dfe 100644
+--- a/tcg/wasm32/tcg-target.c.inc
++++ b/tcg/wasm32/tcg-target.c.inc
+@@ -1756,13 +1756,17 @@ static void tcg_wasm_out_label_idx(TCGContext *s, int label)
+     env_cached = false;
+ }
+ 
+-__thread int current_label[100];
++/* Porty: as many as label ids, LABEL_MAX (tcg.c); QEMU-Wasm had 100. */
++__thread int current_label[LABEL_MAX];
+ __thread int current_label_pos;
+ 
+ static void tcg_out_label_cb(TCGContext *s, TCGLabel *l)
+ {
++    /* Porty: room first (this asserted current_label_pos < 100 afterwards). */
++    if (current_label_pos == ARRAY_SIZE(current_label)) {
++        wasm_table_full(s, WASM_TAB_LABELS);
++    }
+     current_label[current_label_pos++] = l->id;
+-    tcg_debug_assert(current_label_pos < 100);
+     tcg_wasm_out_label_idx(s, l->id + 1);
+ }
+ 
