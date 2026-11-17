@@ -1,0 +1,287 @@
+# Touchscreen check: boots the image the site publishes in a NATIVE QEMU
+# (TCG, one vCPU) built from the same patched QEMU-Wasm tree, with the
+# arguments and the initrd the page would use, and checks that Android
+# takes the page's touchscreen for one (tests/touch-native.py): how the
+# kernel and Android see the device (getevent -lp, dumpsys input), the raw
+# events of two fingers, a finger tap that opens Gallery, swipes that scroll
+# Settings, no mouse pointer, a two-finger spread that zooms a picture.
+#
+# Each job boots one variant: page parameters plus how touches go in
+# ("fifo": through ui/wasmfb.c's input ring as the page sends them, patch
+# 0020; "qmp": QMP "mtt" events, as QEMU's GTK display sends them;
+# "pointer": the USB tablet, the page's touch=0).
+#
+# The run never fails, because every failed run emails the repository owner.
+# Each job posts the commit status "porty/check touch <variant>" and adds a
+# table to the job summary; the log has "PORTY_RESULT <json>" and the
+# screenshots (base64 PNG between marker lines).
+name: Touch (native)
+
+on:
+  push:
+    branches: [swarm/touchscreen]
+    paths:
+      - .github/workflows/touch-native.yml
+      - tests/touch-native.py
+      - patches/qemu-wasm/**
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: 'Variants, separated by ";", each name|query|inject (inject: fifo, qmp or pointer)'
+        default: ''
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: touch-native-${{ github.ref }}-${{ inputs.variants }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: The variants to boot
+        id: plan
+        continue-on-error: true
+        env:
+          VARIANTS: ${{ inputs.variants }}
+        run: |
+          python3 -I -c '
+          import json, os, re, sys
+          default = "mt-qmp|mem=768&tb=128&cache=16&usb=0&qemu=-device%20virtio-multitouch-pci|qmp"
+          text = os.environ.get("VARIANTS", "").strip() or default
+          include = []
+          for item in text.split(";"):
+              parts = [p.strip() for p in item.split("|")]
+              if len(parts) != 3 or not re.match(r"^[a-z0-9-]{1,24}$", parts[0]) or parts[2] not in ("fifo", "qmp", "pointer"):
+                  continue
+              if not re.match(r"^[A-Za-z0-9_=&%.,:/@+-]*$", parts[1]):
+                  continue
+              include.append({"name": parts[0], "query": parts[1], "inject": parts[2]})
+          if include:
+              print("matrix=" + json.dumps({"include": include[:4]}))
+          else:
+              print("no valid variant in: " + text, file=sys.stderr)
+          ' | tee -a "$GITHUB_OUTPUT"
+
+  touch:
+    name: ${{ matrix.name }} (${{ matrix.inject }})
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      QUERY: ${{ matrix.query }}
+      INJECT: ${{ matrix.inject }}
+      STATUS_CONTEXT: porty/check touch ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "iso_name=$ANDROID_ISO_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      # --- native QEMU from the patched QEMU-Wasm tree (as in snapshot.yml) ---
+      - name: Restore cached native QEMU
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Install tools
+        id: tools
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv gdb
+
+      - name: Check out QEMU-Wasm and apply the Porty patches
+        id: patches
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-src"
+
+      - name: Build qemu-system-x86_64 natively
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.patches.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf out/native-qemu
+          build/build-native-qemu.sh "$RUNNER_TEMP/qemu-src" "$RUNNER_TEMP/qemu-build" out/native-qemu > "$RUNNER_TEMP/native-build.log" 2>&1 \
+            || { tail -150 "$RUNNER_TEMP/native-build.log"; exit 1; }
+          grep -A6 -E '(porty|wasmfb|virtio-input)[^ ]*\.c:[0-9]+:[0-9]+: warning' "$RUNNER_TEMP/native-build.log" || echo "no warnings in the files the patches touch"
+          tail -5 "$RUNNER_TEMP/native-build.log"
+          rm -rf "$RUNNER_TEMP/qemu-build" "$RUNNER_TEMP/qemu-src"
+
+      - name: Save the native QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/native-qemu
+          key: native-qemu-${{ steps.versions.outputs.qemu_commit }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-native-qemu.sh', 'build/apply-patches.sh', 'build/pc-bios.list') }}
+
+      - name: Verify the native QEMU
+        id: qemu
+        continue-on-error: true
+        run: |
+          test -x out/native-qemu/qemu-system-x86_64
+          cat out/native-qemu/build-info.txt
+          out/native-qemu/qemu-system-x86_64 -display help | grep -q wasmfb
+          out/native-qemu/qemu-system-x86_64 -device help | grep -E 'virtio-(multitouch|tablet)|usb-tablet'
+
+      # --- the image the site publishes (build-and-deploy.yml caches it) ------
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore cached Android-x86 ISO
+        id: iso-cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/iso
+          key: android-iso-${{ steps.versions.outputs.iso_sha1 }}
+
+      - name: Download and verify the Android-x86 ISO
+        id: iso
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: scripts/fetch-android.sh out/iso
+
+      - name: Extract kernel, ramdisks and the system disk
+        id: prepare
+        if: steps.image-cache.outputs.cache-hit != 'true' && steps.iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          ISO_NAME: ${{ steps.versions.outputs.iso_name }}
+        run: |
+          scripts/prepare-image.sh "out/iso/$ISO_NAME" out/image > "$RUNNER_TEMP/prepare.log"
+          rm -rf out/iso
+
+      - name: The image
+        id: image
+        continue-on-error: true
+        env:
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+        run: |
+          test -s out/image/manifest.json
+          echo "published image from the cache: ${CACHE_HIT:-false}"
+
+      - name: Boot Android and touch it
+        id: boot
+        if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 100
+        run: |
+          CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "runner CPU: $CPU, $(nproc) threads"
+          mkdir -p out/touch
+          node tests/apply-boot-diet.mjs out/image/initrd.img "$PWD/out/touch/initrd-page.img" "?$QUERY"
+          node tests/print-qemu-args.mjs out/image/manifest.json "$PWD/out/image" \
+            "$PWD/out/native-qemu/pc-bios" "?$QUERY" \
+            | awk -v initrd="$PWD/out/touch/initrd-page.img" 'prev == "-initrd" { $0 = initrd } { prev = $0; print }' \
+            > out/touch/argv-native.txt
+          grep -qxF "$PWD/out/touch/initrd-page.img" out/touch/argv-native.txt
+          cat out/touch/argv-native.txt
+          python3 -I tests/touch-native.py \
+            --qemu out/native-qemu/qemu-system-x86_64 \
+            --argv-file out/touch/argv-native.txt \
+            --work out/touch/boot --cpu "$CPU" --query "$QUERY" --inject "$INJECT" || true
+
+      - name: Upload the logs
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: touch-${{ matrix.name }}
+          path: |
+            out/touch/boot/result.json
+            out/touch/boot/serial.log
+            out/touch/boot/qemu.log
+            out/touch/boot/*.png
+            out/touch/argv-native.txt
+          retention-days: 5
+          if-no-files-found: warn
+
+      - name: Report
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          QEMU: ${{ steps.qemu.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          IMAGE: ${{ steps.image.outcome }}
+        run: |
+          set +e
+          details="$(python3 -I -c '
+          import json, sys
+          try:
+              r = json.load(open(sys.argv[1]))
+          except (OSError, ValueError):
+              print("no result"); sys.exit()
+          if not r.get("booted"):
+              print(r.get("error", "not booted")); sys.exit()
+          checks = r.get("checks", {})
+          bad = [k for k, c in checks.items() if not c["ok"]]
+          head = "booted in %.0f s; " % r.get("booted_seconds", -1)
+          print(head + ("%d checks pass" % len(checks) if not bad else "FAILED: " + ", ".join(bad)) + (("; error: " + r["error"]) if r.get("error") else ""))
+          for k, c in checks.items():
+              print("| %s | %s | %s |" % (k, "pass" if c["ok"] else "**FAIL**", c["detail"].replace("|", "/")))
+          ' out/touch/boot/result.json 2>&1)"
+          first="$(sed -n 1p <<<"$details")"
+          state=failure
+          if [[ "$QEMU" != success ]]; then desc="native QEMU is missing (compile: $COMPILE)"
+          elif [[ "$IMAGE" != success ]]; then desc="no image"
+          elif grep -q 'checks pass' <<<"$first"; then state=success; desc="$first"
+          else desc="$first"
+          fi
+          echo "$state: $desc"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL" >/dev/null || true
+          {
+            echo "## Touch: $QUERY ($INJECT)"
+            echo
+            echo "**$state**: $desc"
+            echo
+            echo "| check | result | detail |"
+            echo "| --- | --- | --- |"
+            sed -n '2,$p' <<<"$details"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
