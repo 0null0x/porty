@@ -307,8 +307,22 @@ function row(v, r) {
         counters, glueApplied: res.glueApplied || {}, errors: (res.errors || []).slice(0, 5),
         // QEMU patch 0018: how full the wasm32 backend's per-TB tables got.
         tcg: res.tcg || null,
+        // Patch 0019: shares of the vCPU's time from the tap to Gallery, and counts.
+        phases: res.phases ? res.phases.launch : null,
+        phasesToLauncherGone: res.phases ? res.phases.toLauncherGone : null,
+        biggest: res.qemu && res.qemu.functions ? (res.qemu.functions.hot || []).slice(0, 8) : [],
         exit: r.code,
     };
+}
+
+/** "wasm 40 tci 20 ..." of a phase delta (tests/boot/webkit-test.mjs), the main shares only. */
+export function phaseCell(d) {
+    if (!d || !d.shares) {
+        return '-';
+    }
+    const short = { other: 'oth', wasm: 'wasm', tci: 'tci', tciCap: 'cap', compile: 'comp', translate: 'tr', sleep: 'slp', idle: 'idle', bql: 'bql' };
+    return Object.entries(d.shares).filter(([, v]) => v >= 1).map(([k, v]) => `${short[k] || k} ${Math.round(v)}`).join(' ') +
+        ` (${d.counts.compiled} comp, ${d.counts.translated} tr)`;
 }
 
 const fmt = (x) => (x === null || x === undefined || x === '' ? '-' : String(x));
@@ -374,10 +388,10 @@ async function main() {
         '',
         `Base query \`${baseQuery}\`; ${rows[0] ? rows[0].version : ''}. RSS of the web content process in MiB.`,
         '',
-        '| variant | browser | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | tap to arrow ms | typing echo ms | disk MB | JIT alive/compiled | CPU by thread | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+        '| variant | browser | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | tap to arrow ms | typing echo ms | disk MB | JIT alive/compiled | vCPU % tap to Gallery | CPU by thread | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows.map((r) => `| ${r.name} (\`${r.words || '-'}\`) | ${(r.version || '').split(' ')[0] || '-'} | ${fmt(r.peakRss)} | ${fmt(r.steadyRss)} | ${fmt(r.peakHeaps)} | ` +
-            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ` +
+            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ${phaseCell(r.phases)} | ` +
             `${(r.threadCpu || '').replace(/\|/g, '/') || '-'} | ` +
             `${(r.gc || []).filter((h) => h.allocatedMb > 50).slice(0, 4).map((h) => `${h.mbPerSecond ?? '?'}/s, ${Math.round(h.maxAllocatedKb / 1024)}`).join('; ') || '-'} | ` +
             `${Object.entries(r.counters).map(([t, row]) => `${t}: ${Object.entries(row).map(([k, x]) => `${k} ${x}`).join(' ')}`).join('; ') || '-'} | ` +

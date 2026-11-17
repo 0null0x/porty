@@ -1190,7 +1190,9 @@ async function qemuTableInfo() {
         };
         let pos = 8;
         let importedFuncs = 0;
+        const importNames = [];
         const bodies = [];
+        const bodyAt = [];
         const names = new Map();
         const text = (p, len) => new TextDecoder().decode(bytes.subarray(p, p + len));
         while (pos < bytes.length) {
@@ -1207,9 +1209,11 @@ async function qemuTableInfo() {
                     [len, p] = leb(p);
                     p += len;
                     [len, p] = leb(p);
+                    const field = text(p, len);
                     p += len;
                     const kind = bytes[p++];
                     if (kind === 0) {
+                        importNames.push(field);
                         importedFuncs++;
                         [, p] = leb(p);
                     } else if (kind === 1) {
@@ -1240,6 +1244,7 @@ async function qemuTableInfo() {
                     let len;
                     [len, p] = leb(p);
                     bodies.push(len);
+                    bodyAt.push(p);
                     p += len;
                 }
             }
@@ -1284,16 +1289,129 @@ async function qemuTableInfo() {
             }
             pos += size;
         }
-        // The engine's optimizing compiler works per function: how big are QEMU's?
+        // The engine's optimizing compiler works per function: how big are
+        // QEMU's?  JavaScriptCore never gives a function body over
+        // Options::maximumOMGCandidateCost bytes (40000 in WebKit 2.48,
+        // 100000 since) to its optimizing tier.
         const order = bodies.map((v, i) => i).sort((x, y) => bodies[y] - bodies[x]);
+        const named = (i) => `${names.get(i + importedFuncs) || `#${i + importedFuncs}`} ${bodies[i]}`;
         out.functions = {
             count: bodies.length, imported: importedFuncs, named: names.size,
             codeBytes: bodies.reduce((x, y) => x + y, 0),
-            over100k: bodies.filter((v) => v >= 100000).length,
+            over100k: bodies.filter((v) => v > 100000).length,
+            over40k: bodies.filter((v) => v > 40000).length,
             over20k: bodies.filter((v) => v >= 20000).length,
             over5k: bodies.filter((v) => v >= 5000).length,
-            biggest: order.slice(0, 25).map((i) => `${names.get(i + importedFuncs) || `#${i + importedFuncs}`} ${bodies[i]}`),
+            biggest: order.slice(0, 40).map(named),
+            // The ones that run all the time, wherever they rank.
+            hot: order.filter((i) => /^(tcg_qemu_tb_exec|porty_tci|i386_tr_|disas_insn|gen_intermediate_code|tcg_gen_code|tcg_optimize|cpu_exec|helper_lookup_tb_ptr|tb_gen_code|tb_lookup|tlb_fill|x86_cpu_tlb_fill|get_physical_address|mmu_translate|cpu_ld|cpu_st|helper_le|helper_be|do_ld|do_st|translator_loop|decode_insn|x86_ld)/
+                .test(names.get(i + importedFuncs) || '')).slice(0, 40).map(named),
         };
+        // What a few hot functions call: calls through Emscripten's invoke_*
+        // wrappers go through JavaScript (setjmp), the rest stay in wasm.
+        const nameOf = (f) => (f < importedFuncs ? `import:${importNames[f]}` : (names.get(f) || `#${f}`));
+        const calls = (fi) => {
+            let p = bodyAt[fi];
+            const end = p + bodies[fi];
+            let n;
+            [n, p] = leb(p);
+            for (let i = 0; i < n; i++) {
+                [, p] = leb(p);
+                p++;
+            }
+            const callees = new Map();
+            let direct = 0;
+            let indirect = 0;
+            const skipLeb = () => {
+                while (bytes[p++] & 0x80) {
+                    // continuation bytes
+                }
+            };
+            while (p < end) {
+                const op = bytes[p++];
+                if (op === 0x10) {
+                    let f;
+                    [f, p] = leb(p);
+                    direct++;
+                    const k = nameOf(f);
+                    callees.set(k, (callees.get(k) || 0) + 1);
+                } else if (op === 0x11) {
+                    indirect++;
+                    skipLeb();
+                    skipLeb();
+                } else if (op === 0x02 || op === 0x03 || op === 0x04) {
+                    if (bytes[p] === 0x40 || (bytes[p] >= 0x6f && bytes[p] <= 0x7f)) {
+                        p++;
+                    } else {
+                        skipLeb();
+                    }
+                } else if (op === 0x0c || op === 0x0d || (op >= 0x20 && op <= 0x26) || op === 0xd2 || op === 0x41 || op === 0x42) {
+                    skipLeb();
+                } else if (op === 0x0e) {
+                    let m;
+                    [m, p] = leb(p);
+                    for (let j = 0; j <= m; j++) {
+                        skipLeb();
+                    }
+                } else if (op >= 0x28 && op <= 0x3e) {
+                    skipLeb();
+                    skipLeb();
+                } else if (op === 0x3f || op === 0x40 || op === 0xd0) {
+                    p++;
+                } else if (op === 0x43) {
+                    p += 4;
+                } else if (op === 0x44) {
+                    p += 8;
+                } else if (op === 0x1c) {
+                    let m;
+                    [m, p] = leb(p);
+                    p += m;
+                } else if (op === 0xfc) {
+                    let sub;
+                    [sub, p] = leb(p);
+                    if (sub === 8) {
+                        skipLeb();
+                        p++;
+                    } else if (sub === 9 || sub === 13 || (sub >= 15 && sub <= 17)) {
+                        skipLeb();
+                    } else if (sub === 10) {
+                        p += 2;
+                    } else if (sub === 11) {
+                        p++;
+                    } else if (sub === 12 || sub === 14) {
+                        skipLeb();
+                        skipLeb();
+                    }
+                } else if (op === 0xfe) {
+                    let sub;
+                    [sub, p] = leb(p);
+                    if (sub === 3) {
+                        p++;
+                    } else {
+                        skipLeb();
+                        skipLeb();
+                    }
+                } else if (op === 0xfd) {
+                    return { error: 'SIMD, not decoded' };
+                }
+            }
+            const invokes = [...callees.entries()].filter(([k]) => k.startsWith('import:invoke_')).reduce((x, [, v]) => x + v, 0);
+            return {
+                bytes: bodies[fi], calls: direct, viaInvoke: invokes, callIndirect: indirect,
+                top: [...callees.entries()].sort((x, y) => y[1] - x[1]).slice(0, 8).map(([k, v]) => `${k} ${v}`),
+            };
+        };
+        out.callees = {};
+        for (let i = 0; i < bodies.length; i++) {
+            const nm = names.get(i + importedFuncs) || '';
+            if (/^(i386_tr_translate_insn|disas_insn|disas_insn_body|tb_gen_code|setjmp_gen_code|tcg_gen_code|tcg_qemu_tb_exec_tci|tcg_qemu_tb_exec|porty_tci_call_direct|cpu_exec_loop|gen_intermediate_code|translator_loop)$/.test(nm)) {
+                try {
+                    out.callees[nm] = calls(i);
+                } catch (err) {
+                    out.callees[nm] = { error: String(err) };
+                }
+            }
+        }
     } catch (err) {
         out.wasmError = String(err);
     }
@@ -1437,6 +1555,9 @@ async function sample(label, every = 10000) {
     const h = s.heap || {};
     const counters = await counterRates();
     const cpu = m ? threadCpuDelta(m.pid) : '';
+    const phaseNow = await readPhases();
+    const phases = phaseDelta(phaseLast, phaseNow);
+    phaseLast = phaseNow || phaseLast;
     const row = {
         t: Math.round((Date.now() - t0) / 1000), label,
         alive: h.jitAlive, compiled: h.jitCompiled, heapUsed: h.used, brk: h.brk,
@@ -1448,13 +1569,15 @@ async function sample(label, every = 10000) {
         ...(cpu ? { cpu } : {}),
         ...(s.tci ? { tci: s.tci } : {}),
         ...(s.mainLoop ? { mainLoop: s.mainLoop } : {}),
+        ...(phases ? { phases: { s: phases.seconds, ...phases.shares, ...phases.counts } } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
         `${s.mainLoop ? ` mainloop=${s.mainLoop.join('/')}` : ''} | ${describeMemory(m)}` +
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
-        (cpu ? ` | threads ${cpu}` : ''));
+        (cpu ? ` | threads ${cpu}` : '') +
+        (phases ? ` | PHASES ${describePhases(phases)}` : ''));
     const tcg = tcgTables(s.tcg);
     if (tcg && JSON.stringify(tcg) !== JSON.stringify(result.tcg)) {
         log(`TCG TABLES: ${describeTcgTables(tcg)} ${JSON.stringify(tcg)}`);
@@ -1506,6 +1629,9 @@ async function boot() {
                 log(`main loop wait set to ${mlWaitSet} ms (MLWAIT)`);
                 b.mlWait = Number(mlWaitSet);
             }
+        }
+        if (!phaseSampler && s.wasmMb) {
+            await startPhaseSampler();
         }
         if (!printed && s.cfg && s.wasmMb) {
             printed = true;
@@ -1656,6 +1782,7 @@ async function inputProbe() {
         return Array.from(g.getImageData(0, 0, 32, 32).data);
     }, [150, Math.round(565 * (r.ch || 800) / 800)]).catch(() => null);
     const before = await crop();
+    await markPhases('tap');
     const tTap = Date.now();
     p.how = 'touchscreen';
     try {
@@ -1728,11 +1855,13 @@ async function inputProbe() {
         }
         if (p.launcherGone === undefined && s.bright >= 0 && s.bright < 30) {
             p.launcherGone = secs(Date.now() - tTap);
+            await markPhases('launcherGone');
             log(`INPUT PROBE: the launcher left the screen after ${p.launcherGone} s (lit=${s.lit}% bright=${s.bright}%)`);
             await sample('launcher-gone', 0);
         }
         if (p.launcherGone !== undefined && s.lit >= 50 && s.bright < 30) {
             p.gallery = secs(Date.now() - tTap);
+            await markPhases('gallery');
             log(`INPUT PROBE: Gallery drawn after ${p.gallery} s (lit=${s.lit}% bright=${s.bright}%)`);
             break;
         }
@@ -1750,6 +1879,7 @@ async function inputProbe() {
     }
     if (p.gallery === undefined) {
         p.gallery = null;
+        await markPhases('gallery');
         log(`INPUT PROBE: Gallery not drawn within ${Math.round((Date.now() - tTap) / 1000)} s`);
     } else {
         // One question to Android, to confirm what the screen showed.
@@ -1854,6 +1984,126 @@ async function counterRates() {
     }
     lastCounters = { t: now, flat, n };
     return out;
+}
+
+// ------------------------------------------------------ phase sampler ---
+// Patch 0019: the vCPU thread writes its phase to a word of the shared
+// memory (Module._porty_prof_ptr(): uint32 phase, uint32 version, 16 uint64
+// counts; include/qemu/porty-prof.h).  A worker of the page reads it about
+// every half millisecond and counts samples per phase in a SharedArrayBuffer
+// of its own; the shares of samples are the shares of the vCPU's time.
+const PROF_PHASES = ['other', 'wasm', 'tci', 'tciCap', 'compile', 'translate', 'sleep', 'idle', 'bql'];
+const PROF_COUNTS = ['execWasm', 'execTci', 'execTciCap', 'compiled', 'rearmed', 'drops', 'dropped',
+    'translated', 'insns', 'flushes', 'sleeps'];
+let phaseSampler = null;
+let phaseLast = null;
+const phaseMarks = {};
+
+/** Runs in the page: start the sampler worker once QEMU exports its phase. */
+function startPhaseWorker() {
+    const e = globalThis.__porty;
+    if (globalThis.__portyPhase) {
+        return globalThis.__portyPhase.note;
+    }
+    if (!e || !e.module || typeof e.module._porty_prof_ptr !== 'function' || !e.memory) {
+        return null;
+    }
+    const base = e.module._porty_prof_ptr() >>> 0;
+    const version = new Uint32Array(e.memory.buffer, base, 2)[1];
+    // [0..15] samples per phase, [16] all samples, [17] the sampler's
+    // own loop count, [31] stop.
+    const hist = new SharedArrayBuffer(4 * 32);
+    const source = `self.onmessage = (ev) => {
+        const ph = new Int32Array(ev.data.mem, ev.data.base, 1);
+        const h = new Int32Array(ev.data.hist);
+        const nap = new Int32Array(new SharedArrayBuffer(4));
+        for (;;) {
+            Atomics.wait(nap, 0, 0, 0.5);
+            const p = Atomics.load(ph, 0);
+            h[p >= 0 && p < 15 ? p : 15]++;
+            h[16]++;
+            if (Atomics.load(h, 31)) {
+                return;
+            }
+        }
+    };`;
+    const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+    worker.postMessage({ mem: e.memory.buffer, base, hist });
+    const note = `base ${base} version ${version}`;
+    globalThis.__portyPhase = { hist: new Int32Array(hist), base, worker, note };
+    return note;
+}
+
+async function startPhaseSampler() {
+    if (phaseSampler) {
+        return phaseSampler;
+    }
+    phaseSampler = await page.evaluate(startPhaseWorker).catch(() => null);
+    if (phaseSampler) {
+        log(`PHASE SAMPLER started (${phaseSampler})`);
+        phaseLast = await readPhases();
+        phaseMarks.start = phaseLast;
+    }
+    return phaseSampler;
+}
+
+/** Cumulative samples per phase and the event counts, or null. */
+async function readPhases() {
+    if (!phaseSampler) {
+        return null;
+    }
+    try {
+        return await page.evaluate(() => {
+            const p = globalThis.__portyPhase;
+            const e = globalThis.__porty;
+            if (!p || !e || !e.memory) {
+                return null;
+            }
+            const counts = new BigUint64Array(e.memory.buffer, p.base + 8, 16);
+            return { t: performance.now(), hist: Array.from(p.hist.subarray(0, 18)), counts: Array.from(counts, (x) => Number(x)) };
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
+/** Shares of the vCPU's time (percent) and counts between two readings. */
+function phaseDelta(a, b) {
+    if (!a || !b) {
+        return null;
+    }
+    const n = b.hist[16] - a.hist[16];
+    const shares = {};
+    PROF_PHASES.forEach((name, i) => {
+        shares[name] = n > 0 ? Math.round((1000 * (b.hist[i] - a.hist[i])) / n) / 10 : 0;
+    });
+    const counts = {};
+    PROF_COUNTS.forEach((name, i) => {
+        counts[name] = b.counts[i] - a.counts[i];
+    });
+    const seconds = (b.t - a.t) / 1000;
+    return { seconds: Math.round(seconds * 10) / 10, samples: n, perSecond: seconds > 0 ? Math.round(n / seconds) : 0, shares, counts };
+}
+
+function describePhases(d) {
+    if (!d) {
+        return '-';
+    }
+    const s = PROF_PHASES.filter((k) => d.shares[k] >= 0.5).map((k) => `${k} ${d.shares[k]}%`).join(' ');
+    const c = d.counts;
+    const per = (x) => (d.seconds > 0 ? Math.round(x / d.seconds) : 0);
+    return `${s} | per s: blocks wasm ${per(c.execWasm)} tci ${per(c.execTci)} tciCap ${per(c.execTciCap)}, ` +
+        `compiled ${per(c.compiled)} rearmed ${per(c.rearmed)} dropped ${per(c.dropped)}, translated ${per(c.translated)} ` +
+        `(${c.translated ? Math.round((10 * c.insns) / c.translated) / 10 : 0} insns each), flushes ${c.flushes}, sleeps ${per(c.sleeps)} ` +
+        `| ${d.samples} samples in ${d.seconds} s`;
+}
+
+async function markPhases(label) {
+    const r = await readPhases();
+    if (r) {
+        phaseMarks[label] = r;
+    }
+    return r;
 }
 
 // --------------------------------------------------------- peak sampler ---
@@ -2067,6 +2317,20 @@ if (counterStart.flat && lastCounters && lastCounters.t > counterStart.t) {
         (v, c, i) => Math.round((v - (counterStart.flat[c * COUNTER_NAMES.length + i] || 0)) / dt));
     result.counterTotals = counterTable(lastCounters.flat, lastCounters.n);
     log(`COUNTERS per second per thread over ${Math.round(dt)} s: ${JSON.stringify(result.counterRates)}; totals ${JSON.stringify(result.counterTotals)}`);
+}
+if (phaseSampler) {
+    await markPhases('end');
+    const m = phaseMarks;
+    result.phases = {
+        beforeTap: phaseDelta(m.start, m.tap),
+        launch: phaseDelta(m.tap, m.gallery),
+        toLauncherGone: phaseDelta(m.tap, m.launcherGone),
+        afterLauncherGone: phaseDelta(m.launcherGone, m.gallery),
+        total: phaseDelta(m.start, m.end),
+    };
+    for (const [k, d] of Object.entries(result.phases)) {
+        log(`PHASES ${k}: ${describePhases(d)}`);
+    }
 }
 log(`PEAK: content process ${result.peakRss} MiB at ${result.peakAt} s, all processes ${result.peakTotal} MiB`);
 const verdict = summarize();
