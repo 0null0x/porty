@@ -1089,6 +1089,23 @@ async function inputProbe() {
                 : `${moved.shift} px`} for a finger moved 360 px (row match ${moved.err}, unmoved ${moved.err0}); ` +
                 `screen still after ${quiet} s`);
             await shot('after-swipe', true);
+            // The mouse wheel over the list, up three notches: the page drags
+            // with a finger of its own (web/js/input.js), so the list moves
+            // back down, and the finger lifts by itself.
+            const swiped = await rowSig();
+            const [wx, wy] = at(240, 400 * (r.ch || 800) / 800);
+            await page.mouse.move(wx, wy);
+            for (let i = 0; i < 3; i++) {
+                await page.mouse.wheel({ deltaY: -100 });
+                await sleep(100);
+            }
+            const wquiet = await still(120000);
+            const wheeled = vshift(swiped, await rowSig());
+            touchResult.wheel = { wheelPx: -300, listPx: wheeled.shift, matchErr: wheeled.err, quietS: wquiet };
+            log(`INPUT PROBE: mouse wheel up 3 notches on Settings: the list moved ${wheeled.shift === null
+                ? 'farther than 640 px or not at all' : `${wheeled.shift} px`} (row match ${wheeled.err}); ` +
+                `screen still after ${wquiet} s`);
+            await shot('after-wheel', true);
         }
         await page.click('#nav-home').catch(() => {});
         await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
