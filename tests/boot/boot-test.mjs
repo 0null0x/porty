@@ -615,30 +615,7 @@ async function inputProbe() {
                 seen[k] = (seen[k] || 0) + 1;
             }, { capture: true });
         }
-        // What the page hands QEMU's ring (web/js/emulator.js looks the
-        // export up on every call): touch events, with QEMU's answer.
-        const m = globalThis.__porty && globalThis.__porty.module;
-        if (m && typeof m._porty_input_event === 'function' && !m.__portySent) {
-            const send = m._porty_input_event;
-            const sent = m.__portySent = globalThis.__portySent = [];
-            const t0 = performance.now();
-            m._porty_input_event = (type, a, b, c) => {
-                const ok = send(type, a, b, c);
-                if (type >= 5 && type <= 7) {
-                    sent.push([Math.round(performance.now() - t0), type, a, b, c, ok]);
-                }
-                return ok;
-            };
-        }
     });
-    // The touch events the page sent since `mark` (a count of them), in short.
-    const sentMark = () => page.evaluate(() => (globalThis.__portySent || []).length);
-    const sentSince = (mark) => page.evaluate((from) => {
-        const ev = (globalThis.__portySent || []).slice(from);
-        const name = { 5: 'down', 6: 'move', 7: 'up' };
-        return ev.map(([t, type, slot, x, y, ok]) => `${t}:${name[type]}${slot}` +
-            (type === 7 ? '' : `@${x},${y}`) + (ok ? '' : '!dropped')).join(' ');
-    }, mark);
     const r = await page.$eval('#screen', (e) => {
         const b = e.getBoundingClientRect();
         return { x: b.left, y: b.top, w: b.width, h: b.height, cw: e.width, ch: e.height };
@@ -1240,7 +1217,6 @@ async function inputProbe() {
         const [sx0, sy0] = at(60, 375 * (r.ch || 800) / 800);
         let settingsS = -1;
         const tapped = Date.now();
-        const tapMark = await sentMark();
         for (let i = 0; i < 3 && settingsS < 0; i++) {
             await page.touchscreen.touchStart(sx0, sy0);
             await sleep(120);
@@ -1254,7 +1230,6 @@ async function inputProbe() {
             changedPct: changedPct(drawer, await canvasSample()) };
         log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s ` +
             `(${touchResult.settingsTaps} taps, ${touchResult.settings.changedPct}% of the screen)`);
-        log(`INPUT PROBE: sent for the taps on Settings: ${await sentSince(tapMark)}`);
         if (settingsS < 0) {
             // Then the shell, if it answers, so that the swipe is measured anyway.
             await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
@@ -1271,11 +1246,13 @@ async function inputProbe() {
             log(`INPUT PROBE: the Settings list ${listS < 0 ? 'stayed empty for 480 s' : `was drawn after ${listS} s`}`);
         }
         if (settingsS >= 0 && touchResult.settings.listS >= 0) {
-            // The list goes on filling in its summaries after it shows, and
-            // Settings' main thread with it: wait until nothing changed for
-            // 15 s (in 44096770993 the probe swiped 9 s after the list
-            // showed, and nothing moved).
-            const settled = await stillFor(15, 240000);
+            // The list goes on filling in summaries and tiles after it shows:
+            // wait until nothing changed for 30 s.  (In 44096770993 and
+            // 44100096190 the probe swiped while the last tiles, Accounts
+            // to System, were still missing, and a list that fits on the
+            // screen cannot scroll; in 44109487506 they were there, and the
+            // list moved.)
+            const settled = await stillFor(30, 300000);
             const top = await rowSig();
             const topSample = await canvasSample();
             await shot('settings', true);
@@ -1283,7 +1260,6 @@ async function inputProbe() {
             // before the lift (no fling): the list should follow the finger.
             const [x0, y0] = at(240, 640 * (r.ch || 800) / 800);
             const [, y1] = at(240, 280 * (r.ch || 800) / 800);
-            const swipeMark = await sentMark();
             await page.touchscreen.touchStart(x0, y0);
             for (let i = 1; i <= 8; i++) {
                 await sleep(150);
@@ -1301,18 +1277,19 @@ async function inputProbe() {
             log(`INPUT PROBE: swipe on Settings: the list moved ${moved.shift === null ? 'farther than 640 px or not at all'
                 : `${moved.shift} px`} for a finger moved 360 px (row match ${moved.err}, unmoved ${moved.err0}); ` +
                 `the screen changed after ${movedS} s and was still after ${quiet} s more`);
-            log(`INPUT PROBE: sent for the swipe: ${await sentSince(swipeMark)}`);
             await shot('after-swipe', true);
             // The mouse wheel over the list, three notches: the page drags
             // with a finger of its own (web/js/input.js), which lifts by
             // itself.  Up (the list back down) if the swipe moved it, else
             // down, since a list at its top cannot go further up.
-            const back = moved.shift !== null && Math.abs(moved.shift) > 20;
+            // (A tile that goes or comes while the list moves defeats the
+            // row match, as Battery did in 44109487506: a large error for
+            // "unmoved" says the list moved all the same.)
+            const back = (moved.shift !== null && Math.abs(moved.shift) > 20) || moved.err0 > 150;
             const swiped = await rowSig();
             const swipedSample = await canvasSample();
             const [wx, wy] = at(240, 400 * (r.ch || 800) / 800);
             await page.mouse.move(wx, wy);
-            const wheelMark = await sentMark();
             for (let i = 0; i < 3; i++) {
                 await page.mouse.wheel({ deltaY: back ? -100 : 100 });
                 await sleep(100);
@@ -1325,7 +1302,6 @@ async function inputProbe() {
             log(`INPUT PROBE: mouse wheel ${back ? 'up' : 'down'} 3 notches on Settings: the list moved ${wheeled.shift === null
                 ? 'farther than 640 px or not at all' : `${wheeled.shift} px`} (row match ${wheeled.err}); ` +
                 `the screen changed after ${wmovedS} s`);
-            log(`INPUT PROBE: sent for the wheel: ${await sentSince(wheelMark)}`);
             await shot('after-wheel', true);
             if (probePinch) {
                 await pinch();
