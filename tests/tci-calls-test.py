@@ -14,6 +14,11 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Words that are macros where QEMU's build compiles tcg/wasm32.c, so that the header
+# meets them here too: there "wasm32" expands to nothing (the first build of
+# patch 0015 v2 failed on a local variable of that name).
+QEMU_MACROS = ['-Dwasm32=']
 MAX_ARGS = 7
 
 
@@ -163,7 +168,7 @@ int main(void)
             f.write('\n'.join(src))
         cflags = subprocess.run(['pkg-config', '--cflags', '--libs', 'libffi'], capture_output=True, text=True).stdout.split() or ['-lffi']
         exe = os.path.join(tmp, 't')
-        cc = subprocess.run(['cc', '-O1', '-Wall', '-Wno-unused-function', '-o', exe, os.path.join(tmp, 't.c'), '-I', tmp, *cflags],
+        cc = subprocess.run(['cc', '-O1', '-Wall', '-Wno-unused-function', *QEMU_MACROS, '-o', exe, os.path.join(tmp, 't.c'), '-I', tmp, *cflags],
                             capture_output=True, text=True)
         if cc.returncode:
             print(cc.stderr[-3000:])
@@ -290,7 +295,7 @@ def wasm32_check() -> int:
         with open(os.path.join(tmp, 'w.c'), 'w') as f:
             f.write(WASM_TEST)
         wasm = os.path.join(tmp, 'w.wasm')
-        cc = subprocess.run([clang, '--target=wasm32', '-O1', '-nostdlib', '-ffreestanding', '-Wall', '-Wno-unused-function',
+        cc = subprocess.run([clang, '--target=wasm32', '-O1', '-nostdlib', '-ffreestanding', '-Wall', '-Wno-unused-function', *QEMU_MACROS,
                              '-Wl,--no-entry', '-Wl,--export=run', '-o', wasm, os.path.join(tmp, 'w.c'), '-I', tmp],
                             capture_output=True, text=True)
         if cc.returncode:

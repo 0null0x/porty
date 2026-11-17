@@ -69,14 +69,16 @@ static int porty_tci_code(const ffi_cif *cif)
 {
     unsigned n = cif->nargs, i, k;
     int r, mask = 0, i128 = 0, sret = 0;
-    bool wasm32 = sizeof(void *) == 4;
+    /* Not "wasm32": in QEMU's build of tcg/wasm32.c that word is a macro
+     * that expands to nothing. */
+    bool ptr32 = sizeof(void *) == 4;
 
     switch (cif->rtype->type) {
     case FFI_TYPE_VOID:
         r = 0;
         break;
     case FFI_TYPE_POINTER:
-        if (!wasm32) {
+        if (!ptr32) {
             return -1;
         }
         /* fall through */
@@ -90,7 +92,7 @@ static int porty_tci_code(const ffi_cif *cif)
         r = 2;
         break;
     default:
-        if (!wasm32 || !porty_tci_is_i128(cif->rtype)) {
+        if (!ptr32 || !porty_tci_is_i128(cif->rtype)) {
             return -1;
         }
         r = 0;
@@ -104,7 +106,7 @@ static int porty_tci_code(const ffi_cif *cif)
         k = i + sret;
         switch (cif->arg_types[i]->type) {
         case FFI_TYPE_POINTER:
-            if (!wasm32) {
+            if (!ptr32) {
                 return -1;
             }
             break;
@@ -117,7 +119,7 @@ static int porty_tci_code(const ffi_cif *cif)
             mask |= 1 << k;
             break;
         default:
-            if (!wasm32 || !porty_tci_is_i128(cif->arg_types[i])) {
+            if (!ptr32 || !porty_tci_is_i128(cif->arg_types[i])) {
                 return -1;
             }
             i128 |= 1 << i;
