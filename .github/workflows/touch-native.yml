@@ -201,6 +201,35 @@ jobs:
           test -s out/image/manifest.json
           echo "published image from the cache: ${CACHE_HIT:-false}"
 
+      # Which apps of the image draw differently without a touchscreen
+      # (resources for notouch, stylus or finger): what Android's
+      # configuration (finger with the touchscreen, notouch with the
+      # tablet) changes besides input.  Gallery2's notouch theme has no
+      # action bar.
+      - name: The image's resources for a touchscreen configuration
+        id: touch-configs
+        if: steps.image.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          w="$RUNNER_TEMP/apks"
+          mkdir -p "$w/fs"
+          command -v qemu-img > /dev/null || sudo apt-get install -y -qq qemu-utils > /dev/null
+          cat out/image/system/*.bin > "$w/system.qcow2"
+          qemu-img convert -f qcow2 -O raw "$w/system.qcow2" "$w/system.raw"
+          rm -f "$w/system.qcow2"
+          debugfs -R "rdump /app /priv-app /framework /system/app /system/priv-app /system/framework $w/fs" "$w/system.raw" > /dev/null 2>&1 || true
+          rm -f "$w/system.raw"
+          echo "apks: $(find "$w/fs" -name '*.apk' | wc -l)"
+          python3 -I tests/touch-configs.py "$w/fs" | tee "$RUNNER_TEMP/touch-configs.txt"
+          {
+            echo "### Resources for a touchscreen configuration in the image's apps"
+            echo '```'
+            cat "$RUNNER_TEMP/touch-configs.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$w"
+
       - name: Boot Android and touch it
         id: boot
         if: steps.image.outcome == 'success' && steps.qemu.outcome == 'success'
