@@ -1,6 +1,6 @@
 From: Claude <noreply@anthropic.com>
-Date: Tue, 17 Nov 2026 00:30:00 +0000
-Subject: [PATCH] tcg/wasm32: keep the vCPU's stack pointer across Asyncify
+Date: Tue, 17 Nov 2026 01:00:00 +0000
+Subject: [PATCH] accel/tcg: keep the vCPU's stack pointer across Asyncify
  rewinds and longjmps, and give it room
 
 QEMU-Wasm's vCPU thread died now and then with "Uncaught Infinity" (an
@@ -19,23 +19,22 @@ the same functions again; the invoke_* around cpu_exec_loop() is then
 entered again while __stack_pointer still points where the stack was
 unwound from, deep in cpu_exec_loop().  The next cpu_loop_exit() it
 catches leaves the vCPU thread's stack that much lower, and so on until
-cpu_exec() returns.  libffi's ffi_call_js, which TCI calls helpers
-through, does the same when a helper switched coroutines.  Every pthread
-has a 64 KiB C stack (Emscripten's default; QEMU sets none), directly
-above its TLS block, whose last words are __THREW__ and __threwValue:
-frames below the stack's end overwrite them, and the next setjmp check
-sees a longjmp nobody threw.
+cpu_exec() returns.  Every pthread has a 64 KiB C stack (Emscripten's
+default; QEMU sets none), directly above its TLS block, whose last words
+are __THREW__ and __threwValue: frames below the stack's end overwrite
+them, and the next setjmp check sees a longjmp nobody threw.
 
  - cpu_exec_setjmp() and cpu_exec_step_atomic() note the stack pointer
    before sigsetjmp() and put it back when a longjmp lands;
- - TCI puts its own back after each helper call;
  - vCPU threads get a 1 MiB stack (virtqueue_pop() alone has a 16 KiB
    frame, and the vCPU thread runs device emulation);
  - the vCPU thread paints its stack when it starts: after each cpu_exec()
    QEMU stops with a message if the lowest words were overwritten, and
    porty_stack_stats() tells the page how deep the stack has been used.
 
-Native builds are unchanged.
+libffi's ffi_call_js (TCI's helper calls) has the same habit; with the
+above its effect is bounded and is left to whatever replaces it.  Native
+builds are unchanged.
 ---
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
 index c938eb9..5b47362 100644
@@ -101,114 +100,23 @@ index c938eb9..5b47362 100644
      }
  
 diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
-index 276b636..66ee8d2 100644
+index 276b636..0685852 100644
 --- a/accel/tcg/tcg-accel-ops-mttcg.c
 +++ b/accel/tcg/tcg-accel-ops-mttcg.c
-@@ -71,6 +71,7 @@ static void *mttcg_cpu_thread_fn(void *arg)
- 
+@@ -64,6 +64,84 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
  #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
-     init_wasm32();
-+    porty_vcpu_stack_init();
+ #include "../../tcg/wasm32.h"
  #endif
-     
-     assert(tcg_enabled());
-diff --git a/accel/tcg/tcg-accel-ops.c b/accel/tcg/tcg-accel-ops.c
-index 1b57290..3877cbf 100644
---- a/accel/tcg/tcg-accel-ops.c
-+++ b/accel/tcg/tcg-accel-ops.c
-@@ -68,6 +68,10 @@ void tcg_cpus_destroy(CPUState *cpu)
-     cpu_thread_signal_destroyed(cpu);
- }
- 
-+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
-+#include "../../tcg/wasm32.h"
-+#endif
-+
- int tcg_cpus_exec(CPUState *cpu)
- {
-     int ret;
-@@ -75,6 +79,9 @@ int tcg_cpus_exec(CPUState *cpu)
-     cpu_exec_start(cpu);
-     ret = cpu_exec(cpu);
-     cpu_exec_end(cpu);
-+#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
-+    porty_vcpu_stack_check();
-+#endif
-     return ret;
- }
- 
-diff --git a/include/qemu/porty-stack.h b/include/qemu/porty-stack.h
-new file mode 100644
-index 0000000..792ce9d
---- /dev/null
-+++ b/include/qemu/porty-stack.h
-@@ -0,0 +1,40 @@
-+/*
-+ * Porty: the C stack of QEMU-Wasm's threads.
-+ *
-+ * Under Emscripten the C stack (Emscripten's "shadow stack" in linear
-+ * memory, for address-taken locals and big frames) is addressed through the
-+ * global __stack_pointer.  Two Emscripten mechanisms set it from JavaScript:
-+ *
-+ *  - setjmp/longjmp (without Wasm exceptions): every call made by a function
-+ *    that called setjmp goes through a JavaScript invoke_* wrapper, which
-+ *    saves __stack_pointer when it is entered and puts it back when it
-+ *    catches a longjmp;
-+ *  - Asyncify (coroutine switches, emscripten_sleep): the stack is unwound
-+ *    and later rewound by calling the same functions again, and an
-+ *    invoke_* wrapper on it is entered again then, while __stack_pointer
-+ *    still points where the stack was unwound from, deeper down.
-+ *
-+ * So after a rewind, the next longjmp that wrapper catches leaves
-+ * __stack_pointer too deep, and every later frame of the thread starts
-+ * there.  Functions that call sigsetjmp around code that can unwind save
-+ * the stack pointer first and put it back when a longjmp lands.
-+ *
-+ * Copyright (c) 2026 The Porty contributors
-+ * SPDX-License-Identifier: GPL-2.0-or-later
-+ */
-+#ifndef QEMU_PORTY_STACK_H
-+#define QEMU_PORTY_STACK_H
 +
 +#ifdef __EMSCRIPTEN__
-+#include <emscripten/stack.h>
-+
-+/* compiler-rt's stack_ops.S; sets __stack_pointer. */
-+void porty_stack_set(uintptr_t sp) __asm__("stackRestore");
-+
-+static inline uintptr_t porty_stack_get(void)
-+{
-+    return emscripten_stack_get_current();
-+}
-+#endif
-+
-+#endif
-diff --git a/tcg/wasm32.c b/tcg/wasm32.c
-index 723827e..9e69ca8 100644
---- a/tcg/wasm32.c
-+++ b/tcg/wasm32.c
-@@ -28,7 +28,9 @@
- #include <string.h>
- #include <emscripten.h>
- #include <emscripten/threading.h>
-+#include <emscripten/stack.h>
- #include "wasm32.h"
++#include <emscripten.h>
++#include "qemu/atomic.h"
 +#include "qemu/porty-stack.h"
- 
- int porty_jit_threshold = INSTANTIATE_NUM_DEFAULT;
- 
-@@ -47,6 +49,80 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_threshold(int n)
- 
- __thread uintptr_t tci_tb_ptr;
- 
++
 +/*
-+ * Porty: the vCPU thread's C stack.  porty_vcpu_stack_init() paints it when
-+ * the thread starts (mttcg_cpu_thread_fn()); porty_vcpu_stack_check(),
-+ * after each cpu_exec(), stops QEMU with a message if its lowest words were
-+ * overwritten, rather than let the thread go on with the TLS block below
-+ * the stack overwritten; porty_stack_stats() tells the page how deep the
-+ * stack has been used.  One vCPU thread: the page always runs smp=1, and
-+ * with more the numbers are the last thread's.
++ * Porty: the vCPU thread's C stack (see include/qemu/porty-stack.h).  One
++ * vCPU thread: the page always runs smp=1; with more, the numbers are the
++ * last thread's.
 + */
 +#define PORTY_STACK_PAINT 0x5afe57acu
 +#define PORTY_STACK_GUARD_WORDS 16
@@ -234,7 +142,7 @@ index 723827e..9e69ca8 100644
 +
 +void porty_vcpu_stack_check(void)
 +{
-+    const uint32_t *p = (const uint32_t *)porty_vcpu_stack_low;
++    const uint32_t *p = (const uint32_t *)qatomic_read(&porty_vcpu_stack_low);
 +    int i;
 +
 +    if (!p) {
@@ -254,7 +162,8 @@ index 723827e..9e69ca8 100644
 +
 +/*
 + * Porty: [0] the vCPU thread's C stack size in bytes, [1] the most of it
-+ * used so far (the lowest word no longer painted), 0 if not known.
++ * used so far (from the lowest word no longer painted); zeros before the
++ * thread has started.  For the page and the boot test.
 + */
 +uint32_t *porty_stack_stats(void);
 +EMSCRIPTEN_KEEPALIVE uint32_t *porty_stack_stats(void)
@@ -274,43 +183,109 @@ index 723827e..9e69ca8 100644
 +    }
 +    return out;
 +}
++#endif
 +
- /* Disassemble TCI bytecode. */
- int print_insn_tci(bfd_vma addr, disassemble_info *info)
+ static void *mttcg_cpu_thread_fn(void *arg)
  {
-@@ -804,7 +880,17 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
+     MttcgForceRcuNotifier force_rcu;
+@@ -72,6 +150,9 @@ static void *mttcg_cpu_thread_fn(void *arg)
+ #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+     init_wasm32();
+ #endif
++#ifdef __EMSCRIPTEN__
++    porty_vcpu_stack_init();
++#endif
+     
+     assert(tcg_enabled());
+     g_assert(!icount_enabled());
+diff --git a/accel/tcg/tcg-accel-ops.c b/accel/tcg/tcg-accel-ops.c
+index 1b57290..f87b528 100644
+--- a/accel/tcg/tcg-accel-ops.c
++++ b/accel/tcg/tcg-accel-ops.c
+@@ -68,6 +68,8 @@ void tcg_cpus_destroy(CPUState *cpu)
+     cpu_thread_signal_destroyed(cpu);
+ }
  
-                 /* Helper functions may need to access the "return address" */
-                 tci_tb_ptr = (uintptr_t)tb_ptr;
-+                /*
-+                 * Porty: libffi's ffi_call_js saves the stack pointer when
-+                 * it is entered and puts it back after the helper returns.
-+                 * When the helper switched coroutines, Asyncify entered it
-+                 * again on the rewind, with the stack pointer of the
-+                 * switch, deep in the helper: put back this frame's own.
-+                 * See include/qemu/porty-stack.h.
-+                 */
-+                const uintptr_t sp = porty_stack_get();
-                 ffi_call(cif, func, stack, call_slots);
-+                porty_stack_set(sp);
-             }
++#include "qemu/porty-stack.h"
++
+ int tcg_cpus_exec(CPUState *cpu)
+ {
+     int ret;
+@@ -75,6 +77,9 @@ int tcg_cpus_exec(CPUState *cpu)
+     cpu_exec_start(cpu);
+     ret = cpu_exec(cpu);
+     cpu_exec_end(cpu);
++#ifdef __EMSCRIPTEN__
++    porty_vcpu_stack_check();
++#endif
+     return ret;
+ }
  
-             switch (len) {
-diff --git a/tcg/wasm32.h b/tcg/wasm32.h
-index 8d493a1..c6ac18e 100644
---- a/tcg/wasm32.h
-+++ b/tcg/wasm32.h
-@@ -37,6 +37,10 @@ int get_core_nums();
- 
- void init_wasm32();
- 
-+/* Porty: the vCPU thread's C stack, see wasm32.c. */
+diff --git a/include/qemu/porty-stack.h b/include/qemu/porty-stack.h
+new file mode 100644
+index 0000000..da7eb6c
+--- /dev/null
++++ b/include/qemu/porty-stack.h
+@@ -0,0 +1,59 @@
++/*
++ * Porty: the C stack of QEMU-Wasm's threads.
++ *
++ * Under Emscripten the C stack (Emscripten's "shadow stack" in linear
++ * memory, for address-taken locals and big frames) is addressed through the
++ * global __stack_pointer.  Two Emscripten mechanisms set it from JavaScript:
++ *
++ *  - setjmp/longjmp (without Wasm exceptions): every call made by a function
++ *    that called setjmp goes through a JavaScript invoke_* wrapper, which
++ *    saves __stack_pointer when it is entered and puts it back when it
++ *    catches a longjmp;
++ *  - Asyncify (coroutine switches, emscripten_sleep): the stack is unwound
++ *    and later rewound by calling the same functions again, and an
++ *    invoke_* wrapper on it is entered again then, while __stack_pointer
++ *    still points where the stack was unwound from, deeper down.
++ *
++ * So after a rewind, the next longjmp that wrapper catches leaves
++ * __stack_pointer too deep, and every later frame of the thread starts
++ * there, until the function that called setjmp returns.  The functions
++ * that call sigsetjmp around code that can unwind (cpu_exec_setjmp(),
++ * cpu_exec_step_atomic()) save the stack pointer first and put it back
++ * when a longjmp lands.  (libffi's ffi_call_js, which TCI calls helpers
++ * through, also saves and restores it around the helper: after a helper
++ * that switched coroutines, TCI runs on with it too deep until it returns
++ * or the next longjmp lands.)
++ *
++ * Every pthread of this build has a 64 KiB C stack, directly above its
++ * TLS block; the last words of that block are Emscripten's __THREW__ and
++ * __threwValue, which every setjmp caller checks after each call.
++ *
++ * Copyright (c) 2026 The Porty contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_PORTY_STACK_H
++#define QEMU_PORTY_STACK_H
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten/stack.h>
++
++/* compiler-rt's stack_ops.S; sets __stack_pointer. */
++void porty_stack_set(uintptr_t sp) __asm__("stackRestore");
++
++static inline uintptr_t porty_stack_get(void)
++{
++    return emscripten_stack_get_current();
++}
++
++/*
++ * The vCPU thread's stack (tcg-accel-ops-mttcg.c): painted when the
++ * thread starts; checked after each cpu_exec(), which stops QEMU with a
++ * message if its lowest words were overwritten rather than let the thread
++ * run on with its TLS block (right below the stack) overwritten.
++ * porty_stack_stats() (exported) tells the page how deep it has been used.
++ */
 +void porty_vcpu_stack_init(void);
 +void porty_vcpu_stack_check(void);
++#endif
 +
- /*
-  * Executions of a TB before it is compiled to its own Wasm module (until
-  * then TCI interprets it).  Porty: a variable rather than a constant, so the
++#endif
 diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
 index b2e26e2..bcdf146 100644
 --- a/util/qemu-thread-posix.c
