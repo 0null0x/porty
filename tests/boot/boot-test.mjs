@@ -560,6 +560,9 @@ async function inputProbe() {
             if (/SFTSDONE:2:END/.test(line)) {
                 marks.sfts = 'done';
             }
+            if (/INLOGDONE:2:END/.test(line)) {
+                marks.inlog = Date.now();
+            }
             m = line.match(/SPRITES:(\d+):(\d+):END/);
             if (m) {
                 marks.sprites = { layers: Number(m[1]), pointerMappers: Number(m[2]) };
@@ -1093,6 +1096,24 @@ async function inputProbe() {
         }
         return -1;
     };
+    // Until the canvas has not changed for sec seconds (or ms pass).
+    const stillFor = async (sec, ms) => {
+        const t = Date.now();
+        let prev = await rowSig();
+        let since = Date.now();
+        while (Date.now() - t < ms) {
+            await sleep(3000);
+            const now = await rowSig();
+            const diff = now.reduce((n, v, i) => n + (Math.abs(v - prev[i]) > 200 ? 1 : 0), 0);
+            prev = now;
+            if (diff > 4) {
+                since = Date.now();
+            } else if (Date.now() - since >= sec * 1000) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+        }
+        return -1;
+    };
     const touchResult = { swipe: null };
     // How much of the canvas differs between two looks (48x80 samples).
     const canvasSample = () => page.evaluate(() => {
@@ -1225,8 +1246,13 @@ async function inputProbe() {
             log(`INPUT PROBE: the Settings list ${listS < 0 ? 'stayed empty for 480 s' : `was drawn after ${listS} s`}`);
         }
         if (settingsS >= 0 && touchResult.settings.listS >= 0) {
-            const settled = await still(120000);
+            // The list goes on filling in its summaries after it shows, and
+            // Settings' main thread with it: wait until nothing changed for
+            // 15 s (in 44096770993 the probe swiped 9 s after the list
+            // showed, and nothing moved).
+            const settled = await stillFor(15, 240000);
             const top = await rowSig();
+            const topSample = await canvasSample();
             await shot('settings', true);
             // From 640 to 280 of Android's 800 rows, in 1.2 s, then a rest
             // before the lift (no fling): the list should follow the finger.
@@ -1239,31 +1265,48 @@ async function inputProbe() {
             }
             await sleep(1500);
             await page.touchscreen.touchEnd();
-            const quiet = await still(120000);
+            // A busy main thread takes the touches late: wait up to 60 s
+            // for the list to move (10% of the screen) before measuring.
+            const movedS = await changeFrom(topSample, 10, 60000);
+            const quiet = await stillFor(9, 120000);
             const moved = vshift(top, await rowSig());
             touchResult.swipe = { fingerPx: 360, listPx: moved.shift, matchErr: moved.err, unmovedErr: moved.err0,
-                settledS: settled, quietS: quiet };
+                settledS: settled, movedS, quietS: quiet };
             log(`INPUT PROBE: swipe on Settings: the list moved ${moved.shift === null ? 'farther than 640 px or not at all'
                 : `${moved.shift} px`} for a finger moved 360 px (row match ${moved.err}, unmoved ${moved.err0}); ` +
-                `screen still after ${quiet} s`);
+                `the screen changed after ${movedS} s and was still after ${quiet} s more`);
             await shot('after-swipe', true);
-            // The mouse wheel over the list, up three notches: the page drags
-            // with a finger of its own (web/js/input.js), so the list moves
-            // back down, and the finger lifts by itself.
+            // The mouse wheel over the list, three notches: the page drags
+            // with a finger of its own (web/js/input.js), which lifts by
+            // itself.  Up (the list back down) if the swipe moved it, else
+            // down, since a list at its top cannot go further up.
+            const back = moved.shift !== null && Math.abs(moved.shift) > 20;
             const swiped = await rowSig();
+            const swipedSample = await canvasSample();
             const [wx, wy] = at(240, 400 * (r.ch || 800) / 800);
             await page.mouse.move(wx, wy);
             for (let i = 0; i < 3; i++) {
-                await page.mouse.wheel({ deltaY: -100 });
+                await page.mouse.wheel({ deltaY: back ? -100 : 100 });
                 await sleep(100);
             }
-            const wquiet = await still(120000);
+            const wmovedS = await changeFrom(swipedSample, 10, 60000);
+            const wquiet = await stillFor(9, 120000);
             const wheeled = vshift(swiped, await rowSig());
-            touchResult.wheel = { wheelPx: -300, listPx: wheeled.shift, matchErr: wheeled.err, quietS: wquiet };
-            log(`INPUT PROBE: mouse wheel up 3 notches on Settings: the list moved ${wheeled.shift === null
+            touchResult.wheel = { wheelPx: back ? -300 : 300, listPx: wheeled.shift, matchErr: wheeled.err,
+                movedS: wmovedS, quietS: wquiet };
+            log(`INPUT PROBE: mouse wheel ${back ? 'up' : 'down'} 3 notches on Settings: the list moved ${wheeled.shift === null
                 ? 'farther than 640 px or not at all' : `${wheeled.shift} px`} (row match ${wheeled.err}); ` +
-                `screen still after ${wquiet} s`);
+                `the screen changed after ${wmovedS} s`);
             await shot('after-wheel', true);
+            // The guest's side: touches the input dispatcher dropped, or
+            // that Settings took long over (lines of the serial console).
+            marks.inlog = null;
+            await send('logcat -d -b main -b system | grep -E "InputDispatcher|Dropp|spent [0-9.]+ms|ANR in|' +
+                'Skipped [0-9]+ frames" | tail -25; echo INLOGDONE:$((1+1)):END\r');
+            for (let i = 0; i < 24 && !marks.inlog; i++) {
+                await sleep(5000);
+            }
+            log(`INPUT PROBE: the guest's input log ${marks.inlog ? 'is in the serial lines above' : 'did not come in 120 s'}`);
             if (probePinch) {
                 await pinch();
             }
