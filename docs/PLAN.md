@@ -847,6 +847,67 @@ usage limit stopped them.
    `virtio-multitouch-pci`), so that taps and swipes behave like touch.
 4. The uncaught longjmp after a tap.
 
+**Twelfth round: memory, the crash and surfaceflinger (2026-11-17).**
+Three agents on Opus (branches `swarm/webkit-memory`, `swarm/qemu-crash`,
+`swarm/guest-cpu`).
+
+- WebKit's memory (merge 46b96a9). JavaScriptCore counts the shared
+  WebAssembly memory as live in every worker's heap (once as the memory's
+  extra memory, once as its buffer), so a busy worker collects only after
+  allocating about as much again: gigabytes. Two sources of garbage did
+  the allocating: libffi's `ffi_call_js`, through which the interpreter
+  called every helper (about 900,000 calls a second during a launch, an
+  argument array, BigInts and three Asyncify-wrapped exports each), and
+  QEMU's main loop, whose `poll()` never waits under Emscripten (about
+  50,000 polls a second with the guest idle). Patch 0015 calls helpers
+  through a pointer of their own WebAssembly type, from a switch generated
+  by `build/gen-tci-calls.py` over the 765 signatures plus Int128
+  (checked against libffi and clang's wasm32 calls by
+  `tests/tci-calls-test.py`); patch 0017 makes the main loop wait on a
+  futex (at most 8 ms, woken by `event_notifier_set()`). In WebKit during
+  a Gallery start: peak 7.3 GB before, 2.2 GB after at the phones'
+  `jitcap=4000` (2.5 GB at 15000), steady 4.8 GB before, 2.2 GB after;
+  the page's thread 75% busy before, 5% after. Chrome stays at 2 GB.
+  Typing echo, disk reads and resume unchanged (runs 44000239102,
+  44009013916, 44011396295). Whether WebKit opens Gallery slower with
+  0015 v2 than with v1 is being measured in one job.
+- The crash (merge afa5fc8): Emscripten's setjmp emulation calls
+  `cpu_exec_loop()` through a JavaScript `invoke_iii` that saves the C
+  stack pointer when entered; Asyncify enters it again on each rewind
+  after the JIT's `emscripten_sleep(0)` (every 50,000 blocks while the JIT
+  is at its cap), and each longjmp it caught left the stack lower, until
+  the vCPU walked off its 64 KiB stack into its TLS block, whose last
+  words are `__THREW__` and `__threwValue` ("Uncaught Infinity").
+  Reproduced without QEMU (`tests/boot/sjlj-drift.c`). Patch 0016 puts the
+  stack pointer back where a longjmp lands and gives vCPU threads 1 MiB.
+  Crashes: 2 of 4 full boots unfixed at `timescale=16`, 0 of 12 full boots
+  and 0 of 4 resumes fixed; no measurable cost. One fixed full boot froze
+  after 6 minutes with the page's own polls slowed to a minute: not
+  explained, watch for it.
+- surfaceflinger (`swarm/guest-cpu`, not merged yet): while a layer
+  change waits for another layer's frame (`deferTransactionUntil`, used
+  by SurfaceView), Android 9's surfaceflinger asks for a traversal on
+  every vsync and each one is a full SwiftShader composition in a
+  SCHED_FIFO thread: in 6 of 8 native Gallery starts it composed 290 to
+  430 times at about 80% of the CPU for 56 to 101 s. A 2-byte change to
+  `libsurfaceflinger.so` applied by the boot diet (`sffix=`) applies such
+  a change at once: 0 of 8 starts looped, quiet after 18 to 30 s, a
+  quarter of the guest CPU per start, the same final screen.
+- Latent, not yet fixed: the wasm32 backend's per-block thread-local
+  arrays (`target_helper_types[200]`, `current_label[100]`, in
+  tcg/tcg.c and tcg-target.c.inc) are bounded only by `tcg_debug_assert`,
+  which this build compiles to `__builtin_unreachable()`; a block with
+  some 25 to 30 helper signatures (SSE-heavy code) overruns them and
+  corrupts that block's branches.
+
+**Next steps:**
+
+1. Merge surfaceflinger's fix after its browser A/B, then a new snapshot.
+2. On the iPhone: Gallery with the new build, and whether the tab
+   survives at `jitcap=4000` and 15000.
+3. Bound the wasm32 backend's per-block arrays.
+4. A real touchscreen (`virtio-multitouch-pci`).
+
 ## 8. Open questions for the first real run
 
 - Exact size of `system.sfs` and of the `.wasm` (section 4).
