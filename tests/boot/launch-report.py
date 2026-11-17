@@ -35,11 +35,16 @@ def main(args):
             except ValueError:
                 result = None
         cpu = re.search(r"^\[\d+:\d+\] host CPU: (.*)$", log, re.M)
+        # Android's own "Displayed" time for Gallery (guest time), the last
+        # one in the log (the probe greps the log at the end of the visit).
+        shown = re.findall(r"Displayed com\.android\.gallery3d/\S+: \+(?:(\d+)s)?(\d+)ms", log)
+        if result is not None:
+            result["displayedS"] = round(int(shown[-1][0] or 0) + int(shown[-1][1]) / 1000, 1) if shown else None
         rows.append((label, result, cpu.group(1).strip() if cpu else "?"))
     measured = [r for r in rows if r[1]]
     print(f"ok: {len(measured)} of {len(rows)} launches measured" if measured else f"failed: none of {len(rows)} launches measured")
     print()
-    print("| visit | host CPU | screen changed s | screen timeline | drawn (event log) s | Android's launch time s | focused at end "
+    print("| visit | host CPU | screen changed s | screen timeline | drawn (event log) s | Android's Displayed (guest s) | focused at end "
           "| guest busy ticks | display updates | top processes (ticks) | top threads | JIT compiled |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for label, r, cpu in rows:
@@ -51,7 +56,7 @@ def main(args):
         threads = ", ".join(f"{name} {ticks}" for name, ticks in (c.get("threads") or [])[:5])
         jit = r.get("jit") or {}
         print(f"| {label} | {r.get('hostCpu', cpu)} | {r.get('screenChangedS')} | {r.get('screenTimeline', '')} "
-              f"| {r.get('firstFrameS')} | {r.get('launchTimeWallS')} | {r.get('focusedAtEnd')} "
+              f"| {r.get('firstFrameS')} | {r.get('displayedS')} | {r.get('focusedAtEnd')} "
               f"| {c.get('busy', '')} | {c.get('displayUpdates', '')} | {top} | {threads} | {jit.get('compiled', '')} |")
     after = [(label, r) for label, r, _ in rows if r and (r.get("cpuAfterContent") or r.get("anr"))]
     if after:

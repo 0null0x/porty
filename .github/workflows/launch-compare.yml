@@ -12,9 +12,11 @@
 # as debug.hwui.renderer, or scheduling), " @@ " between variants.  Page parameters that shape the machine veto the
 # resume and boot instead (web/js/snapshot.js, MACHINE_PARAMS).
 #
-# With baseline_ref (e.g. main), the job also assembles that ref's site
-# with that ref's snapshot and visits both alternately: guest-side changes
-# need a snapshot of their own, and this compares them on one runner.
+# With baseline_ref (e.g. main, or a commit), the job also assembles that
+# ref's site with that ref's own QEMU-Wasm build, image and snapshot (from
+# the caches its own files key) and visits both alternately: guest-side
+# changes need a snapshot of their own, and this compares them on one
+# runner.  The log lists the QEMU patches in which the two refs differ.
 #
 #   gh workflow run launch-compare.yml -R <owner>/<repo> --ref swarm/<you> \
 #     -f queries='wasmmem=1280&jitcap=15000;wasmmem=1280&jitcap=15000&jitgc=0' -f rounds=2
@@ -151,15 +153,50 @@ jobs:
           path: base
           persist-credentials: false
 
-      # The baseline's snapshot, under the key its own files give (the same
-      # key snapshot.yml saved it under) and at the path snapshot.yml saved
-      # it from: a cache entry is only found with the same path.  The test
-      # site has its own copy in dist by now.
-      - name: Make room for the baseline's snapshot
-        id: base-room
+      # The baseline's own QEMU-Wasm build, image and snapshot, under the
+      # keys its own files give (those build-and-deploy.yml and snapshot.yml
+      # saved them under) and at the paths they were saved from: a cache
+      # entry is only found with the same path.  The test site has its own
+      # copies in dist by now.
+      - name: Read the baseline's pinned versions
+        id: base-versions
         if: steps.base-checkout.outcome == 'success'
         continue-on-error: true
-        run: rm -rf out/artifact/snapshot
+        run: |
+          source base/build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+          } >> "$GITHUB_OUTPUT"
+          git -C base log -1 --oneline
+          echo "QEMU patches only in the test ref:"; diff <(ls patches/qemu-wasm) <(ls base/patches/qemu-wasm) | sed -n 's/^< /  /p'
+          echo "QEMU patches only in the baseline:"; diff <(ls patches/qemu-wasm) <(ls base/patches/qemu-wasm) | sed -n 's/^> /  /p'
+          echo "changed patches:"; for f in $(ls base/patches/qemu-wasm); do [[ -f patches/qemu-wasm/$f ]] && ! cmp -s patches/qemu-wasm/$f base/patches/qemu-wasm/$f && echo "  $f"; done || true
+
+      - name: Make room for the baseline's builds
+        id: base-room
+        if: steps.base-versions.outcome == 'success'
+        continue-on-error: true
+        run: rm -rf out/artifact/snapshot out/qemu out/image
+
+      - name: Restore the baseline's QEMU-Wasm build
+        id: base-qemu
+        if: steps.base-room.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.base-versions.outputs.qemu_commit }}-${{ steps.base-versions.outputs.wasm_memory_mb }}-${{ hashFiles('base/patches/qemu-wasm/**', 'base/build/build-qemu.sh', 'base/build/pc-bios.list', 'base/scripts/wasm-info.py') }}
+
+      - name: Restore the baseline's Android image
+        id: base-image
+        if: steps.base-room.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.base-versions.outputs.iso_sha1 }}-${{ hashFiles('base/scripts/prepare-image.sh', 'base/scripts/slim-system.py', 'base/build/slim-remove.list', 'base/build/versions.env') }}
 
       - name: Restore the baseline's resume snapshot
         id: base-snapshot
@@ -168,16 +205,14 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/artifact/snapshot
-          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('base/scripts/prepare-image.sh', 'base/scripts/slim-system.py', 'base/build/slim-remove.list', 'base/build/versions.env') }}-${{ hashFiles('base/patches/qemu-wasm/**') }}-${{ hashFiles('base/web/js/qemu-args.js', 'base/web/js/config.js', 'base/web/js/boot-diet.js', 'base/web/js/initramfs.js', 'base/scripts/snapshot/**') }}
+          key: android-snapshot-${{ steps.base-versions.outputs.iso_sha1 }}-${{ hashFiles('base/scripts/prepare-image.sh', 'base/scripts/slim-system.py', 'base/build/slim-remove.list', 'base/build/versions.env') }}-${{ hashFiles('base/patches/qemu-wasm/**') }}-${{ hashFiles('base/web/js/qemu-args.js', 'base/web/js/config.js', 'base/web/js/boot-diet.js', 'base/web/js/initramfs.js', 'base/scripts/snapshot/**') }}
 
       - name: Assemble the baseline's site
         id: base-site
-        if: steps.base-snapshot.outputs.cache-hit == 'true'
+        if: steps.base-snapshot.outputs.cache-hit == 'true' && steps.base-qemu.outputs.cache-hit == 'true' && steps.base-image.outputs.cache-hit == 'true'
         continue-on-error: true
         run: |
-          # Same QEMU-Wasm build and image, or the comparison means nothing.
-          cmp -s build/versions.env base/build/versions.env
-          diff -r -q patches/qemu-wasm base/patches/qemu-wasm
+          # The baseline's own QEMU-Wasm build, image and snapshot.
           (cd base/web && npm ci --ignore-scripts --no-audit --no-fund)
           base/scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist-base \
             --id "$(git -C base rev-parse HEAD)" --snapshot out/artifact/snapshot
