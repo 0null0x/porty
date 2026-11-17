@@ -1,11 +1,11 @@
 {
   "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only). apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start.",
   "base": "mem=768&tb=128&cache=16",
-  "run": ["base", "hwui-opengl", "res360", "nojit"],
+  "run": ["base", "res360"],
   "jobs": 2,
   "rounds": 1,
   "apps": [
-    {"name": "gallery", "how": "tap", "x": 0.3125, "y": 0.70625, "component": "com.android.gallery3d/.app.GalleryActivity", "times": 3},
+    {"name": "gallery", "how": "tap", "x": 0.3125, "y": 0.70625, "component": "com.android.gallery3d/.app.GalleryActivity", "times": 2},
     {"name": "settings", "how": "start", "component": "com.android.settings/.Settings", "times": 2}
   ],
   "variants": {

@@ -122,7 +122,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xorriso squashfs-tools e2fsprogs qemu-utils cpio \
-            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv
+            ninja-build pkg-config libglib2.0-dev zlib1g-dev libfdt-dev python3-venv gdb
 
       - name: Check out QEMU-Wasm and apply the Porty patches
         id: patches
@@ -226,7 +226,7 @@ jobs:
               --argv-file "out/gc/$v/argv-native.txt" \
               --work "out/gc/$v/boot" --cpu "$CPU" --query "$QUERY" \
               --pcpu out/gc/pcpu.sh --plan tests/guest-cpu-variants.json --variant "$v" \
-              --facts "$first" --show-screens "$first" || true
+              --facts "$first" --show-screens "$first" --profile "$first" || true
             first=0
           done
 

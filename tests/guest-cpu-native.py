@@ -160,7 +160,7 @@ class Guest:
         return self.vm.sh(command, timeout)
 
     def cpu(self, tag, threads=False, timeout=240):
-        status, text = self.sh(f"pcpu {tag}{' threads' if threads else ''}", timeout)
+        status, text = self.sh(f"pcpu {tag} {'threads' if threads else 'procs'} frames", timeout)
         s = parse_cpu(text, tag)
         if not s["done"]:
             log(f"cpu snapshot {tag}: incomplete (status {status})")
@@ -233,13 +233,15 @@ def launch(g, app, opts, index):
     vm = g.vm
     component = app["component"]
     package = component.split("/")[0]
-    out = {"app": app["name"], "how": app["how"], "index": index}
+    out = {"app": app["name"], "how": app["how"], "index": index, "component": component}
     g.sh(f"am force-stop {package}", 60)
+    out["anr_dismissed"] = dismiss_anr(vm)
     out["focus_before"] = g.focus()
     out["quiet_before_s"] = g.quiet(timeout=90)
     before_events = g.sh(f"grep -c 'am_activity_launch_time.*{package}' /data/local/tmp/porty-ev.txt", 30)[1].strip()
     seen = int(before_events) if before_events.isdigit() else 0
     _, base = screen_diff(vm, "base", None)
+    g.sh("dumpsys SurfaceFlinger --timestats -enable -clear > /dev/null 2>&1; dumpsys SurfaceFlinger --latency-clear > /dev/null 2>&1", 120)
     a = g.cpu("a", threads=True)
     t0 = time.monotonic()
     if app["how"] == "tap":
@@ -249,6 +251,7 @@ def launch(g, app, opts, index):
     drawn = None
     changed = None
     timeline = []
+    shots = [5, 15, 30, 60, 90, 120, 160]
     prev = g.stat()
     calm = 0
     quiet_at = None
@@ -264,6 +267,9 @@ def launch(g, app, opts, index):
         diff, _ = screen_diff(vm, "now", base)
         if changed is None and diff >= 40:
             changed = now_t
+        if index == 1 and shots and now_t >= shots[0]:
+            shot_at = shots.pop(0)
+            vm.screenshot(f"{app['name']}-{index}-t{shot_at}", show=opts.show_screens)
         if m:
             v = [int(x) for x in m.group(1).split()]
             cur = (sum(v[:8]), v[3] + v[4])
@@ -276,6 +282,14 @@ def launch(g, app, opts, index):
             quiet_at = now_t
             break
     b = g.cpu("b", threads=True)
+    out["sf_timestats"] = g.sh("dumpsys SurfaceFlinger --timestats -dump -maxlayers 16 2>&1 | grep -E"
+                               " 'layerName|totalFrames|droppedFrames|missedFrames|clientCompositionFrames|statsStart|statsEnd'"
+                               " | cut -c1-150", 120)[1]
+    # Frames per layer since the clear: lines of three non-zero times.
+    out["sf_latency"] = g.sh("dumpsys SurfaceFlinger --list | while read -r n; do"
+                             " echo \"LAT|$(dumpsys SurfaceFlinger --latency \"$n\" | tail -n +2 | grep -c '^[1-9]')|$n\"; done"
+                             " | grep -v '^LAT|0|' | cut -c1-120", 300)[1]
+    log("    sf frames per layer (latency): " + " | ".join(line.strip() for line in out["sf_latency"].split("\n") if line.strip())[:3000])
     out["drawn_s"] = drawn
     out["screen_changed_s"] = changed
     out["quiet_s"] = quiet_at
@@ -293,12 +307,80 @@ def launch(g, app, opts, index):
     if d:
         for t in d["threads"][:14]:
             log(f"    thread {t['proc']}/{t['comm']} (nice {t['nice']}, policy {t['policy']}): {t['ticks']}")
+    log("    sf timestats: " + " | ".join(line.strip() for line in out["sf_timestats"].split("\n") if line.strip())[:3000])
     gfx = g.sh(f"dumpsys gfxinfo {package} | grep -e 'Total frames' -e 'Janky' -e 'Pipeline' -e '90th' | cut -c1-120", 120)[1]
     out["gfxinfo"] = gfx
     g.sh("input keyevent 3", 60)
     prov.wait(vm, 2)
     out["quiet_home_s"] = g.quiet(timeout=90)
     return out
+
+
+def profile(g, app, opts, result):
+    """One more start of `app`, sampled by simpleperf (cpu-clock, every CPU),
+    reported by process, by library and by symbol."""
+    vm = g.vm
+    package = app["component"].split("/")[0]
+    out = {}
+    g.sh(f"am force-stop {package}", 60)
+    g.quiet(timeout=90)
+    _, base = screen_diff(vm, "base", None)
+    del base
+    g.sh("echo 0 > /proc/sys/kernel/kptr_restrict; echo -1 > /proc/sys/kernel/perf_event_paranoid; rm -f /data/local/tmp/perf.data", 30)
+    g.sh(f"(simpleperf record -a -e cpu-clock -f {opts.profile_hz} --duration {opts.profile_seconds} "
+         f"-o /data/local/tmp/perf.data > /data/local/tmp/perf.log 2>&1 &)", 30)
+    prov.wait(vm, 2)
+    if app["how"] == "tap":
+        tap(vm, app["x"], app["y"])
+    else:
+        vm.sh(f"(am start -n {app['component']} > /dev/null 2>&1 &)", 30)
+    prov.wait(vm, opts.profile_seconds + 5)
+    for _ in range(30):
+        status, text = g.sh("pidof simpleperf || echo done", 30)
+        if "done" in text:
+            break
+        prov.wait(vm, 5)
+    out["record"] = g.sh("cat /data/local/tmp/perf.log | tail -5", 30)[1]
+    for key, sort, limit in (("by_process", "comm", 0.5), ("by_dso", "comm,dso", 0.7), ("by_symbol", "comm,dso,symbol", 0.4)):
+        status, text = g.sh(f"simpleperf report -i /data/local/tmp/perf.data --sort {sort} --percent-limit {limit} 2>&1"
+                            f" | head -70 | cut -c1-200", 600)
+        out[key] = text
+        log(f"profile {app['name']} {key}:\n{text}")
+    g.sh("input keyevent 3", 60)
+    prov.wait(vm, 2)
+    g.quiet(timeout=90)
+    result["profile"] = out
+
+
+def set_time_scale(vm, scale):
+    """The page's time dilation (patch 0011, ?timescale=), which the native
+    QEMU has but no option for: gdb calls porty_set_time_scale() in the
+    running process, as the page calls the wasm export before the guest
+    runs.  Without it Android's timeouts fire natively all the time
+    ("System UI isn't responding" over the launcher)."""
+    import subprocess
+    try:
+        out = subprocess.run(["sudo", "-n", "gdb", "-p", str(vm.proc.pid), "-batch", "-nx",
+                              "-ex", f"call (int)porty_set_time_scale({int(scale)})"],
+                             capture_output=True, text=True, timeout=120)
+        text = (out.stdout + out.stderr).strip().split("\n")
+        got = next((line for line in reversed(text) if line.startswith("$")), "")
+        log(f"time scale {scale} via gdb: {got or text[-3:]}")
+        return got
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"time scale via gdb failed: {e}")
+        return f"error: {e}"
+
+
+def dismiss_anr(vm):
+    """End the processes Android shows an "isn't responding" dialog for (as
+    make-snapshot.py does before it saves); returns their names."""
+    status, windows = vm.sh("dumpsys window windows | grep -o 'Application Not Responding: [A-Za-z0-9_.]*' | sort -u", 180)
+    anrs = sorted(set(re.findall(r"Application Not Responding: ([A-Za-z0-9_.]+)", windows if status == 0 else "")))
+    if anrs:
+        vm.sh("; ".join(f"kill $(pidof {p})" for p in anrs) + "; echo killed", 120)
+        prov.wait(vm, 20)
+    return anrs
 
 
 def settle(vm, opts, result):
@@ -340,8 +422,12 @@ def main():
     ap.add_argument("--boot-timeout", type=float, default=2400)
     ap.add_argument("--settle", type=float, default=180)
     ap.add_argument("--max-load", type=float, default=1.5)
-    ap.add_argument("--launch-timeout", type=float, default=240)
+    ap.add_argument("--launch-timeout", type=float, default=180)
     ap.add_argument("--show-screens", type=int, default=0)
+    ap.add_argument("--timescale", type=int, default=8, help="the page's time dilation, set through gdb (1: none)")
+    ap.add_argument("--profile", type=int, default=0, help="1: one more start of the first app, sampled by simpleperf")
+    ap.add_argument("--profile-seconds", type=int, default=60)
+    ap.add_argument("--profile-hz", type=int, default=1000)
     opts = ap.parse_args()
     with open(opts.plan, encoding="utf-8") as f:
         plan = json.load(f)
@@ -359,6 +445,8 @@ def main():
               "milestones": {}, "launches": [], "guest": {}}
     vm = snap.Machine(opts.qemu, argv, opts.work)
     log("QEMU started: " + " ".join(vm.args))
+    if opts.timescale > 1:
+        result["timescale"] = set_time_scale(vm, opts.timescale)
     g = Guest(vm, pcpu)
 
     def run(key, command, timeout=240):
@@ -406,6 +494,9 @@ def main():
                         index = rnd * app.get("times", 1) + i + 1
                         result["launches"].append(launch(g, app, opts, index))
                         snap.write_json(os.path.join(opts.work, "result.json"), result)
+            if opts.profile and apps:
+                profile(g, apps[0], opts, result)
+                snap.write_json(os.path.join(opts.work, "result.json"), result)
             result["reboots"] = list(vm.reboots)
             run("crashes", "logcat -b crash -d | grep -e 'Process: ' -e '>>> ' | cut -c1-200 | head -20")
             run("anr", "logcat -b events -d | grep -c am_anr")

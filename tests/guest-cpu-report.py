@@ -60,10 +60,13 @@ def main(paths):
             if not runs:
                 print(f"| {r.get('variant')} | {r.get('booted_seconds', 'no boot')} | {r.get('error', '')[:80]} |||||||||||")
                 continue
+            # The app's process: new, named after the package (/proc's comm
+            # is the last 15 characters of the process name).
+            package = (x.get("component") or "").split("/")[0] if (x := runs[0]) else ""
             app_names = set()
             for x in runs:
                 for p in (x.get("cpu") or {}).get("procs", []):
-                    if p.get("new") and p["comm"].startswith("com.") and p["comm"] not in ("com.android.systemui",):
+                    if p.get("new") and package and package.endswith(p["comm"]):
                         app_names.add(p["comm"])
             threads = {}
             for x in runs:
