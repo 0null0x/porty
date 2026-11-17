@@ -18,6 +18,16 @@ Patch 0027 then changes porty_tci_call_code() and the declaration of
 porty_tci_call_direct() in it, so that the interpreter inlines the switch
 (for JavaScriptCore); keep its hunks applying when this template changes.
 
+The cases are split into one function per return kind and argument count
+(24 functions, the largest with 128 cases, about 18 KB of WebAssembly)
+behind a small switch on both.  JavaScriptCore never compiles a function
+whose body is larger than Options::maximumOMGCandidateCost (40000 bytes in
+WebKit 2.48, 100000 since) with its optimizing tier, and one switch over all
+765 signatures was 106 KB: in Safari every helper call of the interpreter
+went through baseline code.  They are called through a table of pointers:
+Binaryen, which Emscripten runs on the linked module, inlines any function
+that has a single direct caller, whatever its size and attributes.
+
 usage: build/gen-tci-calls.py > tcg/wasm32-tci-calls.h
 """
 import sys
@@ -172,11 +182,17 @@ static bool porty_tci_call_code(int code, unsigned nargs, void *f, void *ret, vo
 
 /*
  * Call f with the arguments av[0..n) point to and put its result where
- * libffi would (4 bytes at ret for an i32, 8 for an i64); false if the
- * switch has no case for the code.
+ * libffi would (4 bytes at ret for an i32, 8 for an i64); false if no
+ * case has the code.  One function per return kind r and argument count n
+ * switches on the mask of 64-bit arguments.  They are small enough for
+ * JavaScriptCore's optimizing tier, which never compiles a function body
+ * over Options::maximumOMGCandidateCost bytes (40000 in WebKit 2.48,
+ * 100000 since); one switch over every signature was 106 KB.  They are
+ * called through a table of pointers: Binaryen, which Emscripten runs on
+ * the linked module, inlines every function with a single direct caller
+ * whatever its size or attributes, and merged direct calls back into one
+ * function of 95 KB.
  */
-static bool porty_tci_call_direct(int code, void *f, void *ret, void **av)
-{
 #define I_ uint32_t
 #define J_ uint64_t
 #define a_(i) (*(I_ *)av[i])
@@ -184,28 +200,41 @@ static bool porty_tci_call_direct(int code, void *f, void *ret, void **av)
 #define V_(...) ((void (*)(__VA_ARGS__))f)
 #define W_(...) *(I_ *)ret = ((I_ (*)(__VA_ARGS__))f)
 #define X_(...) *(J_ *)ret = ((J_ (*)(__VA_ARGS__))f)
-    switch (code) {
 """ % MAX_ARGS)
     count = 0
     for r in (0, 1, 2):
         for n in range(MAX_ARGS + 1):
+            out.write(f'static __attribute__((noinline)) bool porty_tci_call_r{r}n{n}(int mask, void *f, void *ret, void **av)\n'
+                      '{\n    switch (mask) {\n')
             for mask in range(1 << n):
                 params = ', '.join('J_' if mask >> i & 1 else 'I_' for i in range(n)) or 'void'
                 args = ', '.join(f'b_({i})' if mask >> i & 1 else f'a_({i})' for i in range(n))
-                code = r << 10 | n << 7 | mask
-                out.write(f'    case {code}: {RET[r]}({params})({args}); break;\n')
+                out.write(f'    case {mask}: {RET[r]}({params})({args}); break;\n')
                 count += 1
-    out.write("""    default:
-        return false;
-    }
-    return true;
-#undef I_
+            out.write('    default:\n        return false;\n    }\n    return true;\n}\n\n')
+    out.write("""#undef I_
 #undef J_
 #undef a_
 #undef b_
 #undef V_
 #undef W_
 #undef X_
+
+static bool (*const porty_tci_call_rn[%d])(int mask, void *f, void *ret, void **av) = {
+""" % (3 * (MAX_ARGS + 1)))
+    for r in (0, 1, 2):
+        for n in range(MAX_ARGS + 1):
+            out.write(f'    porty_tci_call_r{r}n{n},\n')
+    out.write("""};
+
+static bool porty_tci_call_direct(int code, void *f, void *ret, void **av)
+{
+    unsigned rn = (unsigned)code >> 7;
+
+    if (rn >= sizeof(porty_tci_call_rn) / sizeof(porty_tci_call_rn[0])) {
+        return false;
+    }
+    return porty_tci_call_rn[rn](code & 0x7f, f, ret, av);
 }
 """)
     print(f'{count} signatures', file=sys.stderr)
