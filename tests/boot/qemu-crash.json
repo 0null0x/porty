@@ -1,3 +1,3 @@
 {
-  "mode": "glue"
+  "mode": "sjlj"
 }

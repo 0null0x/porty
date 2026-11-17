@@ -14,6 +14,10 @@
 #                glue is instrumented (tests/boot/longjmp-trace.mjs) so that
 #                a longjmp that no setjmp frame will catch prints where it
 #                was thrown from.
+#   mode=sjlj    builds tests/boot/sjlj-drift.c with Emscripten 3.1.50 and
+#                runs it under Node: the same setjmp, Asyncify unwind and
+#                rewind, and longjmp as QEMU-Wasm's vCPU thread, without
+#                QEMU, with and without patch 0016's fix.
 #
 # A push of this file or of tests/boot/qemu-crash.json runs what that JSON
 # file says; a manual start takes the same settings as inputs:
@@ -33,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: glue or stress
+        description: glue, sjlj or stress
         type: string
         default: stress
       variants:
@@ -66,7 +70,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: qemu-crash-${{ github.ref }}-${{ github.event_name }}-${{ inputs.mode }}-${{ inputs.variants }}-${{ inputs.reps }}
+  group: qemu-crash-${{ github.ref }}-${{ github.event_name }}-${{ inputs.mode }}-${{ inputs.variants }}-${{ inputs.reps }}-${{ inputs.trace }}-${{ inputs.patches_from }}
   cancel-in-progress: false
 
 defaults:
@@ -170,6 +174,99 @@ jobs:
             gzip -9c "$f" | base64 -w 50000
             echo "-----END PORTY FILE-----"
           done
+
+  # The mechanism without QEMU: tests/boot/sjlj-drift.c, built with the
+  # Emscripten of QEMU-Wasm's toolchain image (3.1.50) and the same kind of
+  # flags (pthreads, Asyncify, longjmp emulated in JavaScript).
+  sjlj:
+    name: Emscripten longjmp after an Asyncify rewind
+    needs: setup
+    if: needs.setup.outputs.mode == 'sjlj'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/sjlj"
+          docker run --rm -v "$PWD/tests/boot:/src:ro" -v "$RUNNER_TEMP/sjlj:/out" \
+            emscripten/emsdk:3.1.50 \
+            emcc -O2 -g2 -pthread -sASYNCIFY -sPROXY_TO_PTHREAD -sEXIT_RUNTIME \
+              -sINITIAL_MEMORY=64MB -sENVIRONMENT=node,worker \
+              /src/sjlj-drift.c -o /out/sjlj-drift.js
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/sjlj"
+          ls -l "$RUNNER_TEMP/sjlj"
+
+      - name: Run
+        id: run
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP/sjlj"
+          node --version
+          while read -r name args; do
+            echo "::group::$name: $args"
+            set +e
+            timeout 120 node sjlj-drift.js $args > "$name.out" 2>&1
+            echo "exit $?" >> "$name.out"
+            set -e
+            cat "$name.out"
+            echo "::endgroup::"
+          done <<'EOF'
+          control none 0 0 50 0x01
+          sleep sleep 0 0 400 0x01
+          sleep-a5 sleep 0 0 400 0xa5
+          fiber fiber 0 0 400 0x01
+          sleep-fixed sleep 1 0 400 0x01
+          fiber-fixed fiber 1 0 400 0x01
+          sleep-1mib sleep 0 1024 400 0x01
+          EOF
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd "$RUNNER_TEMP/sjlj" 2>/dev/null || { echo "no build"; exit 0; }
+          python3 -I - ./*.out <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY" > summary.txt
+          import os, re, sys
+          print('## Emscripten longjmp after an Asyncify rewind\n')
+          for path in sys.argv[1:]:
+              text = open(path, errors='replace').read()
+              rounds = [(int(a), int(b), int(c)) for a, b, c in re.findall(r'round (\d+): stack pointer (-?\d+) bytes below where setjmp\(\) was, (-?\d+) above', text)]
+              code = re.findall(r'^exit (\d+)', text, re.M)
+              ok = 'SJLJ RESULT' in text
+              err = ''
+              for pattern in (r'out of bounds|RuntimeError|Aborted|unreachable', r'Infinity', r'error'):
+                  hits = [l.strip() for l in text.splitlines() if re.search(pattern, l, re.I) and not l.startswith('round ')]
+                  if hits:
+                      err = hits[0][:120]
+                      break
+              per = (rounds[-1][1] / rounds[-1][0]) if rounds else 0
+              last = rounds[-1] if rounds else (0, 0, 0)
+              print('- %s: %d rounds, stack pointer %d bytes lower after the last (%.0f per round), %d above the stack end; %s%s' % (
+                  os.path.basename(path)[:-4], last[0], last[1], per, last[2],
+                  'finished' if ok else 'DIED (exit %s)' % (code[-1] if code else '?'),
+                  (': ' + err) if err and not ok else ''))
+          EOF
+          cat summary.txt
+          state=success
+          grep -q -E '^- (sleep|sleep-a5|fiber): .*finished' summary.txt && state=failure
+          grep -q -E '^- (sleep-fixed|fiber-fixed|control|sleep-1mib): .*DIED' summary.txt && state=failure
+          desc="$(grep -E '^- (sleep|sleep-fixed):' summary.txt | sed 's/^- //; s/ rounds, stack pointer / rounds, sp -/; s/ bytes lower after the last//' | tr '\n' ' ' | cut -c1-139)"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="porty/crash sjlj" \
+            -f description="$desc" -f target_url="$RUN_URL" >/dev/null || true
+          exit 0
 
   stress:
     name: ${{ matrix.variant }} ${{ matrix.rep }}
