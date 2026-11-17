@@ -21,6 +21,7 @@ import { PCPU_FUNCTION, THREAD_PROCS, cpuDelta, describeCpu, parseCpuLine } from
     assert.equal(parseCpuLine('console:/ # pcpu() { t=$1; echo "CPS|$t|$(cut -d\' \' -f1 /proc/uptime)', store), false);
     assert.equal(parseCpuLine('echo "CP|$t|${l%% *}|$c|$((${12}+${13}))"; done', store), false);
     assert.equal(parseCpuLine('CPE|$t|$((1+1))', store), false);
+    assert.equal(parseCpuLine('echo "CPE|$t|$((1+1))|$$|$u|$s"; }', store), false);
     assert.equal(parseCpuLine('serial| something else', store), false);
     const s = store.get('before');
     assert.equal(s.done, true);
@@ -29,6 +30,15 @@ import { PCPU_FUNCTION, THREAD_PROCS, cpuDelta, describeCpu, parseCpuLine } from
     assert.equal(s.frames, 0x2e5);
     assert.equal(s.procs.size, 3);
     assert.deepEqual(s.threads.get(1138), { pid: 1138, comm: 'surfaceflinger', ticks: 4900, nice: -8, policy: 1 });
+    assert.equal(s.self, undefined, 'an end marker without the shell\'s pid');
+    // The end marker with the shell's pid, uptime and /proc/stat at the end.
+    assert.equal(parseCpuLine('CPE|after|2|1157|1250.75|cpu  130 5 60 1010 10 1 2 0 0 0', store, 9000), true);
+    const e = store.get('after');
+    assert.equal(e.done, true);
+    assert.equal(e.self, 1157);
+    assert.equal(e.endUptime, 1250.75);
+    assert.equal(e.endAt, 9000);
+    assert.deepEqual(e.endStat, [130, 5, 60, 1010, 10, 1, 2, 0, 0, 0]);
     // No frame count (service missing): -1.
     parseCpuLine('CPS|x|1.0|cpu  1 2 3 4 5 6 7 8|', store);
     assert.equal(store.get('x').frames, -1);
@@ -74,6 +84,31 @@ import { PCPU_FUNCTION, THREAD_PROCS, cpuDelta, describeCpu, parseCpuLine } from
     assert.equal(cpuDelta(null, store.get('b')), null);
     assert.equal(describeCpu(null), 'no CPU data');
 }
+{
+    // The snapshots' own work (in the shell, pid 1157) falls between CPS and
+    // CPE of each: the difference spans from a's CPE to b's CPS, and the
+    // shell's ticks are reported apart.
+    const store = new Map();
+    for (const [line, at] of [
+        ['CPS|a|100.0|cpu  1000 0 500 3000 0 0 0 0 0 0|', 1000],
+        ['CP|a|1138|surfaceflinger|800', 1000], ['CP|a|1157|sh|100', 1000],
+        ['CPE|a|2|1157|105.0|cpu  1400 0 600 3000 0 0 0 0 0 0', 41000],
+        ['CPS|b|115.0|cpu  2200 0 700 3100 0 0 0 0 0 0|', 121000],
+        ['CP|b|1138|surfaceflinger|1300', 121000], ['CP|b|1157|sh|600', 121000], ['CP|b|3000|droid.gallery3d|150', 121000],
+        ['CPE|b|2|1157|120.0|cpu  2600 0 800 3100 0 0 0 0 0 0', 161000],
+    ]) {
+        assert.equal(parseCpuLine(line, store, at), true, line);
+    }
+    const d = cpuDelta(store.get('a'), store.get('b'));
+    assert.equal(d.total, 1000, 'from the end of a (1400+600+3000) to the start of b (2200+700+3100)');
+    assert.equal(d.busy, 900);
+    assert.equal(d.guestSeconds, 10);
+    assert.equal(d.wallSeconds, 80);
+    assert.equal(d.probeTicks, 500);
+    assert.deepEqual(d.procs.map((p) => [p.comm, p.ticks]), [['surfaceflinger', 500], ['droid.gallery3d', 150]]);
+    assert.equal(d.uncounted, 900 - 650);
+    assert.match(describeCpu(d), /surfaceflinger 500 \(55\.6%\), droid\.gallery3d\* 150 \(16\.7%\).*; the probe's own shell 500 more \(its snapshots, not counted\)$/);
+}
 
 // --- the shell function on this machine --------------------------------------
 if (existsSync('/proc/self/stat') && existsSync('/proc/stat')) {
@@ -96,6 +131,9 @@ if (existsSync('/proc/self/stat') && existsSync('/proc/stat')) {
         }
         const s = store.get('t1');
         assert.ok(s && s.done, `${shell}: end marker`);
+        assert.ok(Number.isInteger(s.self) && s.self > 1, `${shell}: the shell's pid in the end marker`);
+        assert.ok(s.endStat && s.endStat.length >= 8 && s.endUptime > 0, `${shell}: /proc/stat and uptime at the end`);
+        assert.ok(s.endStat[0] >= s.stat[0], `${shell}: the end comes after the start`);
         assert.ok(s.stat.length >= 8, `${shell}: /proc/stat`);
         assert.ok(s.procs.size >= 2, `${shell}: processes`);
         assert.ok(s.procs.has(1), `${shell}: pid 1`);

@@ -9,10 +9,17 @@
 //   CP|tag|pid|comm|user+system ticks           one per process
 //   CT|tag|pid|tid|comm|ticks|nice|policy        with "threads": one per
 //                                                thread of THREAD_PROCS
-//   CPE|tag|2                                    the end
+//   CPE|tag|2|shell pid|uptime|cpu line of /proc/stat   the end
 // The frame count is surfaceflinger's transaction 1013, the display's page
 // flip count: one per composed frame.  Ticks are 1/100 s of the guest's own
 // (dilated) time.  mksh (Android's /system/bin/sh), also bash and dash.
+//
+// A snapshot itself takes the guest seconds (in the browser, 10-50 s of
+// wall time), all of them in the shell that runs it.  So the difference of
+// two snapshots spans from the end of the first (CPE's /proc/stat) to the
+// start of the second (CPS's), and the shell that ran them is reported on
+// its own (probeTicks), not as a process of the guest: its ticks are mostly
+// its own snapshots, read at points that do not line up with that span.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // The processes whose threads are listed, by their /proc comm (the last 15
@@ -36,7 +43,7 @@ export const PCPU_FUNCTION = [
     'done 2>/dev/null; ',
     'if [ "$w" = threads ]; then for p in $n; do for f in /proc/$p/task/[0-9]*/stat; do ', STAT,
     'echo "CT|$t|$p|${l%% *}|$c|$((${12}+${13}))|${17}|${39}"; done; done 2>/dev/null; fi; ',
-    'echo "CPE|$t|$((1+1))"; }',
+    'read -r u x < /proc/uptime; read -r s < /proc/stat; echo "CPE|$t|$((1+1))|$$|$u|$s"; }',
 ].join('');
 
 /** Parse one line of pcpu output into `store` (tag -> snapshot); false if it is none. */
@@ -69,9 +76,16 @@ export function parseCpuLine(line, store, now = Date.now()) {
         });
         return true;
     }
-    m = /^CPE\|([a-z0-9]+)\|2\s*$/.exec(line);
+    m = /^CPE\|([a-z0-9]+)\|2(?:\|(\d+)\|([\d.]+)\|cpu\s+([\d ]+))?\s*$/.exec(line);
     if (m) {
-        get(m[1]).done = true;
+        const s = get(m[1]);
+        s.done = true;
+        if (m[2]) {
+            s.self = Number(m[2]);
+            s.endAt = now;
+            s.endUptime = Number(m[3]);
+            s.endStat = m[4].trim().split(/\s+/).map(Number);
+        }
         return true;
     }
     return false;
@@ -79,14 +93,19 @@ export function parseCpuLine(line, store, now = Date.now()) {
 
 /**
  * The difference between two pcpu snapshots: the guest's ticks by kind
- * (/proc/stat), by process and by thread (largest first), and
- * surfaceflinger's frames.  A pid whose name changed counts as new.
+ * (/proc/stat, from the end of `a` to the start of `b`), by process and by
+ * thread (largest first), and surfaceflinger's frames.  A pid whose name
+ * changed counts as new.  The shell that ran the snapshots is not among the
+ * processes: its ticks are probeTicks.
  */
 export function cpuDelta(a, b) {
     if (!a || !b || !a.stat || !b.stat) {
         return null;
     }
-    const st = b.stat.map((v, i) => v - (a.stat[i] || 0));
+    const from = a.endStat || a.stat;
+    const st = b.stat.map((v, i) => v - (from[i] || 0));
+    const probe = new Set([a.self, b.self].filter((pid) => pid !== undefined));
+    let probeTicks = 0;
     // user nice system idle iowait irq softirq steal
     const total = st.slice(0, 8).reduce((x, y) => x + y, 0);
     const idle = (st[3] || 0) + (st[4] || 0);
@@ -96,7 +115,9 @@ export function cpuDelta(a, b) {
         const before = a.procs.get(pid);
         const same = before && before.comm === p.comm;
         const d = p.ticks - (same ? before.ticks : 0);
-        if (d > 0) {
+        if (probe.has(pid)) {
+            probeTicks += Math.max(0, d);
+        } else if (d > 0) {
             procs.push({ pid, comm: p.comm, ticks: d, isNew: !same });
         }
     }
@@ -115,15 +136,16 @@ export function cpuDelta(a, b) {
     threads.sort((x, y) => y.ticks - x.ticks);
     const counted = procs.reduce((s, p) => s + p.ticks, 0);
     return {
-        guestSeconds: Math.round(((b.uptime || 0) - (a.uptime || 0)) * 10) / 10,
-        wallSeconds: Math.round((b.at - a.at) / 1000),
+        guestSeconds: Math.round(((b.uptime || 0) - (a.endUptime || a.uptime || 0)) * 10) / 10,
+        wallSeconds: Math.round((b.at - (a.endAt || a.at)) / 1000),
         total,
         busy,
         idle,
         user: (st[0] || 0) + (st[1] || 0),
         system: (st[2] || 0) + (st[5] || 0) + (st[6] || 0),
         // Processes that started and ended in between, and accounting slack.
-        uncounted: busy - counted,
+        uncounted: Math.max(0, busy - counted),
+        probeTicks,
         frames: a.frames >= 0 && b.frames >= 0 ? b.frames - a.frames : -1,
         procs,
         threads,
@@ -139,5 +161,6 @@ export function describeCpu(d, count = 8) {
     return `${d.busy} busy of ${d.total} ticks (${d.guestSeconds} guest s, ${d.wallSeconds} s), ` +
         `user ${d.user} system ${d.system}, sf frames ${d.frames}; ` +
         d.procs.slice(0, count).map((p) => `${p.comm}${p.isNew ? '*' : ''} ${p.ticks} (${pct(p.ticks)})`).join(', ') +
-        (d.uncounted > 0 ? `, not in a listed process ${d.uncounted} (${pct(d.uncounted)})` : '');
+        (d.uncounted > 0 ? `, not in a listed process ${d.uncounted} (${pct(d.uncounted)})` : '') +
+        (d.probeTicks > 0 ? `; the probe's own shell ${d.probeTicks} more (its snapshots, not counted)` : '');
 }
