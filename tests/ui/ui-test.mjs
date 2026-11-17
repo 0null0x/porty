@@ -108,6 +108,9 @@ try {
     assert.ok(wantFixes.sf, 'the default configuration fixes surfaceflinger');
     assert.ok(Buffer.from(appended.entries[1].data).toString('latin1').includes(`porty_m=${wantFixes.sf.module}\n`));
     assert.ok(initrd.notes.some((n) => n.startsWith('surfaceflinger\'s library is replaced at boot')));
+    assert.ok(wantFixes.anr, 'the default configuration has no ANR dumps');
+    assert.ok(Buffer.from(appended.entries[1].data).toString('latin1').includes('setprop dalvik.vm.stack-trace-dir /proc/porty-no-anr-traces'));
+    assert.ok(initrd.notes.some((n) => n.startsWith('"Not responding" reports come without the stack dumps')));
     assert.ok(wantFixes.provision, 'the default configuration provisions Android');
     assert.ok(Buffer.from(appended.entries[1].data).toString('latin1').includes('cmd settings put global device_provisioned 1'));
     assert.ok(initrd.notes.some((n) => n.startsWith('Android is marked as set up once it has booted')));

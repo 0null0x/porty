@@ -19,7 +19,8 @@ export const SNAP_FAILED = 3;
 // URL parameters that shape the machine. A snapshot only fits the machine
 // it was saved on, so a visitor who sets one of these gets a normal boot.
 const MACHINE_PARAMS = ['mem', 'tb', 'smp', 'usb', 'cpu', 'res', 'dpi', 'gfx', 'disk', 'setup',
-    'cache', 'parallel', 'append', 'cmdline', 'qemu', 'timescale', 'diet', 'props', 'lowmem', 'ttmfix', 'sffix'];
+    'cache', 'parallel', 'append', 'cmdline', 'qemu', 'timescale', 'diet', 'props', 'lowmem', 'ttmfix', 'sffix',
+    'anrtraces'];
 // Settings of the page and of this device that a resume keeps.
 const PAGE_KEYS = ['mobile', 'serial', 'fps', 'prefetch', 'wasmmem', 'wasmmemExplicit', 'jit', 'jitcap', 'jitgc'];
 
