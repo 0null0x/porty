@@ -1162,12 +1162,26 @@ async function inputProbe() {
         log(`INPUT PROBE: swipe up on the home screen: ${touchResult.drawer.changedPct}% of the screen changed ` +
             `after ${drawerS} s (the app drawer)`);
         await shot('drawer', true);
-        // Settings: the drawer's eleventh app, first of the third row.
+        // Settings: the drawer's eleventh app, first of the third row.  A
+        // press of 120 ms, as a finger's (puppeteer's tap lifts at once);
+        // up to three, since the first tap in the drawer opened nothing in
+        // two runs (44080618863, 44080633997), maybe caught by a list that
+        // was still settling after the swipe.
         const [sx0, sy0] = at(60, 375 * (r.ch || 800) / 800);
-        await page.touchscreen.tap(sx0, sy0);
-        const settingsS = await changeFrom(drawer, 30, probeWaitMs);
-        touchResult.settings = { changedS: settingsS };
-        log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s`);
+        let settingsS = -1;
+        const tapped = Date.now();
+        for (let i = 0; i < 3 && settingsS < 0; i++) {
+            await page.touchscreen.touchStart(sx0, sy0);
+            await sleep(120);
+            await page.touchscreen.touchEnd();
+            if (await changeFrom(drawer, 30, i < 2 ? 60000 : probeWaitMs) >= 0) {
+                settingsS = Math.round((Date.now() - tapped) / 1000);
+            }
+            touchResult.settingsTaps = i + 1;
+        }
+        touchResult.settings = { changedS: settingsS, taps: touchResult.settingsTaps };
+        log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s ` +
+            `(${touchResult.settingsTaps} taps)`);
         if (settingsS >= 0) {
             const settled = await still(120000);
             const top = await rowSig();
