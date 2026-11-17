@@ -107,6 +107,7 @@ jobs:
           export CHROME
           tests/ui/run.sh "$RUNNER_TEMP/ui"
           tests/ui/run.sh "$RUNNER_TEMP/ui-small" '?wasmmem=1024&mem=512&disk=ide'
+          tests/ui/run.sh "$RUNNER_TEMP/ui-touch" '?touch=1'
 
   build:
     name: Build QEMU-Wasm and the site

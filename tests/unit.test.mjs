@@ -32,8 +32,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([desktop.mem, desktop.tb, desktop.smp, desktop.width, desktop.height, desktop.dpi],
         [1024, 384, 1, 480, 800, 160]);
     assert.deepEqual([desktop.usb, desktop.jit], [true, -1]);
-    // a touchscreen unless touch=0 (then the USB tablet)
-    assert.deepEqual([desktop.touch, parseConfig('?touch=0', {}).touch, parseConfig('?touch=1', {}).touch], [true, false, true]);
+    // the USB tablet unless touch=1 (then a touchscreen; off by default, see config.js)
+    assert.deepEqual([desktop.touch, parseConfig('?touch=0', {}).touch, parseConfig('?touch=1', {}).touch], [false, false, true]);
     assert.equal(parseConfig('?jit=0', {}).jit, 0);
     assert.equal(parseConfig('?jit=-5', {}).jit, -1);
     assert.equal(parseConfig('?jit=99999999999', {}).jit, 2147483647);
@@ -156,13 +156,13 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.match(buildKernelCmdline(parseConfig('?gfx=vesa&res=1024x768', {}), manifest), /vga=0x344 UVESA_MODE=1024x768/);
     assert.equal(buildKernelCmdline(parseConfig('?cmdline=a=1%20b', {}), manifest), 'a=1 b');
 
-    const args = buildQemuArgs(cfg, manifest, paths);
+    const args = buildQemuArgs(parseConfig('?touch=1', { userAgent: MAC }), manifest, paths);
     const value = (flag) => args[args.indexOf(flag) + 1];
     assert.equal(value('-m'), '1024M');
     assert.equal(value('-accel'), 'tcg,tb-size=384');
     assert.equal(value('-display'), 'wasmfb');
     assert.equal(value('-cpu'), 'Nehalem');
-    // the pointing device: a touchscreen, no USB controller and no tablet
+    // touch=1: the pointing device is a touchscreen, no USB controller and no tablet
     assert.equal(value('-device'), 'virtio-multitouch-pci');
     assert.equal(TOUCH_DEVICE, 'virtio-multitouch-pci');
     assert.ok(!args.includes('-usb') && !args.includes('usb-tablet'));
@@ -179,8 +179,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.ok(qcow2.includes(drives[0].replace('format=raw', 'format=qcow2')));
     assert.equal(buildQemuArgs(parseConfig('?smp=2', {}), manifest, paths)[9], 'tcg,tb-size=384,thread=multi');
     assert.ok(!buildQemuArgs(parseConfig('?usb=0', {}), manifest, paths).includes('usb-tablet'));
-    // touch=0: the USB tablet of before, at the same place in the argv
-    const tablet = buildQemuArgs(parseConfig('?touch=0', {}), manifest, paths);
+    // by default (and with touch=0): the USB tablet, at the same place in the argv
+    const tablet = buildQemuArgs(cfg, manifest, paths);
+    assert.deepEqual(buildQemuArgs(parseConfig('?touch=0', { userAgent: MAC }), manifest, paths), tablet);
     assert.deepEqual(tablet.slice(tablet.indexOf('-usb'), tablet.indexOf('-usb') + 3), ['-usb', '-device', TABLET_DEVICE]);
     assert.ok(!tablet.includes(TOUCH_DEVICE));
     assert.equal(inputDevice(tablet), 'tablet');
@@ -199,7 +200,7 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(inputDevice(['-usb', 'virtio-multitouch-pci']), 'none', 'only a -device counts');
     // the RTC follows the dilated virtual clock (timescale 8 by default), and only then
     assert.equal(value('-rtc'), 'base=utc,clock=vm');
-    const realTime = buildQemuArgs(parseConfig('?timescale=1', { userAgent: MAC }), manifest, paths);
+    const realTime = buildQemuArgs(parseConfig('?timescale=1&touch=1', { userAgent: MAC }), manifest, paths);
     assert.ok(!realTime.includes('-rtc'));
     assert.deepEqual(args.filter((a, i) => a !== '-rtc' && args[i - 1] !== '-rtc'), realTime);
     const ide = buildQemuArgs(parseConfig('?disk=ide', {}), manifest, paths).filter((a) => a.startsWith('if=ide'));

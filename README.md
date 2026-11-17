@@ -109,9 +109,12 @@ for a much newer Android.
   Android reads them, from QEMU's own worker threads, and QEMU unpacks them
   (the image is a compressed qcow2 of the ext4 system partition).
 - The guest's video memory is shared with the page, which copies the rows
-  that changed onto a canvas every frame. Taps, swipes and clicks enter the
-  guest as a touchscreen (QEMU's virtio multitouch device, one slot per
-  finger), keys as a keyboard.
+  that changed onto a canvas every frame. Taps and clicks enter the guest
+  through a USB tablet, which Android treats as a mouse (an arrow follows
+  the finger), and keys as a keyboard. With `?touch=1` they enter as a
+  touchscreen instead (QEMU's virtio multitouch device, one slot per
+  finger); it is off by default for now because apps draw their first
+  frame about twice as slowly with it.
 - QEMU's threads need `SharedArrayBuffer`, which browsers only allow on
   cross-origin-isolated pages. GitHub Pages cannot send the headers that
   turn this on, so a service worker
@@ -170,7 +173,7 @@ and say how far it got, with that message.
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
 | `tb` | 384 (phones: 128) | TCG translation cache in MiB |
 | `smp` | 1 | Guest CPUs, 1 to 4 (`smp=2` crashes QEMU-Wasm with this guest today) |
-| `touch` | 1 | Android gets a touchscreen (QEMU's virtio multitouch device): taps, swipes, flings and two-finger gestures as on a phone, no mouse pointer. A mouse is one finger while its left button is down; its wheel (and a trackpad's two-finger scrolling) drags the screen with a finger that lifts by itself, a trackpad's pinch spreads two fingers, the right button is Back. `0` gives Android the USB tablet of before instead, which it treats as a mouse: an arrow follows the finger and a tap is a click |
+| `touch` | 0 | `1` gives Android a touchscreen (QEMU's virtio multitouch device): taps, swipes, flings and two-finger gestures as on a phone, no mouse pointer. A mouse is one finger while its left button is down; its wheel (and a trackpad's two-finger scrolling) drags the screen with a finger that lifts by itself, a trackpad's pinch spreads two fingers, the right button is Back. Off by default for now: with the touchscreen, apps take about twice as long to draw their first frame (2026-11-17). The default is the USB tablet, which Android treats as a mouse: an arrow follows the finger and a tap is a click. As a machine setting, `touch=1` boots instead of resuming |
 | `usb` | on | `0` leaves out the pointing device, touchscreen or USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
 | `jitcap` | 15000 (phones: 4000) | Compiled code blocks kept at once (256 to 15000). Each is a module in the browser's own memory |

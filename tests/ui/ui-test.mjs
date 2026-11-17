@@ -141,7 +141,7 @@ try {
 
     // 4. the touchscreen: the mouse is one finger (slot 0) in tablet
     // coordinates; hovering sends nothing; no tablet events at all
-    const touchMode = !/touch=0/.test(query);
+    const touchMode = /touch=1/.test(query);
     assert.ok(p.args.includes(touchMode ? 'virtio-multitouch-pci' : 'usb-tablet'));
     const box = await (await page.$('#screen')).boundingBox();
     const cx = box.x + box.width / 2;
@@ -352,7 +352,7 @@ try {
         assert.ok(t.args.includes('usb-tablet') && t.args.includes('-usb') && !t.args.includes('virtio-multitouch-pci'));
         const kinds = t.events.filter((e) => e[0] !== 3 && e[0] !== 10).map((e) => e[0]);
         assert.ok(kinds.includes(1) && kinds.includes(2) && !kinds.some((k) => k >= 5 && k <= 7), `events ${kinds}`);
-        assert.ok(t.notes.some((n) => n.startsWith('Android has a USB tablet (touch=0)')));
+        assert.ok(t.notes.some((n) => n.startsWith('Android has a USB tablet (touch=0')));
         ok('touch=0 gives Android the USB tablet, and the page sends it tablet moves and clicks');
         await tablet.close();
     }

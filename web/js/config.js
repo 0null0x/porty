@@ -46,7 +46,7 @@ export const PARAM_HELP = [
     ['wasmmem', 'size of the WebAssembly memory in MiB. Default: sized to fit.'],
     ['tb', 'TCG translation cache in MiB (64-1024). Default 384, phones 128.'],
     ['smp', 'guest CPUs, 1-4 (default 1).'],
-    ['touch', '0 gives Android a USB tablet (a mouse: an arrow follows the finger and a tap is a click) instead of a touchscreen (virtio multitouch, default: taps, swipes and two-finger gestures as on a phone; a mouse acts as one finger, its wheel drags, its right button is Back).'],
+    ['touch', '1 gives Android a touchscreen (virtio multitouch: taps, swipes and two-finger gestures as on a phone; a mouse acts as one finger, its wheel drags, its right button is Back) instead of the USB tablet (default 0: a mouse, an arrow follows the finger and a tap is a click). Off by default for now: with a touchscreen, apps take about twice as long to draw their first frame.'],
     ['usb', '0 leaves out the pointing device, touchscreen or USB tablet (no touch input; for diagnosis).'],
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
@@ -146,10 +146,15 @@ export function parseConfig(search, env = {}) {
         smp: intParam(params, 'smp', 1, 1, 4),
         // false: no pointing device at all (diagnosis).
         usb: boolParam(params, 'usb', true),
-        // Android's pointing device: a touchscreen (virtio-multitouch-pci,
-        // QEMU patch 0020 feeds it) or, with touch=0, the USB tablet, which
-        // Android-x86 drives as a mouse.
-        touch: boolParam(params, 'touch', true),
+        // Android's pointing device: with touch=1 a touchscreen
+        // (virtio-multitouch-pci, QEMU patch 0020 feeds it), by default the
+        // USB tablet, which Android-x86 drives as a mouse.  Off by default
+        // since 2026-11-17: with the touchscreen in the machine, Gallery's
+        // first frame took 2.3-2.5x as long natively (guest-cpu runs
+        // 44137863037, 44142443850, 44142458128; with am start too, so not
+        // the events) and about 5x in the browser.  Not the USB controller,
+        // touch mode or anrtraces; still being looked into.
+        touch: boolParam(params, 'touch', false),
         // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
         jit: intParam(params, 'jit', -1, -1, 2147483647),
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),

@@ -493,9 +493,11 @@ export class Emulator {
                 'and nothing else to point with: add ?touch=0 for the USB tablet.');
         } else {
             this.notes.push({
-                touch: 'Android has a touchscreen (virtio multitouch): fingers are fingers, the mouse is one finger, ' +
-                    'its wheel drags and its right button is Back; touch=0 gives it a USB tablet (a mouse) instead.',
-                tablet: 'Android has a USB tablet (touch=0): it is a mouse there, with an arrow, and a tap is a click.',
+                touch: 'Android has a touchscreen (virtio multitouch, touch=1): fingers are fingers, the mouse is one finger, ' +
+                    'its wheel drags and its right button is Back. Apps draw their first frame more slowly with it; ' +
+                    'touch=0 (the default) gives Android a USB tablet (a mouse) instead.',
+                tablet: 'Android has a USB tablet (touch=0, the default): it is a mouse there, with an arrow, and a tap ' +
+                    'is a click. touch=1 gives it a touchscreen.',
                 none: 'Android has no pointing device (usb=0).',
             }[this.inputMode]);
         }
