@@ -128,3 +128,16 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          # The candidate fix: in Layer::pushPendingState() (inlined
+          # addSyncPoint), "jbe" to the path for a barrier frame already
+          # latched becomes "nop; jmp" to the same place (0f 86 -> 90 e9), so
+          # that no deferred transaction ever waits for a barrier frame.
+          echo "::group::the patched copy"
+          off=$((16#7a4aa))
+          od -A d -t x1 -j "$off" -N 6 "$so"
+          cp "$so" "$RUNNER_TEMP/patched.so"
+          printf '\220\351' | dd of="$RUNNER_TEMP/patched.so" bs=1 seek="$off" conv=notrunc 2>/dev/null
+          od -A d -t x1 -j "$off" -N 6 "$RUNNER_TEMP/patched.so"
+          echo "original $(sha256sum < "$so" | cut -c1-64) patched $(sha256sum < "$RUNNER_TEMP/patched.so" | cut -c1-64) offset $off"
+          objdump -d --start-address=$((16#964a0)) --stop-address=$((16#964c1)) "$RUNNER_TEMP/patched.so" | tail -n +7
+          echo "::endgroup::"
