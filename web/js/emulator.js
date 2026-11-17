@@ -316,11 +316,6 @@ export class Emulator {
         } else if (this.cfg.gfx !== 'vesa') {
             this.notes.push('ttmfix=0: ttm.ko is left as shipped; the guest panics when surfaceflinger forks.');
         }
-        this.notes.push(fixes.sf
-            ? 'surfaceflinger\'s library is replaced at boot by a copy that applies a layer change waiting for another ' +
-                'layer\'s frame at once, instead of composing the screen again on every vsync until then; sffix=0 leaves it.'
-            : 'sffix=0: surfaceflinger is left as shipped; it composes the screen again on every vsync while a layer ' +
-                'change waits for another layer\'s frame.');
         this.notes.push(fixes.provision
             ? 'Android is marked as set up once it has booted, and its setup wizard, analytics service and ' +
                 'second launcher (Taskbar) are hidden, so the boot ends on the home screen; setup=1 leaves all that alone.'

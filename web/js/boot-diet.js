@@ -21,10 +21,6 @@
 //
 // And it does what a setup wizard would have done (PROVISION below): the
 // only one in the image crashes without Google's services.
-//
-// And it replaces surfaceflinger's library with a copy in which two bytes
-// differ (SF_FIX below), so that it stops composing the same picture on
-// every vsync while a deferred transaction waits.
 // Pure functions (no DOM).
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -129,42 +125,6 @@ export const TTM_FIX = {
     patchedSha256: '1958d6138042f15e0b83369914962e7d0d041ac0e831ec44cadb8908b3166408',
 };
 
-// surfaceflinger's deferred transactions (SF_FIX, ?sffix=, on by default).
-//
-// A client can ask surfaceflinger to apply a change to a layer (position,
-// crop, alpha...) only once another layer has shown a given frame
-// (deferTransactionUntil): SurfaceView does it for its position, which it
-// keeps in step with its window's frames.  Android 9's surfaceflinger keeps
-// such a change pending (Layer::pushPendingState, applyPendingStates) and,
-// until the frame arrives, asks for a traversal on every vsync, and every
-// traversal ends in a full composition.  Here a composition is SwiftShader
-// drawing every layer on the guest's one CPU, in a SCHED_FIFO thread that
-// everything else waits for.  In 10 of 16 Gallery starts of native boots
-// (.github/workflows/guest-cpu.yml, runs 43988974672 and 43994117807; by tap
-// and by "am start" alike) surfaceflinger then composed 120-430 times
-// (TimeStats) while the layers posted about 15 buffers, for 30-110 s after
-// the start, at 75-85% of the CPU; the other starts took 50-75 compositions
-// and were quiet after 17-26 s.  In the browser the guest was busy for all
-// of the 600 s after a tap on Gallery (run 43980055445).
-//
-// The fix takes the path surfaceflinger already has for a barrier frame
-// that was latched before: drop the barrier, apply the change at once.  In
-// pushPendingState, with Layer::addSyncPoint inlined,
-//     964a7: 48 39 c8             cmp  %rcx,%rax    (frame vs. latched)
-//     964aa: 0f 86 01 01 00 00    jbe  965b1        ->  90 e9 01 01 00 00
-// "jbe" becomes "nop; jmp" to the same place (965b1 clears the barrier,
-// releases the sync point and asks for one traversal), so no change ever
-// waits; at worst a SurfaceView moves one frame early.  (The file offset is
-// the address minus 0x1c000, where the first LOAD segment starts.)  Checked
-// against the image by .github/workflows/image-facts.yml.
-export const SF_FIX = {
-    module: 'system/lib64/libsurfaceflinger.so',
-    sha256: '54784750ca0c2674fcf45c02f7d69b3bd36d493ce46eeca7c68771359f4236f9',
-    offset: 0x7a4aa,
-    bytes: [0x90, 0xe9],
-    patchedSha256: '9a508052d6526e340fdf7355e1596d4596846f7124c07af4b02f43666379a6c1',
-};
-
 // Provisioning: what stands between a first boot and the home screen.
 //
 // A new Android has Settings.Global.DEVICE_PROVISIONED = 0 and
@@ -217,16 +177,14 @@ const SETTING = /^[a-z0-9_]{1,64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
 /**
- * Which fixes a config gets: { ttm: false | TTM_FIX, sf: false | SF_FIX,
- * provision: false | PROVISION }.  The kernel fix not with gfx=vesa
- * (nomodeset: bochs-drm never drives the screen, nothing maps a TTM buffer)
- * and not with ttmfix=0; surfaceflinger's not with sffix=0; the
+ * Which fixes a config gets: { ttm: false | TTM_FIX, provision: false |
+ * PROVISION }.  The kernel fix not with gfx=vesa (nomodeset: bochs-drm never
+ * drives the screen, nothing maps a TTM buffer) and not with ttmfix=0; the
  * provisioning not with setup=1.
  */
 export function dietFixes(cfg) {
     return {
         ttm: cfg.ttmfix !== false && cfg.gfx !== 'vesa' ? TTM_FIX : false,
-        sf: cfg.sffix !== false ? SF_FIX : false,
         provision: cfg.setup ? false : PROVISION,
     };
 }
@@ -271,9 +229,8 @@ export function dietProps(cfg) {
 /** For the configuration line: " props: k=v k=v" and the fixes. */
 export function describeDiet(cfg) {
     const props = dietProps(cfg);
-    const fixes = dietFixes(cfg);
     return (props.length ? ` props: ${props.map((p) => p.join('=')).join(' ')}` : ' props: none')
-        + (fixes.ttm ? ' ttmfix' : '') + (fixes.sf ? ' sffix' : '') + (fixes.provision ? ' provisioned' : '');
+        + (dietFixes(cfg).ttm ? ' ttmfix' : '') + (dietFixes(cfg).provision ? ' provisioned' : '');
 }
 
 /** Shell lines that set the properties (empty: none to set). */
@@ -316,10 +273,9 @@ function propLines(props) {
 }
 
 /**
- * Shell lines that put a patched copy of a file of the system image in its
- * place: a kernel module (TTM_FIX) or a library (SF_FIX).  The copy lives in
- * the root tmpfs; every step is checked by hash, and the original stays in
- * place when anything is not as expected.
+ * Shell lines that put a patched copy of a kernel module in its place (see
+ * TTM_FIX).  The copy lives in the root tmpfs; every step is checked by
+ * hash, and the original stays in place when anything is not as expected.
  */
 function moduleFixLines(fix) {
     if (!fix) {
@@ -412,7 +368,7 @@ function provisionLines(provision) {
  * Lines for the same keys are removed first: init keeps the first value of
  * a "ro." property and the last of any other.
  * @param props  [[key, value]...]
- * @param fixes  { ttm, sf: false | a file fix like TTM_FIX, provision: false | PROVISION }
+ * @param fixes  { ttm: false | a module fix like TTM_FIX, provision: false | PROVISION }
  */
 export function dietScript(props, fixes = {}) {
     for (const [key, value] of props) {
@@ -425,7 +381,6 @@ export function dietScript(props, fixes = {}) {
         '# Sourced by /init in /android after ramdisk.img was unpacked there.',
         ...propLines(props),
         ...moduleFixLines(fixes.ttm),
-        ...moduleFixLines(fixes.sf),
         ...provisionLines(fixes.provision),
         '',
     ].join('\n');
@@ -441,5 +396,5 @@ export function dietArchive(props, fixes = {}) {
 
 /** initrd.img with the diet script appended; unchanged when there is nothing to do. */
 export function applyBootDiet(initrd, props, fixes = {}) {
-    return props.length || fixes.ttm || fixes.sf || fixes.provision ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
+    return props.length || fixes.ttm || fixes.provision ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
 }

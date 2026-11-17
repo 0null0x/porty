@@ -69,7 +69,6 @@ export const PARAM_HELP = [
     ['props', 'more Android properties, key=value,key=value (letters, digits, . _ -); they override diet.'],
     ['lowmem', '0 leaves Android\'s low memory killer as shipped: it then ends every app that is left for another within seconds (default 1: background apps stay until memory is critically short, see boot-diet.js).'],
     ['ttmfix', '0 leaves the kernel module ttm.ko as shipped: the guest then panics when Android collects stack traces (for diagnosis).'],
-    ['sffix', '0 leaves surfaceflinger as shipped: it then composes the same picture on every vsync while a deferred transaction waits, for up to minutes after an app starts (see boot-diet.js).'],
     ['resume', '1 resumes the saved Android even with other settings in the address; 0 always boots.'],
 ];
 
@@ -178,8 +177,6 @@ export function parseConfig(search, env = {}) {
         lowmem: boolParam(params, 'lowmem', true),
         // false: no patched ttm.ko (boot-diet.js, TTM_FIX).
         ttmfix: boolParam(params, 'ttmfix', true),
-        // false: surfaceflinger as shipped (boot-diet.js, SF_FIX).
-        sffix: boolParam(params, 'sffix', true),
     };
     return cfg;
 }
