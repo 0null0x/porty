@@ -287,10 +287,13 @@ function row(v, r) {
         cpu: res.cpu || '', version: res.version || '', crashed: !!res.crashed, failed: boot.failed || '',
         resumed: boot.resumed ?? null, loops: boot.loops || [], loopMedian: median(boot.loops || []),
         gallery: probe.gallery ?? null, launcherGone: probe.launcherGone ?? null,
+        arrowMs: probe.arrowMs ?? null, echoMs: boot.echoMs || [], shell: boot.shell ?? null,
+        diskMb: samples.length ? samples[samples.length - 1].diskMb ?? null : null,
         peakRss: peak, steadyRss: median(settle) ?? (rss.length ? rss[rss.length - 1] : null),
         peakHeaps: heaps.length ? Math.max(...heaps) : null,
         peakTotal: Math.max(res.peakTotal || 0, ...samples.map((s) => s.total).filter(Number.isFinite), 0) || null,
         jit: samples.length ? `${samples[samples.length - 1].alive}/${samples[samples.length - 1].compiled}` : '',
+        threadCpu: (samples.filter((x) => x.cpu && (x.label === 'loop' || x.label === 'settle' || x.label === 'focus')).pop() || {}).cpu || '',
         counters, glueApplied: res.glueApplied || {}, errors: (res.errors || []).slice(0, 5),
         exit: r.code,
     };
@@ -359,10 +362,11 @@ async function main() {
         '',
         `Base query \`${baseQuery}\`; ${rows[0] ? rows[0].version : ''}. RSS of the web content process in MiB.`,
         '',
-        '| variant | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | JIT alive/compiled | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
-        ...rows.map((r) => `| ${r.name} (\`${r.words || '-'}\`) | ${fmt(r.peakRss)} | ${fmt(r.steadyRss)} | ${fmt(r.peakHeaps)} | ` +
-            `${fmt(r.resumed)} | ${r.loops.map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${r.jit || '-'} | ` +
+        '| variant | browser | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | tap to arrow ms | typing echo ms | disk MB | JIT alive/compiled | CPU by thread | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+        ...rows.map((r) => `| ${r.name} (\`${r.words || '-'}\`) | ${(r.version || '').split(' ')[0] || '-'} | ${fmt(r.peakRss)} | ${fmt(r.steadyRss)} | ${fmt(r.peakHeaps)} | ` +
+            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ` +
+            `${(r.threadCpu || '').replace(/\|/g, '/') || '-'} | ` +
             `${(r.gc || []).filter((h) => h.allocatedMb > 50).slice(0, 4).map((h) => `${h.mbPerSecond ?? '?'}/s, ${Math.round(h.maxAllocatedKb / 1024)}`).join('; ') || '-'} | ` +
             `${Object.entries(r.counters).map(([t, row]) => `${t}: ${Object.entries(row).map(([k, x]) => `${k} ${x}`).join(' ')}`).join('; ') || '-'} | ` +
             `${[r.crashed ? 'CRASHED' : '', r.failed, ...r.errors.map((e) => e.slice(0, 80))].filter(Boolean).join('; ').replace(/\|/g, '/') || ''} |`),

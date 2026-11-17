@@ -1524,6 +1524,27 @@ async function boot() {
     b.shell = shell ? secs(shell.ms) : null;
     log(shell ? `SHELL answered after ${b.shell} s` : 'SHELL did not answer within 180 s');
     if (shell) {
+        // Typing latency: how soon the characters typed come back from the
+        // guest's tty (its echo), polled every 50 ms; three times.
+        b.echoMs = [];
+        for (let i = 1; i <= 3 && !result.crashed; i++) {
+            serialAll = '';
+            const word = `ECHO${i}x${Date.now() % 100000}`;
+            const t = Date.now();
+            await send(`: ${word}\r`);
+            let ms = null;
+            while (Date.now() - t < 30000) {
+                await sleep(50);
+                await drainSerial();
+                if (serialAll.includes(word)) {
+                    ms = Date.now() - t;
+                    break;
+                }
+            }
+            b.echoMs.push(ms);
+            await sleep(500);
+        }
+        log(`TYPING ECHO: ${b.echoMs.map((x) => (x === null ? 'none' : `${x} ms`)).join(', ')}`);
         // A loop in the shell, timed from here (the guest's own clock runs
         // slow by "timescale"): the same few blocks over and over, so after
         // the first round this is compiled code.
@@ -1566,6 +1587,19 @@ async function inputProbe() {
     const [gx, gy] = at(150, 565 * (r.ch || 800) / 800);
     log(`INPUT PROBE: canvas ${JSON.stringify(r)}; finger tap at ${gx.toFixed(0)},${gy.toFixed(0)} (the Gallery icon)`);
     const seen = () => page.evaluate(() => globalThis.__portyProbe);
+    // Android draws its arrow where the finger lands (the page's ring is a
+    // DOM element, not on the canvas): pixels around that point, before and
+    // after the tap, in canvas coordinates.
+    const crop = () => page.evaluate(([cx, cy]) => {
+        const c = document.getElementById('screen');
+        const t = document.createElement('canvas');
+        t.width = 32;
+        t.height = 32;
+        const g = t.getContext('2d');
+        g.drawImage(c, cx - 16, cy - 16, 32, 32, 0, 0, 32, 32);
+        return Array.from(g.getImageData(0, 0, 32, 32).data);
+    }, [150, Math.round(565 * (r.ch || 800) / 800)]).catch(() => null);
+    const before = await crop();
     const tTap = Date.now();
     p.how = 'touchscreen';
     try {
@@ -1597,6 +1631,22 @@ async function inputProbe() {
     }
     p.events = events;
     log(`INPUT PROBE: the page saw ${JSON.stringify(events)} (${p.how})`);
+    // The arrow: until the pixels around the tap change (30 s at most).
+    if (before) {
+        while (Date.now() - tTap < 30000) {
+            const now = await crop();
+            let diff = 0;
+            for (let i = 0; now && i < now.length; i += 4) {
+                diff += Math.abs(now[i] - before[i]) + Math.abs(now[i + 1] - before[i + 1]) + Math.abs(now[i + 2] - before[i + 2]);
+            }
+            if (diff > 32 * 32 * 3 * 4) {
+                p.arrowMs = Date.now() - tTap;
+                break;
+            }
+            await sleep(100);
+        }
+        log(`INPUT PROBE: ${p.arrowMs === undefined ? 'no change around the tap within 30 s' : `the screen changed at the tap after ${p.arrowMs} ms`}`);
+    }
     await sample('tap', 0);
 
     // Watch the screen: the launcher's wallpaper goes (a black starting

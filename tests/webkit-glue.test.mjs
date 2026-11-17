@@ -209,15 +209,15 @@ check('every counter finds its place, and the result parses', () => {
     const applied = {};
     const out = glueRewrite(GLUE, ['count', 'ffi', 'slice'], applied);
     assert.deepEqual(applied, {
-        ffi: 1, slice: 1, countPrelude: 1, countThrow: 1, countInvoke: 2,
-        countCompile: 1, countSleep: 1, countXhr: 1, countClock: 1, countPoll: 1,
+        poll: 1, ffi: 1, slice: 1, countPrelude: 1, countThrow: 1, countInvoke: 2,
+        countCompile: 1, countSleep: 1, countXhr: 1,
     });
     // eslint-disable-next-line no-new-func
     new Function(out);
     assert.ok(out.indexOf('function ffi_call_js(') < out.indexOf('var wasmImports'));
     assert.ok(out.includes('function portyFfiSlow('));
     assert.ok(out.includes('function ffi_call_js(cif, fn, rvalue, avalue) {\n  portyCount(2);'));
-    assert.ok(out.includes('var ___syscall_poll = (fds, nfds, timeout) => (portyCount(8), PTY_wrapPoll('));
+    assert.ok(out.includes('  portyCount(8); if (timeout === 0) portyCount(9);'));
     assert.ok(out.includes('const wasmBytes = HEAP8.slice(wasm_begin, wasm_begin + wasm_size);'));
 });
 
@@ -243,16 +243,18 @@ check('each context counts in a row of its own', () => {
     const i32 = new Int32Array(memory.buffer);
     assert.equal(i32[COUNTER_BASE / 4], 2);
     const row = (c) => Array.from(i32.subarray(COUNTER_ROWS / 4 + c * COUNTER_NAMES.length, COUNTER_ROWS / 4 + (c + 1) * COUNTER_NAMES.length));
-    assert.deepEqual(row(0), [2, 0, 1, 0, 0, 0, 0, 0, 0]);
-    assert.deepEqual(row(1), [0, 0, 0, 0, 0, 0, 0, 1, 0]);
+    assert.deepEqual(row(0), [2, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    assert.deepEqual(row(1), [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]);
     assert.ok(COUNTER_ROWS + COUNTER_CONTEXTS * COUNTER_NAMES.length * 4 <= 1024, 'the rows stay below GLOBAL_BASE');
 });
 
 check('pace puts a tick into the busy functions, and the result parses', () => {
     const applied = {};
     const out = glueRewrite(GLUE, ['pace-400', 'count'], applied);
-    // ffi_call_js, instantiate_wasm, _clock_time_get, the throw, two invoke wrappers, the poll
-    assert.equal(applied.pace, 7);
+    // ffi_call_js, instantiate_wasm, _clock_time_get, the throw, two invoke wrappers (the poll: below)
+    assert.equal(applied.pace, 6);
+    assert.equal(applied.poll, 1);
+    assert.ok(out.includes('  portyPaceTick();\n  var r = PTY_wrapPoll('));
     assert.ok(out.includes('portyPaceNext = now + 400;'));
     // eslint-disable-next-line no-new-func
     new Function(out);
@@ -286,6 +288,25 @@ check('the pacer makes a shared memory as big as the main one, at most every PAC
     }
     assert.equal(made.length, 2);
     made = [];
+});
+
+check('pollwait waits only when poll found nothing and may wait, in a worker, at most its ms', () => {
+    const out = glueRewrite(GLUE, ['pollwait-3'], {});
+    const waits = [];
+    const run = (pthread, result, timeout) => {
+        // eslint-disable-next-line no-new-func
+        const f = new Function('ENVIRONMENT_IS_PTHREAD', 'PTY_wrapPoll', 'xterm_pty_old_poll', 'Atomics', 'SharedArrayBuffer',
+            `${out.slice(out.indexOf('var portyPollWord'), out.indexOf('};', out.indexOf('var ___syscall_poll')) + 2)}; return ___syscall_poll;`);
+        const poll = f(pthread, (impl) => impl(), () => result, { wait: (v, i, x, ms) => waits.push(ms) }, SharedArrayBuffer);
+        return poll(0, 1, timeout);
+    };
+    assert.equal(run(true, 0, 100), 0);
+    assert.equal(run(true, 0, -1), 0);
+    assert.equal(run(true, 0, 1), 0);
+    assert.equal(run(true, 2, 100), 2);
+    assert.equal(run(true, 0, 0), 0);
+    assert.equal(run(false, 0, 100), 0);
+    assert.deepEqual(waits, [3, 3, 1]);
 });
 
 check('nothing changes without names', () => {

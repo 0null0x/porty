@@ -6,12 +6,17 @@
 //          of 1024, where nothing else lives): throws for longjmp, invoke
 //          wrappers, libffi calls, compiled blocks, sleeps
 //          (Asyncify.handleSleep runs twice per sleep), XHRs, postMessage
-//          from workers, clock reads (clock_time_get) and polls
+//          from workers, polls, polls with timeout 0, and polls that found
+//          nothing ready although they could have waited (pollIdle)
 //   ffi    libffi's ffi_call_js without the arrays it allocates
 //   slice  instantiate_wasm copies a block's bytes once instead of twice
 //   pace, pace-<ms>
 //          threads that run the glue often let the engine collect every few
 //          PACE_MS (default 250 ms); see PACE_PRELUDE
+//   pollwait, pollwait-<ms>
+//          poll() waits (up to the timeout, at most <ms>, default 2) when
+//          nothing is ready, instead of returning at once: QEMU's main loop
+//          otherwise spins, some 50000 polls a second
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -21,8 +26,8 @@
 // COUNTER_CONTEXTS rows.  Each row has one writer, so plain increments do.
 export const COUNTER_BASE = 512;
 export const COUNTER_ROWS = 528;
-export const COUNTER_NAMES = ['throws', 'invokes', 'ffi', 'compiles', 'sleeps', 'xhrs', 'posts', 'clocks', 'polls'];
-export const COUNTER_CONTEXTS = 12;
+export const COUNTER_NAMES = ['throws', 'invokes', 'ffi', 'compiles', 'sleeps', 'xhrs', 'posts', 'pollIdle', 'polls', 'poll0'];
+export const COUNTER_CONTEXTS = 12;  // 528 + 12 * 10 * 4 = 1008 < 1024
 
 export const COUNT_PRELUDE = `
 var portyCounters = null;
@@ -159,6 +164,33 @@ export function glueRewrite(js, names, applied = {}) {
         });
         return n;
     };
+    // xterm-pty's ___syscall_poll, rewritten once for all that want it:
+    // count (all polls, those with timeout 0, those that found nothing
+    // ready although they could have waited), pace (a tick) and pollwait.
+    const paceWanted = names.some((n) => /^pace(-\d+)?$/.test(n));
+    const waitName = names.find((n) => /^pollwait(-\d+)?$/.test(n));
+    if (names.includes('count') || paceWanted || waitName) {
+        const waitMs = waitName ? Math.max(1, Math.min(50, Number(waitName.split('-')[1]) || 2)) : 0;
+        applied.poll = count(/var ___syscall_poll\s*=\s*\(fds, nfds, timeout\)\s*=>\s*(PTY_wrapPoll\(\(\) => xterm_pty_old_poll\(fds, nfds, timeout\)\));/,
+            (m, call) => [
+                'var portyPollWord = null;',
+                'var ___syscall_poll = (fds, nfds, timeout) => {',
+                names.includes('count') ? '  portyCount(8); if (timeout === 0) portyCount(9);' : '',
+                paceWanted ? '  portyPaceTick();' : '',
+                `  var r = ${call};`,
+                '  if (r === 0 && timeout !== 0) {',
+                names.includes('count') ? '    portyCount(7);' : '',
+                // POSIX: wait up to the timeout for something to become
+                // ready.  Emscripten returns at once, so QEMU's main loop
+                // spins; wait at most waitMs, as nothing wakes this thread
+                // when an fd becomes ready.
+                waitMs ? `    if (ENVIRONMENT_IS_PTHREAD) { if (portyPollWord === null) portyPollWord = new Int32Array(new SharedArrayBuffer(4)); ` +
+                    `Atomics.wait(portyPollWord, 0, 0, timeout > 0 ? Math.min(timeout, ${waitMs}) : ${waitMs}); }` : '',
+                '  }',
+                '  return r;',
+                '};',
+            ].filter(Boolean).join('\n'));
+    }
     if (names.includes('ffi')) {
         // Only if both the original and the place for the new one are found.
         const kept = out;
@@ -183,8 +215,6 @@ export function glueRewrite(js, names, applied = {}) {
         ticks += count(/(function (?:ffi_call_js|portyFfiSlow|instantiate_wasm|_clock_time_get)\([^)]*\)\s*\{)/g, (m, a) => `${a} portyPaceTick();`);
         ticks += count(/((?:__emscripten_throw_longjmp\s*=\s*\(\)\s*=>)\s*\{)/, (m, a) => `${a} portyPaceTick();`);
         ticks += count(/(function invoke_[a-zA-Z0-9]+\([^)]*\)\s*\{\s*var sp = stackSave\(\);)/g, (m, a) => `${a} portyPaceTick();`);
-        ticks += count(/(var ___syscall_poll\s*=\s*\([^)]*\)\s*=>\s*)(PTY_wrapPoll\(\(\) => xterm_pty_old_poll\([^)]*\)\));/,
-            (m, a, b) => `${a}(portyPaceTick(), ${b});`);
         applied.pace = Math.max(0, ticks);
     }
     if (names.includes('slice')) {
@@ -203,9 +233,6 @@ export function glueRewrite(js, names, applied = {}) {
         applied.countCompile = count(/(function instantiate_wasm\(\)\s*\{)/, (m, a) => `${a} portyCount(3);`);
         applied.countSleep = count(/(\n\s*handleSleep\(startAsync\)\s*\{)/, (m, a) => `${a} portyCount(4);`);
         applied.countXhr = count(/new XMLHttpRequest\b(?:\(\))?/g, () => '(portyCount(5), new XMLHttpRequest())');
-        applied.countClock = count(/(function _clock_time_get\([^)]*\)\s*\{)/, (m, a) => `${a} portyCount(7);`);
-        applied.countPoll = count(/(var ___syscall_poll\s*=\s*\([^)]*\)\s*=>\s*)(PTY_wrapPoll\(\(\) => xterm_pty_old_poll\([^)]*\)\));/,
-            (m, a, b) => `${a}(portyCount(8), ${b});`);
     }
     return out;
 }
