@@ -1,0 +1,238 @@
+// Rewrites of QEMU-Wasm's JavaScript glue (qemu/out.js, Emscripten 3.1.50)
+// for the WebKit memory experiments (tests/boot/webkit-test.mjs, GLUE):
+//
+//   count  counters of what the glue does, per thread, in the WebAssembly
+//          memory that every thread shares (below Emscripten's GLOBAL_BASE
+//          of 1024, where nothing else lives): throws for longjmp, invoke
+//          wrappers, libffi calls, compiled blocks, sleeps
+//          (Asyncify.handleSleep runs twice per sleep), XHRs, postMessage
+//          from workers, polls, polls with timeout 0, and polls that found
+//          nothing ready although they could have waited (pollIdle)
+//   ffi    libffi's ffi_call_js without the arrays it allocates
+//   slice  instantiate_wasm copies a block's bytes once instead of twice
+//   pace, pace-<ms>
+//          threads that run the glue often let the engine collect every few
+//          PACE_MS (default 250 ms); see PACE_PRELUDE
+//   pollwait, pollwait-<ms>
+//          poll() waits (up to the timeout, at most <ms>, default 2) when
+//          nothing is ready, instead of returning at once: QEMU's main loop
+//          otherwise spins, some 50000 polls a second
+//
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// Layout below GLOBAL_BASE: [512] the next context number; from 528 on,
+// one row of COUNTER_NAMES.length int32 per context (the page's thread
+// first, then QEMU's threads in the order they load the glue), at most
+// COUNTER_CONTEXTS rows.  Each row has one writer, so plain increments do.
+export const COUNTER_BASE = 512;
+export const COUNTER_ROWS = 528;
+export const COUNTER_NAMES = ['throws', 'invokes', 'ffi', 'compiles', 'sleeps', 'xhrs', 'posts', 'pollIdle', 'polls', 'poll0'];
+export const COUNTER_CONTEXTS = 12;  // 528 + 12 * 10 * 4 = 1008 < 1024
+
+export const COUNT_PRELUDE = `
+var portyCounters = null;
+function portyCount(i) {
+  if (portyCounters === null) {
+    try {
+      var n = Atomics.add(new Int32Array(wasmMemory.buffer, ${COUNTER_BASE}, 1), 0, 1);
+      portyCounters = new Int32Array(wasmMemory.buffer, ${COUNTER_ROWS} + Math.min(n, ${COUNTER_CONTEXTS - 1}) * ${COUNTER_NAMES.length * 4}, ${COUNTER_NAMES.length});
+    } catch (e) {
+      return;
+    }
+  }
+  portyCounters[i]++;
+}
+if (typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self !== 'undefined' && self.postMessage) {
+  var portyPostMessage = self.postMessage;
+  self.postMessage = function(m, t) { portyCount(6); return t === undefined ? portyPostMessage.call(self, m) : portyPostMessage.call(self, m, t); };
+}
+`;
+
+// libffi's ffi_call_js (src/wasm32/ffi.c) runs for every helper call of
+// QEMU's interpreter: it builds an argument array, a two-element array per
+// argument and for the return type (unbox_small_structs), calls three
+// exported functions that Asyncify wraps (stackSave, stackRestore,
+// stackAlloc) and calls with apply().  This one decodes a signature once
+// (QEMU makes its ffi_cif records at start-up and never frees them) and
+// calls directly; anything but integer and pointer arguments and results
+// (TCG's i32, i64 and pointers) goes to the original, renamed portyFfiSlow.
+// Addresses are read with >>> so that memories above 2 GiB work too.
+export const FFI_FAST = `
+var portyFfiInfo = new Map();
+function portyFfiDecode(cif) {
+  var p = cif >>> 2;
+  var nargs = HEAPU32[p + 1], nfixed = HEAPU32[p + 6], argTypes = HEAPU32[p + 2], rtype = HEAPU32[p + 3];
+  if (nargs !== nfixed || nargs > 7) return 0;
+  var rid = HEAPU16[(rtype + 6) >>> 1], r;
+  if (rid === 0) r = 0;
+  else if (rid === 1 || rid === 9 || rid === 10 || rid === 14) r = 1;
+  else if (rid === 11 || rid === 12) r = 2;
+  else return 0;
+  var wide = 0;
+  for (var i = 0; i < nargs; i++) {
+    var id = HEAPU16[(HEAPU32[(argTypes >>> 2) + i] + 6) >>> 1];
+    if (id === 11 || id === 12) wide |= 1 << i;
+    else if (!(id === 1 || id === 9 || id === 10 || id === 14)) return 0;
+  }
+  return 1 + nargs + (r << 4) + (wide << 8);
+}
+function portyFfiArg(a, i, wide) {
+  return (wide >> i) & 1 ? HEAPU64[HEAPU32[a + i] >>> 3] : HEAPU32[HEAPU32[a + i] >>> 2];
+}
+function ffi_call_js(cif, fn, rvalue, avalue) {
+  /*PORTY_FFI_COUNT*/
+  var info = portyFfiInfo.get(cif);
+  if (info === undefined) {
+    info = portyFfiDecode(cif);
+    portyFfiInfo.set(cif, info);
+  }
+  if (info === 0) {
+    /*PORTY_FFI_SLOW_COUNT*/
+    return portyFfiSlow(cif, fn, rvalue, avalue);
+  }
+  info -= 1;
+  var wide = info >> 8, f = getWasmTableEntry(fn), a = avalue >>> 2, r;
+  switch (info & 15) {
+  case 0: r = f(); break;
+  case 1: r = f(portyFfiArg(a, 0, wide)); break;
+  case 2: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide)); break;
+  case 3: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide)); break;
+  case 4: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide)); break;
+  case 5: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide),
+                portyFfiArg(a, 4, wide)); break;
+  case 6: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide),
+                portyFfiArg(a, 4, wide), portyFfiArg(a, 5, wide)); break;
+  default: r = f(portyFfiArg(a, 0, wide), portyFfiArg(a, 1, wide), portyFfiArg(a, 2, wide), portyFfiArg(a, 3, wide),
+                 portyFfiArg(a, 4, wide), portyFfiArg(a, 5, wide), portyFfiArg(a, 6, wide)); break;
+  }
+  var kind = (info >> 4) & 3;
+  if (kind === 1) HEAPU32[rvalue >>> 2] = r;
+  else if (kind === 2) HEAPU64[rvalue >>> 3] = r;
+}
+`;
+
+// JavaScriptCore counts the shared WebAssembly memory as live in the heap
+// of every thread that holds it (the memory's size as extra memory, and its
+// buffer once more), so a thread's next collection waits until about twice
+// that much has been allocated after the last one: some 2.5 GB with 1280 MiB.
+// "pace" makes the threads that run the glue often create, every PACE_MS,
+// a shared memory as big as QEMU's and drop it: reserved, never touched, it
+// costs no RAM, but the engine counts its size as allocated, so a busy
+// thread collects after a few of them instead of after gigabytes of garbage.
+export const PACE_PRELUDE = (ms) => `
+var portyPaceCalls = 0, portyPaceNext = 0, portyPaceCount = 0;
+function portyPace() {
+  portyPaceCalls = 0;
+  var now = performance.now();
+  if (now < portyPaceNext) return;
+  portyPaceNext = now + ${ms};
+  try {
+    var pages = Math.max(256, Math.min(65536, wasmMemory.buffer.byteLength >>> 16));
+    new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+    portyPaceCount++;
+  } catch (e) {
+    portyPaceNext = Infinity;
+  }
+}
+function portyPaceTick() {
+  if (++portyPaceCalls > 1023) portyPace();
+}
+`;
+
+/** Insert text before Emscripten's import object, or else before the first invoke wrapper. */
+export function insertBeforeImports(js, text) {
+    for (const anchor of [/\n\s*var wasmImports\s*=/, /\nfunction invoke_[a-z]+\(/]) {
+        const m = anchor.exec(js);
+        if (m) {
+            return js.slice(0, m.index) + text + js.slice(m.index);
+        }
+    }
+    return js;
+}
+
+/**
+ * Rewrite QEMU's JavaScript glue for the experiments in `names`; `applied`
+ * gets one entry per rewrite: how many places it changed (0: not found).
+ */
+export function glueRewrite(js, names, applied = {}) {
+    let out = js;
+    const count = (re, fn) => {
+        let n = 0;
+        out = out.replace(re, (...m) => {
+            n++;
+            return fn(...m);
+        });
+        return n;
+    };
+    // xterm-pty's ___syscall_poll, rewritten once for all that want it:
+    // count (all polls, those with timeout 0, those that found nothing
+    // ready although they could have waited), pace (a tick) and pollwait.
+    const paceWanted = names.some((n) => /^pace(-\d+)?$/.test(n));
+    const waitName = names.find((n) => /^pollwait(-\d+)?$/.test(n));
+    if (names.includes('count') || paceWanted || waitName) {
+        const waitMs = waitName ? Math.max(1, Math.min(50, Number(waitName.split('-')[1]) || 2)) : 0;
+        applied.poll = count(/var ___syscall_poll\s*=\s*\(fds, nfds, timeout\)\s*=>\s*(PTY_wrapPoll\(\(\) => xterm_pty_old_poll\(fds, nfds, timeout\)\));/,
+            (m, call) => [
+                'var portyPollWord = null;',
+                'var ___syscall_poll = (fds, nfds, timeout) => {',
+                names.includes('count') ? '  portyCount(8); if (timeout === 0) portyCount(9);' : '',
+                paceWanted ? '  portyPaceTick();' : '',
+                `  var r = ${call};`,
+                '  if (r === 0 && timeout !== 0) {',
+                names.includes('count') ? '    portyCount(7);' : '',
+                // POSIX: wait up to the timeout for something to become
+                // ready.  Emscripten returns at once, so QEMU's main loop
+                // spins; wait at most waitMs, as nothing wakes this thread
+                // when an fd becomes ready.
+                waitMs ? `    if (ENVIRONMENT_IS_PTHREAD) { if (portyPollWord === null) portyPollWord = new Int32Array(new SharedArrayBuffer(4)); ` +
+                    `Atomics.wait(portyPollWord, 0, 0, timeout > 0 ? Math.min(timeout, ${waitMs}) : ${waitMs}); }` : '',
+                '  }',
+                '  return r;',
+                '};',
+            ].filter(Boolean).join('\n'));
+    }
+    if (names.includes('ffi')) {
+        // Only if both the original and the place for the new one are found.
+        const kept = out;
+        const renamed = count(/function ffi_call_js\(/, () => 'function portyFfiSlow(');
+        let fast = FFI_FAST;
+        if (names.includes('count')) {
+            fast = fast.replace('/*PORTY_FFI_COUNT*/', 'portyCount(2);');
+        }
+        const before = out.length;
+        out = renamed ? insertBeforeImports(out, fast) : out;
+        applied.ffi = renamed && out.length > before ? 1 : 0;
+        if (!applied.ffi) {
+            out = kept;
+        }
+    }
+    const paceName = names.find((n) => /^pace(-\d+)?$/.test(n));
+    if (paceName) {
+        const ms = Math.max(20, Math.min(10000, Number(paceName.split('-')[1]) || 250));
+        const before = out.length;
+        out = insertBeforeImports(out, PACE_PRELUDE(ms));
+        let ticks = out.length > before ? 0 : -1000;
+        ticks += count(/(function (?:ffi_call_js|portyFfiSlow|instantiate_wasm|_clock_time_get)\([^)]*\)\s*\{)/g, (m, a) => `${a} portyPaceTick();`);
+        ticks += count(/((?:__emscripten_throw_longjmp\s*=\s*\(\)\s*=>)\s*\{)/, (m, a) => `${a} portyPaceTick();`);
+        ticks += count(/(function invoke_[a-zA-Z0-9]+\([^)]*\)\s*\{\s*var sp = stackSave\(\);)/g, (m, a) => `${a} portyPaceTick();`);
+        applied.pace = Math.max(0, ticks);
+    }
+    if (names.includes('slice')) {
+        applied.slice = count(/new Uint8Array\(HEAP8\.slice\(([^()]*)\)\)/, (m, a) => `HEAP8.slice(${a})`);
+    }
+    if (names.includes('count')) {
+        const before = out.length;
+        out = insertBeforeImports(out, COUNT_PRELUDE);
+        applied.countPrelude = out.length > before ? 1 : 0;
+        applied.countThrow = count(/((?:__emscripten_throw_longjmp\s*=\s*(?:\(\)\s*=>|function\s*\(\))|function\s+__emscripten_throw_longjmp\s*\(\))\s*\{)/,
+            (m, a) => `${a} portyCount(0);`);
+        applied.countInvoke = count(/(function invoke_[a-zA-Z0-9]+\([^)]*\)\s*\{\s*var sp = stackSave\(\);)/g, (m, a) => `${a} portyCount(1);`);
+        if (!names.includes('ffi')) {
+            applied.countFfi = count(/(function ffi_call_js\([^)]*\)\s*\{)/, (m, a) => `${a} portyCount(2);`);
+        }
+        applied.countCompile = count(/(function instantiate_wasm\(\)\s*\{)/, (m, a) => `${a} portyCount(3);`);
+        applied.countSleep = count(/(\n\s*handleSleep\(startAsync\)\s*\{)/, (m, a) => `${a} portyCount(4);`);
+        applied.countXhr = count(/new XMLHttpRequest\b(?:\(\))?/g, () => '(portyCount(5), new XMLHttpRequest())');
+    }
+    return out;
+}

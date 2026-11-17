@@ -1,0 +1,210 @@
+# Runs the deployed site in Playwright's WebKit build (the engine of iPhone
+# Safari, on Linux) and in Chrome on the same kind of runner, on the phone
+# budget: what the browser supports, a model of QEMU-Wasm's JIT, the resume,
+# a tap on Gallery, JIT statistics and the memory of the browser's processes
+# (tests/boot/webkit-test.mjs).
+#
+# With qemu=cache the QEMU-Wasm under test is the one built for the
+# dispatching ref's patches (build-and-deploy on main, branch-check on a
+# branch, both under the same cache key), served by a local proxy of the
+# site in place of the deployed one; the page, snapshot and disk are still
+# the deployed ones.  The page checks the snapshot against the site's
+# build.json, not against the QEMU it runs, so the cached build resumes the
+# deployed snapshot: a fair test only of patches that leave the machine's
+# state as it is (0015 and 0017 do; resume times matched the deployed
+# build's).  A ref whose build is not in the cache tests nothing.
+#
+# The run never fails, because every failed run emails the repository owner.
+# The outcome of each job is a commit status ("porty/webkit <query>" for
+# WebKit, "porty/webkit-chrome <query>" for Chrome), the job summary and a
+# "RESULT {json}" line in the log:
+#   gh api repos/<owner>/<repo>/commits/<sha>/statuses
+name: WebKit test
+
+on:
+  push:
+    branches: [swarm/webkit]
+    paths:
+      - .github/workflows/webkit-test.yml
+      - tests/boot/webkit-test.mjs
+      - tests/webkit/**
+  workflow_dispatch:
+    inputs:
+      queries:
+        description: Page parameters, one job per space-separated entry
+        type: string
+        default: wasmmem=1280&jitcap=4000 wasmmem=1280&jitcap=8000 wasmmem=1280&jitcap=15000
+      browsers:
+        description: Browsers (webkit, chrome), space separated
+        type: string
+        default: webkit chrome
+      minutes:
+        description: Deadline of one job's test in minutes
+        type: number
+        default: 30
+      probe_seconds:
+        description: Seconds to wait for Gallery after the tap
+        type: number
+        default: 480
+      bench:
+        description: 'JIT model: first (only the first query of each browser), all, none or only (no Android)'
+        type: string
+        default: first
+      device:
+        description: iphone (an iPhone's user agent, so the page takes its phone defaults) or desktop
+        type: string
+        default: iphone
+      coi:
+        description: 'Cross-origin isolation: auto, sw (only the page''s service worker) or route (headers added by the test)'
+        type: string
+        default: auto
+      browser_env:
+        description: 'Experiment: options of WebKit''s JavaScript engine as environment variables, e.g. JSC_useOMGJIT=0 (space separated)'
+        type: string
+        default: ''
+      table_grow:
+        description: 'Experiment: QEMU''s function table grows by this many entries at a time (0: as built, one per compiled block)'
+        type: number
+        default: 0
+      qemu:
+        description: 'QEMU-Wasm: deployed (the site''s) or cache (the build of this ref''s patches, from the Actions cache)'
+        type: string
+        default: deployed
+
+permissions:
+  contents: read
+  statuses: write  # the verdicts (tests/boot/webkit-test.mjs)
+
+concurrency:
+  group: webkit-test-${{ github.ref }}-${{ github.event_name }}-${{ inputs.queries }}-${{ inputs.browsers }}-${{ inputs.bench }}-${{ inputs.device }}-${{ inputs.coi }}-${{ inputs.table_grow }}-${{ inputs.browser_env }}-${{ inputs.qemu }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Matrix
+        id: matrix
+        env:
+          # A push runs one WebKit job; start the rest by hand.
+          QUERIES: ${{ inputs.queries || 'wasmmem=1280&jitcap=4000' }}
+          BROWSERS: ${{ inputs.browsers || 'webkit' }}
+          BENCH: ${{ inputs.bench || 'first' }}
+        run: |
+          # Only words of the characters page parameters and browser names need.
+          matrix="$(python3 -I - <<'EOF'
+          import json, os, re
+          word = re.compile(r"^[A-Za-z0-9_=&.,:%+-]{1,90}$")
+          queries = [q for q in os.environ["QUERIES"].split() if word.match(q)][:8] or ["wasmmem=1280&jitcap=4000"]
+          browsers = [b for b in os.environ["BROWSERS"].split() if b in ("webkit", "chrome")] or ["webkit"]
+          bench = os.environ["BENCH"] if os.environ["BENCH"] in ("first", "all", "none", "only") else "first"
+          jobs = []
+          for b in browsers:
+              for i, q in enumerate(queries):
+                  mode = {"all": "1", "none": "0", "only": "only"}.get(bench, "1" if i == 0 else "0")
+                  jobs.append({"browser": b, "query": q, "bench": mode})
+          print(json.dumps({"include": jobs}))
+          EOF
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix"
+
+  test:
+    name: ${{ matrix.browser }} ${{ matrix.query }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The pinned Playwright (tests/webkit/package-lock.json), without its
+      # install scripts.
+      - name: Install playwright-core
+        continue-on-error: true
+        working-directory: tests/webkit
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # Playwright's WebKit build and the system libraries it needs.  The
+      # download is untrusted: it gets a directory of its own outside the
+      # checkout, and nothing in it is run but the browser, by Playwright.
+      - name: Install WebKit
+        if: ${{ matrix.browser == 'webkit' }}
+        continue-on-error: true
+        working-directory: tests/webkit
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: |
+          mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+          npx --no-install playwright-core install --with-deps webkit
+          ls "$PLAYWRIGHT_BROWSERS_PATH"
+
+      - name: Read pinned versions
+        id: versions
+        if: ${{ inputs.qemu == 'cache' }}
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+          } >> "$GITHUB_OUTPUT"
+
+      # The key of build-and-deploy.yml and branch-check.yml.  A branch
+      # sees its own caches and main's.
+      - name: Restore this ref's QEMU-Wasm build
+        id: qemu-cache
+        if: ${{ inputs.qemu == 'cache' }}
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Test
+        continue-on-error: true
+        env:
+          QEMU_SOURCE: ${{ inputs.qemu || 'deployed' }}
+          LOCAL_QEMU: ${{ steps.qemu-cache.outputs.cache-hit == 'true' && format('{0}/out/qemu', github.workspace) || '' }}
+          PLAYWRIGHT_DIR: ${{ github.workspace }}/tests/webkit
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          GITHUB_TOKEN: ${{ github.token }}
+          BROWSER: ${{ matrix.browser }}
+          QUERY: ${{ matrix.query }}
+          BENCH: ${{ matrix.bench }}
+          MINUTES: ${{ inputs.minutes || 30 }}
+          PROBE_SECONDS: ${{ inputs.probe_seconds || 480 }}
+          DEVICE: ${{ inputs.device || 'iphone' }}
+          COI: ${{ inputs.coi || 'auto' }}
+          TABLE_GROW: ${{ inputs.table_grow || 0 }}
+          BROWSER_ENV: ${{ inputs.browser_env }}
+        run: |
+          # Project site of this repository: https://<owner>.github.io/<repo>/
+          SITE_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          export SITE_URL
+          if [ "$QEMU_SOURCE" = cache ] && [ -z "$LOCAL_QEMU" ]; then
+            echo "::warning title=Porty WebKit test::qemu=cache, but the cache has no QEMU-Wasm build for this ref's patches: nothing tested"
+            echo "qemu=cache, but the cache has no QEMU-Wasm build for this ref's patches (build it with branch-check or build-and-deploy first): nothing tested." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          nproc
+          free -m
+          grep -m1 'model name' /proc/cpuinfo || true
+          # The test ends itself at its deadline; this only stops a hang
+          # before the job's own timeout would turn the run red.
+          timeout -k 30 "$((MINUTES + 25))m" node tests/boot/webkit-test.mjs || echo "the test ended with status $?"

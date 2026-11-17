@@ -1,0 +1,143 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 01:30:00 +0000
+Subject: [PATCH] main-loop: wait instead of spinning under Emscripten
+
+Under Emscripten, poll() never waits: it looks at the file descriptors
+(in JavaScript, proxied to the page's thread) and returns at once.  So
+QEMU's main loop thread spun, some 50000 polls a second even with the
+guest idle; each poll made garbage in that thread's JavaScript heap,
+which WebKit collects only after gigabytes (JavaScriptCore counts the
+shared WebAssembly memory as live in every thread's heap), and the loop
+kept a core and a good part of the page's thread busy.
+
+The main loop now polls without waiting and, when nothing is ready,
+waits on a futex for the rest of its timeout, at most
+porty_main_loop_wait_ms (8 ms by default; porty_set_main_loop_wait(0)
+restores the spinning poll).  event_notifier_set() wakes it, which is
+how other threads reach the main loop: bottom halves, thread pool
+completions, timers set from other threads.  The timeout is short anyway:
+wasmfb drains its input ring on an 8 ms timer.  porty_main_loop_stats()
+counts polls, waits and wakes.
+---
+  util/event_notifier-posix.c |  8 +++++
+  util/main-loop.c            | 73 +++++++++++++++++++++++++++++++++++++++++++++
+  2 files changed, 81 insertions(+)
+
+diff --git a/util/event_notifier-posix.c b/util/event_notifier-posix.c
+index 76420c5..d5b6d1d 100644
+--- a/util/event_notifier-posix.c
++++ b/util/event_notifier-posix.c
+@@ -101,6 +101,11 @@ int event_notifier_get_wfd(const EventNotifier *e)
+     return e->wfd;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++/* Porty: util/main-loop.c, wakes the main loop where it waits. */
++void porty_main_loop_kick(void);
++#endif
++
+ int event_notifier_set(EventNotifier *e)
+ {
+     static const uint64_t value = 1;
+@@ -113,6 +118,9 @@ int event_notifier_set(EventNotifier *e)
+     do {
+         ret = write(e->wfd, &value, sizeof(value));
+     } while (ret < 0 && errno == EINTR);
++#ifdef __EMSCRIPTEN__
++    porty_main_loop_kick();
++#endif
+ 
+     /* EAGAIN is fine, a read must be pending.  */
+     if (ret < 0 && errno != EAGAIN) {
+diff --git a/util/main-loop.c b/util/main-loop.c
+index 797b640..5d5cd18 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -293,6 +293,75 @@ static void glib_pollfds_poll(void)
+ 
+ #define MAX_MAIN_LOOP_SPIN (1000)
+ 
++#ifdef __EMSCRIPTEN__
++/*
++ * Porty: under Emscripten, poll() never waits: it looks at the file
++ * descriptors (in JavaScript, on the page's thread) and returns at once, so
++ * this loop spun some 50000 times a second.  Each of those polls makes
++ * garbage in this thread's JavaScript heap, which WebKit collects only once
++ * gigabytes have accumulated, and it kept a core and a good part of the
++ * page's thread busy.  Here the loop polls without waiting, and when
++ * nothing is ready waits on a futex instead, for the rest of its timeout
++ * (at most porty_main_loop_wait_ms).  event_notifier_set() wakes it: that
++ * is how other threads reach the main loop (bottom halves, thread pool
++ * completions, timers set from other threads).  The timeout is at most a
++ * few milliseconds anyway, as wasmfb drains its input ring on an 8 ms timer.
++ */
++#include <emscripten/emscripten.h>
++#include <emscripten/threading.h>
++
++static int porty_main_loop_wake;
++static int porty_main_loop_wait_ms = 8;
++static uint32_t porty_main_loop_counts[3];  /* polls, waits, kicks */
++
++void porty_main_loop_kick(void);
++void porty_main_loop_kick(void)
++{
++    qatomic_inc(&porty_main_loop_wake);
++    qatomic_inc(&porty_main_loop_counts[2]);
++    emscripten_futex_wake(&porty_main_loop_wake, INT_MAX);
++}
++
++/*
++ * Porty: the longest the main loop waits when nothing is ready, in ms;
++ * 0 restores the spinning poll.  Returns the value in effect.  The page
++ * sets it (?mlwait=) before main() starts.
++ */
++int porty_set_main_loop_wait(int ms);
++EMSCRIPTEN_KEEPALIVE int porty_set_main_loop_wait(int ms)
++{
++    qatomic_set(&porty_main_loop_wait_ms, MAX(0, MIN(ms, 1000)));
++    return qatomic_read(&porty_main_loop_wait_ms);
++}
++
++/* Porty: [0] polls of the main loop, [1] waits, [2] wakes (kicks). */
++uint32_t *porty_main_loop_stats(void);
++EMSCRIPTEN_KEEPALIVE uint32_t *porty_main_loop_stats(void)
++{
++    return porty_main_loop_counts;
++}
++
++static int porty_main_loop_poll(GPollFD *fds, guint nfds, int64_t timeout)
++{
++    int max_ms = qatomic_read(&porty_main_loop_wait_ms);
++    int seen = qatomic_read(&porty_main_loop_wake);
++    int ret;
++
++    qatomic_inc(&porty_main_loop_counts[0]);
++    if (max_ms <= 0) {
++        return qemu_poll_ns(fds, nfds, timeout);
++    }
++    ret = qemu_poll_ns(fds, nfds, 0);
++    if (ret == 0 && timeout != 0) {
++        double ms = timeout < 0 ? max_ms : MIN((double)timeout / SCALE_MS, max_ms);
++        qatomic_inc(&porty_main_loop_counts[1]);
++        emscripten_futex_wait(&porty_main_loop_wake, seen, ms);
++        ret = qemu_poll_ns(fds, nfds, 0);
++    }
++    return ret;
++}
++#endif
++
+ static int os_host_main_loop_wait(int64_t timeout)
+ {
+     GMainContext *context = g_main_context_default();
+@@ -305,7 +374,11 @@ static int os_host_main_loop_wait(int64_t timeout)
+     qemu_mutex_unlock_iothread();
+     replay_mutex_unlock();
+ 
++#ifdef __EMSCRIPTEN__
++    ret = porty_main_loop_poll((GPollFD *)gpollfds->data, gpollfds->len, timeout);
++#else
+     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
++#endif
+ 
+     replay_mutex_lock();
+     qemu_mutex_lock_iothread();
