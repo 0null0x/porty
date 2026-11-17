@@ -1,0 +1,641 @@
+# QEMU crash hunt: QEMU-Wasm's threads sometimes die of an uncaught
+# Emscripten longjmp ("Uncaught Infinity") or "memory access out of bounds".
+#
+#   mode=glue    prints the QEMU-Wasm build of this branch's patches (out.js,
+#                the worker glue and the .wasm, gzip+base64 between marker
+#                lines) so that call frames can be mapped to code; the
+#                Pages site and artifact downloads are not reachable from
+#                every place the logs are read.
+#   mode=stress  boots this branch's site (assembled from the caches, as
+#                branch-boot-test.yml does) in several jobs at once, drives
+#                taps, clicks, swipes and the Home and Back keys after the
+#                boot (STRESS_MINUTES of the boot test) or leaves the guest
+#                alone, and counts worker exceptions.  With trace on, the
+#                glue is instrumented (tests/boot/longjmp-trace.mjs) so that
+#                a longjmp that no setjmp frame will catch prints where it
+#                was thrown from.
+#   mode=build   builds the QEMU-Wasm of patches_from (and extra_patches_from)
+#                into this branch's cache, for later stress runs with the
+#                same two inputs (branch-check.yml builds only what a push
+#                carries).
+#   mode=sjlj    builds tests/boot/sjlj-drift.c with Emscripten 3.1.50 and
+#                runs it under Node: the same setjmp, Asyncify unwind and
+#                rewind, and longjmp as QEMU-Wasm's vCPU thread, without
+#                QEMU, with and without patch 0016's fix.
+#
+# A push of this file or of tests/boot/qemu-crash.json runs what that JSON
+# file says; a manual start takes the same settings as inputs:
+#   gh workflow run qemu-crash.yml -R <owner>/<repo> --ref swarm/qemu-crash \
+#     -f mode=stress -f variants='["full-input","resume-input"]' -f reps='[1,2,3]'
+#
+# The run never fails, because every failed run emails the repository owner.
+# Verdicts are commit statuses ("porty/crash ...") and job summaries.
+name: QEMU crash
+
+on:
+  push:
+    branches: [swarm/qemu-crash]
+    paths:
+      - .github/workflows/qemu-crash.yml
+      - tests/boot/qemu-crash.json
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: glue, build, sjlj or stress
+        type: string
+        default: stress
+      variants:
+        description: 'JSON list of variants: full-input, full-quiet, resume-input, resume-quiet (a suffix ":<query>" adds page parameters)'
+        type: string
+        default: '["full-input","full-quiet","resume-input","resume-quiet"]'
+      reps:
+        description: JSON list, one job per element and variant
+        type: string
+        default: '[1,2]'
+      minutes:
+        description: Minutes per job
+        type: number
+        default: 70
+      stress_minutes:
+        description: Minutes of input after the boot (the -input variants)
+        type: number
+        default: 45
+      trace:
+        description: 'Instrument the glue (tests/boot/longjmp-trace.mjs flags): 0 off, 1 report an uncaught longjmp, +2 the last 8 longjmps (allocates per longjmp), +4 C stack depth'
+        type: string
+        default: '1'
+      patches_from:
+        description: Commit whose QEMU-Wasm build (patches and build script) to test, e.g. a main commit for the build without this branch's patches; empty is this commit's
+        type: string
+        default: ''
+      extra_patches_from:
+        description: Commit whose QEMU-Wasm patch files the chosen set lacks are added to it (another branch's new patch, to test both together); empty adds none
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: qemu-crash-${{ github.ref }}-${{ github.event_name }}-${{ inputs.mode }}-${{ inputs.variants }}-${{ inputs.reps }}-${{ inputs.trace }}-${{ inputs.patches_from }}-${{ inputs.extra_patches_from }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  setup:
+    name: Settings
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.s.outputs.mode }}
+      variants: ${{ steps.s.outputs.variants }}
+      reps: ${{ steps.s.outputs.reps }}
+      minutes: ${{ steps.s.outputs.minutes }}
+      stress_minutes: ${{ steps.s.outputs.stress_minutes }}
+      trace: ${{ steps.s.outputs.trace }}
+      patches_from: ${{ steps.s.outputs.patches_from }}
+      extra_patches_from: ${{ steps.s.outputs.extra_patches_from }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Settings
+        id: s
+        env:
+          EVENT: ${{ github.event_name }}
+          I_MODE: ${{ inputs.mode }}
+          I_VARIANTS: ${{ inputs.variants }}
+          I_REPS: ${{ inputs.reps }}
+          I_MINUTES: ${{ inputs.minutes }}
+          I_STRESS: ${{ inputs.stress_minutes }}
+          I_TRACE: ${{ inputs.trace }}
+          I_PATCHES_FROM: ${{ inputs.patches_from }}
+          I_EXTRA_PATCHES_FROM: ${{ inputs.extra_patches_from }}
+        run: |
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          print('mode=' + os.environ['I_MODE'])
+          print('variants=' + json.dumps(json.loads(os.environ['I_VARIANTS'])))
+          print('reps=' + json.dumps(json.loads(os.environ['I_REPS'])))
+          print('minutes=%d' % int(float(os.environ['I_MINUTES'] or 70)))
+          print('stress_minutes=%d' % int(float(os.environ['I_STRESS'] or 45)))
+          print('trace=%d' % (int(os.environ['I_TRACE']) if os.environ['I_TRACE'].isdigit() else 0))
+          for name in ('patches_from', 'extra_patches_from'):
+              ref = os.environ.get('I_' + name.upper(), '').strip()
+              print(name + '=' + (ref if all(c in '0123456789abcdefABCDEF' for c in ref) and len(ref) <= 40 else ''))
+          EOF
+          else
+            python3 -I - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          c = json.load(open('tests/boot/qemu-crash.json'))
+          print('mode=' + c.get('mode', 'stress'))
+          print('variants=' + json.dumps(c.get('variants', ['full-input'])))
+          print('reps=' + json.dumps(c.get('reps', [1])))
+          print('minutes=%d' % int(c.get('minutes', 70)))
+          print('stress_minutes=%d' % int(c.get('stress_minutes', 45)))
+          print('trace=%d' % int(c.get('trace', 1)))
+          print('patches_from=' + str(c.get('patches_from', '')))
+          print('extra_patches_from=' + str(c.get('extra_patches_from', '')))
+          EOF
+          fi
+          cat "$GITHUB_OUTPUT"
+
+  glue:
+    name: Print the QEMU-Wasm build
+    needs: setup
+    if: needs.setup.outputs.mode == 'glue'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Print
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: |
+          cd out/qemu
+          ls -l
+          sha256sum out.js qemu-system-x86_64.worker.js qemu-system-x86_64.wasm
+          for f in out.js qemu-system-x86_64.worker.js qemu-system-x86_64.wasm; do
+            echo "-----BEGIN PORTY FILE $f-----"
+            gzip -9c "$f" | base64 -w 50000
+            echo "-----END PORTY FILE-----"
+          done
+
+  # A QEMU-Wasm build for the stress mode's patches_from and
+  # extra_patches_from, saved under the key the stress jobs restore (the
+  # steps of branch-check.yml's build job).
+  build:
+    name: Build QEMU-Wasm
+    needs: setup
+    if: needs.setup.outputs.mode == 'build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Take the QEMU-Wasm patches of another commit
+        id: patches
+        env:
+          FROM: ${{ needs.setup.outputs.patches_from }}
+          EXTRA: ${{ needs.setup.outputs.extra_patches_from }}
+        run: |
+          if [[ -n "$FROM" ]]; then
+            rm -rf patches/qemu-wasm
+            git checkout "$FROM" -- patches/qemu-wasm build/build-qemu.sh build/pc-bios.list scripts/wasm-info.py
+          fi
+          if [[ -n "$EXTRA" ]]; then
+            for f in $(git ls-tree --name-only "$EXTRA" patches/qemu-wasm/); do
+              [[ -e "$f" ]] || { git show "$EXTRA:$f" > "$f"; echo "added $f"; }
+            done
+          fi
+          ls patches/qemu-wasm
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+          lookup-only: true
+
+      - name: Check out QEMU-Wasm and apply the patches
+        id: apply
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: build/apply-patches.sh "$RUNNER_TEMP/qemu-wasm"
+
+      - name: Set up Docker Buildx
+        id: buildx
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.apply.outcome == 'success'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Prepare an empty Docker build context
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.apply.outcome == 'success'
+        run: mkdir -p "$RUNNER_TEMP/empty-context"
+
+      # Reads main's toolchain layer cache; branches do not write it.
+      - name: Build the toolchain image
+        id: toolchain
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.apply.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ runner.temp }}/empty-context
+          file: ${{ runner.temp }}/qemu-wasm/Dockerfile
+          tags: porty-qemu-build:local
+          load: true
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=qemu-wasm-toolchain
+
+      - name: Compile qemu-system-x86_64 to WebAssembly
+        id: compile
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.toolchain.outcome == 'success'
+        continue-on-error: true
+        env:
+          WASM_MEMORY_MB: ${{ steps.versions.outputs.wasm_memory_mb }}
+        run: |
+          mkdir -p out/qemu
+          docker run --rm \
+            -e WASM_MEMORY_MB \
+            -v "$RUNNER_TEMP/qemu-wasm:/qemu" \
+            -v "$PWD:/porty:ro" \
+            -v "$PWD/out/qemu:/out" \
+            porty-qemu-build:local \
+            bash /porty/build/build-qemu.sh
+          sudo chown -R "$(id -u):$(id -g)" out/qemu
+          ls -l out/qemu
+
+      - name: Save the QEMU-Wasm build
+        id: save
+        if: steps.qemu-cache.outputs.cache-hit != 'true' && steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FROM: ${{ needs.setup.outputs.patches_from }}
+          EXTRA: ${{ needs.setup.outputs.extra_patches_from }}
+          HIT: ${{ steps.qemu-cache.outputs.cache-hit }}
+          APPLY: ${{ steps.apply.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          SAVE: ${{ steps.save.outcome }}
+        run: |
+          base="${FROM:-this}"
+          name="qemu@${base:0:7}${EXTRA:++${EXTRA:0:7}}"
+          state=failure
+          if [[ "$HIT" == true ]]; then text="already in the cache"; state=success
+          elif [[ "$APPLY" != success ]]; then text="the patches do not apply"
+          elif [[ "$COMPILE" != success ]]; then text="the build failed"
+          elif [[ "$SAVE" != success ]]; then text="built, but not saved to the cache"
+          else text="built and saved to the cache"; state=success
+          fi
+          text="$text; patches: $(ls patches/qemu-wasm | sed 's/-.*//' | tr '\n' ' ')"
+          echo "$state: $text"
+          echo "## Build $name: $text" >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="porty/crash build $name" \
+            -f description="$(printf '%s' "$text" | cut -c1-139)" -f target_url="$RUN_URL" >/dev/null || true
+          exit 0
+
+  # The mechanism without QEMU: tests/boot/sjlj-drift.c, built with the
+  # Emscripten of QEMU-Wasm's toolchain image (3.1.50) and the same kind of
+  # flags (pthreads, Asyncify, longjmp emulated in JavaScript).
+  sjlj:
+    name: Emscripten longjmp after an Asyncify rewind
+    needs: setup
+    if: needs.setup.outputs.mode == 'sjlj'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/sjlj"
+          docker run --rm -v "$PWD/tests/boot:/src:ro" -v "$RUNNER_TEMP/sjlj:/out" \
+            emscripten/emsdk:3.1.50 \
+            emcc -O2 -g2 -pthread -sASYNCIFY -sPROXY_TO_PTHREAD -sEXIT_RUNTIME \
+              -sINITIAL_MEMORY=64MB -sENVIRONMENT=node,worker \
+              /src/sjlj-drift.c -o /out/sjlj-drift.js
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/sjlj"
+          ls -l "$RUNNER_TEMP/sjlj"
+
+      - name: Run
+        id: run
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP/sjlj"
+          node --version
+          while read -r name args; do
+            echo "::group::$name: $args"
+            set +e
+            timeout 120 node sjlj-drift.js $args > "$name.out" 2>&1
+            echo "exit $?" >> "$name.out"
+            set -e
+            cat "$name.out"
+            echo "::endgroup::"
+          done <<'EOF'
+          control none 0 0 50 0x01
+          sleep sleep 0 0 400 0x01
+          sleep-a5 sleep 0 0 400 0xa5
+          fiber fiber 0 0 400 0x01
+          sleep-fixed sleep 1 0 400 0x01
+          fiber-fixed fiber 1 0 400 0x01
+          sleep-1mib sleep 0 1024 400 0x01
+          EOF
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd "$RUNNER_TEMP/sjlj" 2>/dev/null || { echo "no build"; exit 0; }
+          python3 -I - ./*.out <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY" > summary.txt
+          import os, re, sys
+          print('## Emscripten longjmp after an Asyncify rewind\n')
+          for path in sys.argv[1:]:
+              text = open(path, errors='replace').read()
+              rounds = [(int(a), int(b), int(c)) for a, b, c in re.findall(r'round (\d+): stack pointer (-?\d+) bytes below where setjmp\(\) was, (-?\d+) above', text)]
+              code = re.findall(r'^exit (\d+)', text, re.M)
+              ok = 'SJLJ RESULT' in text
+              err = ''
+              for pattern in (r'out of bounds|RuntimeError|Aborted|unreachable', r'Infinity', r'error'):
+                  hits = [l.strip() for l in text.splitlines() if re.search(pattern, l, re.I) and not l.startswith('round ')]
+                  if hits:
+                      err = hits[0][:120]
+                      break
+              per = (rounds[-1][1] / rounds[-1][0]) if rounds else 0
+              last = rounds[-1] if rounds else (0, 0, 0)
+              print('- %s: %d rounds, stack pointer %d bytes lower after the last (%.0f per round), %d above the stack end; %s%s' % (
+                  os.path.basename(path)[:-4], last[0], last[1], per, last[2],
+                  'finished' if ok else 'DIED (exit %s)' % (code[-1] if code else '?'),
+                  (': ' + err) if err and not ok else ''))
+          EOF
+          cat summary.txt
+          state=success
+          grep -q -E '^- (sleep|sleep-a5|fiber): .*finished' summary.txt && state=failure
+          grep -q -E '^- (sleep-fixed|fiber-fixed|control|sleep-1mib): .*DIED' summary.txt && state=failure
+          desc="$(grep -E '^- (sleep|sleep-fixed):' summary.txt | sed 's/^- //; s/ rounds, stack pointer / rounds, sp -/; s/ bytes lower after the last//' | tr '\n' ' ' | cut -c1-139)"
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="porty/crash sjlj" \
+            -f description="$desc" -f target_url="$RUN_URL" >/dev/null || true
+          exit 0
+
+  stress:
+    name: ${{ matrix.variant }} ${{ matrix.rep }}
+    needs: setup
+    if: needs.setup.outputs.mode == 'stress'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        variant: ${{ fromJSON(needs.setup.outputs.variants) }}
+        rep: ${{ fromJSON(needs.setup.outputs.reps) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        continue-on-error: true
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The QEMU-Wasm build of another commit (patches_from), with this
+      # commit's page and tests: the caches are keyed by the patches.
+      - name: Take the QEMU-Wasm patches of another commit
+        id: patches
+        if: steps.checkout.outcome == 'success' && (needs.setup.outputs.patches_from != '' || needs.setup.outputs.extra_patches_from != '')
+        continue-on-error: true
+        env:
+          FROM: ${{ needs.setup.outputs.patches_from }}
+          EXTRA: ${{ needs.setup.outputs.extra_patches_from }}
+        run: |
+          if [[ -n "$FROM" ]]; then
+            rm -rf patches/qemu-wasm
+            git checkout "$FROM" -- patches/qemu-wasm build/build-qemu.sh build/pc-bios.list scripts/wasm-info.py
+          fi
+          if [[ -n "$EXTRA" ]]; then
+            for f in $(git ls-tree --name-only "$EXTRA" patches/qemu-wasm/); do
+              [[ -e "$f" ]] || { git show "$EXTRA:$f" > "$f"; echo "added $f"; }
+            done
+          fi
+          ls patches/qemu-wasm
+
+      - name: Read pinned versions
+        id: versions
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The keys of branch-boot-test.yml.
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        if: steps.versions.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Restore the prepared Android image
+        id: image-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore the resume snapshot
+        id: snapshot-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && startsWith(matrix.variant, 'resume')
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/artifact/snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}-${{ hashFiles('web/js/qemu-args.js', 'web/js/config.js', 'web/js/boot-diet.js', 'web/js/initramfs.js', 'scripts/snapshot/**') }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        with:
+          node-version: 22
+
+      - name: Assemble the site
+        id: site
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && steps.image-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        env:
+          HAVE_SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          SHA: ${{ steps.versions.outputs.sha }}
+          TRACE: ${{ needs.setup.outputs.trace }}
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
+          extra=()
+          if [[ "$HAVE_SNAPSHOT" == true ]]; then
+            extra=(--snapshot out/artifact/snapshot)
+          fi
+          scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$SHA" "${extra[@]}"
+          if [[ "$TRACE" != 0 ]]; then
+            # A copy: dist/qemu may hold hard links into out/qemu.
+            cp dist/qemu/out.js "$RUNNER_TEMP/out.js"
+            rm dist/qemu/out.js
+            cp "$RUNNER_TEMP/out.js" dist/qemu/out.js
+            node tests/boot/longjmp-trace.mjs dist/qemu/out.js "$TRACE"
+          fi
+          sha256sum dist/qemu/out.js dist/qemu/qemu-system-x86_64.wasm
+
+      - name: Boot and stress
+        id: boot
+        if: steps.site.outcome == 'success'
+        continue-on-error: true
+        env:
+          PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+          VARIANT: ${{ matrix.variant }}
+          REP: ${{ matrix.rep }}
+          MINUTES: ${{ needs.setup.outputs.minutes }}
+          STRESS: ${{ needs.setup.outputs.stress_minutes }}
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium)"
+          export CHROME SITE_URL="http://127.0.0.1:8080/"
+          cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || true)"
+          echo "runner CPU: ${cpu:-unknown}, $(nproc) threads"
+          "$CHROME" --version
+          kind="${VARIANT%%:*}"
+          extra=""
+          [[ "$VARIANT" == *:* ]] && extra="${VARIANT#*:}"
+          case "$kind" in
+            full-*) query="resume=0" ;;
+            *) query="" ;;
+          esac
+          [[ -n "$extra" ]] && query="${query:+$query&}$extra"
+          export QUERY="$query" STRESS_MINUTES="$STRESS" STRESS_SEED="$REP" INPUT_PROBE=0 RESUME_SETTLE=60
+          case "$kind" in
+            *-quiet) export STRESS_INPUT=0 ;;
+            *) export STRESS_INPUT=1 ;;
+          esac
+          echo "variant $VARIANT rep $REP: QUERY='$QUERY' STRESS_MINUTES=$STRESS_MINUTES STRESS_INPUT=$STRESS_INPUT MINUTES=$MINUTES"
+          work="$RUNNER_TEMP/stress"
+          mkdir -p "$work"
+          python3 tests/ui/serve.py dist 8080 "--log=$work/server.log" --isolate &
+          server=$!
+          for _ in $(seq 50); do
+            curl -fsS -o /dev/null "${SITE_URL}index.html" 2>/dev/null && break
+            sleep 0.2
+          done
+          node tests/boot/boot-test.mjs 2>&1 | tee "$work/boot.log" || true
+          kill "$server" 2>/dev/null || true
+          grep -a "RUN RESULT:" "$work/boot.log" | tail -1 | sed 's/^.*RUN RESULT: //' > "$work/result.json" || true
+          echo "cpu=${cpu:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.versions.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VARIANT: ${{ matrix.variant }}
+          REP: ${{ matrix.rep }}
+          FROM: ${{ needs.setup.outputs.patches_from }}
+          EXTRA: ${{ needs.setup.outputs.extra_patches_from }}
+          SITE: ${{ steps.site.outcome }}
+          SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          CPU: ${{ steps.boot.outputs.cpu }}
+        run: |
+          result="$RUNNER_TEMP/stress/result.json"
+          state=error
+          if [[ "$SITE" != success ]]; then text="site not assembled"
+          elif [[ ! -s "$result" ]]; then text="no result"
+          else
+            text="$(python3 -I - "$result" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          s = r.get('stress') or {}
+          errs = r.get('workerErrors') or []
+          parts = ['booted' if r.get('booted') else 'not booted', '%s min' % r.get('minutes')]
+          if errs:
+              parts.append('DIED at %d s: %s' % (errs[0]['atS'], errs[0]['text'][:60]))
+          else:
+              parts.append('no worker exception')
+          if s:
+              parts.append('stress %s min, %d actions' % (s.get('minutes'), sum((s.get('actions') or {}).values())))
+          print(', '.join(parts))
+          EOF
+          )"
+            state=success
+            grep -q DIED <<< "$text" && state=failure
+          fi
+          [[ "$SNAPSHOT" == true ]] && text="$text (resumed snapshot)"
+          build="this commit's QEMU-Wasm"
+          [[ -n "$FROM" ]] && build="QEMU-Wasm of ${FROM:0:7}"
+          [[ -n "$EXTRA" ]] && build="$build with the new patches of ${EXTRA:0:7}"
+          text="$text; $build"
+          qemu=""
+          if [[ -n "$FROM$EXTRA" ]]; then
+            base="${FROM:-this}"
+            qemu=" qemu@${base:0:7}${EXTRA:++${EXTRA:0:7}}"
+          fi
+          echo "$state: $text; CPU $CPU"
+          {
+            echo "## $VARIANT $REP"
+            echo
+            echo "- $text"
+            echo "- runner CPU: $CPU"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "${SHA:-}" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" -f state="$state" \
+              -f context="$(printf 'porty/crash %s %s%s' "$VARIANT" "$REP" "$qemu" | cut -c1-100)" \
+              -f description="$(printf '%s' "$text" | cut -c1-139)" -f target_url="$RUN_URL" >/dev/null || true
+          fi
+          exit 0
