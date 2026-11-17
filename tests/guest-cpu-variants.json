@@ -1,10 +1,10 @@
 {
-  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only); timescale: the page's time dilation for this variant (default 8); browser_like: after settling, QEMU is slowed (cgroup cpu.max) until the guest runs the browser probe's calibration loop in this many guest seconds, as the page's guest does (about 2 at timescale 8), so that Android's timeouts fire as in the browser; launch_timeout: seconds per start. apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: the UI check after the starts. Round 8: \"not responding\" reports at browser speed (slow*), what keeps the guest busy after Android drew Gallery, and SwiftShader's settings (ss*, /SwiftShader.ini, which every process that draws reads from its working directory /).",
+  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only); timescale: the page's time dilation for this variant (default 8); browser_like: after settling, QEMU is slowed (cgroup cpu.max) until the guest runs the browser probe's calibration loop in this many guest seconds, as the page's guest does (about 2 at timescale 8), so that Android's timeouts fire as in the browser; launch_timeout: seconds per start. apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: the UI check after the starts. Round 8: \"not responding\" reports at browser speed (slow*), what keeps the guest busy after Android drew Gallery, and SwiftShader's settings (ss*, /SwiftShader.ini, which every process that draws reads from its working directory /). Round 9: a profile of a Gallery start (base, simpleperf by thread and symbol), and whether SwiftShader reads /SwiftShader.ini at all (ThreadCount=4 gives surfaceflinger more threads).",
   "base": "mem=768&tb=128&cache=16",
   "run": [
-    "slow",
-    "slow-dbgui",
-    "slow-notraces"
+    "base",
+    "base-count",
+    "ss-threads4"
   ],
   "jobs": 1,
   "rounds": 1,
@@ -86,6 +86,19 @@
       "query": "",
       "setup": [
         "mount -o remount,rw / && printf '[Processor]\\nThreadCount=2\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
+    },
+    "base-count": {
+      "query": "",
+      "setup": [
+        "sleep 60; echo SFTASKS:$(ls /proc/$(pidof surfaceflinger)/task | wc -l); cat /proc/$(pidof surfaceflinger)/task/*/comm | sort | uniq -c | tr '\\n' ' '"
+      ]
+    },
+    "ss-threads4": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Processor]\\nThreadCount=4\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; ls -l /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted",
+        "sleep 60; echo SFTASKS:$(ls /proc/$(pidof surfaceflinger)/task | wc -l); cat /proc/$(pidof surfaceflinger)/task/*/comm | sort | uniq -c | tr '\\n' ' '"
       ]
     }
   }

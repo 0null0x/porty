@@ -470,7 +470,10 @@ def profile(g, app, opts, result):
     _, base = screen_diff(vm, "base", None)
     del base
     g.sh("echo 0 > /proc/sys/kernel/kptr_restrict; echo -1 > /proc/sys/kernel/perf_event_paranoid; rm -f /data/local/tmp/perf.data", 30)
-    g.sh(f"(simpleperf record -a -e cpu-clock -f {opts.profile_hz} --duration {opts.profile_seconds} "
+    # --duration is in the guest's (dilated) seconds: profile_seconds of
+    # wall time.
+    duration = max(5, round(opts.profile_seconds / max(1, opts.ts)))
+    g.sh(f"(simpleperf record -a -e cpu-clock -f {opts.profile_hz} --duration {duration} "
          f"-o /data/local/tmp/perf.data > /data/local/tmp/perf.log 2>&1 &)", 30)
     prov.wait(vm, 2)
     if app["how"] == "tap":
@@ -484,8 +487,12 @@ def profile(g, app, opts, result):
             break
         prov.wait(vm, 5)
     out["record"] = g.sh("cat /data/local/tmp/perf.log | tail -5", 30)[1]
-    for key, sort, limit in (("by_process", "comm", 0.5), ("by_dso", "comm,dso", 0.7), ("by_symbol", "comm,dso,symbol", 0.4)):
-        status, text = g.sh(f"simpleperf report -i /data/local/tmp/perf.data --sort {sort} --percent-limit {limit} 2>&1"
+    log(f"profile {app['name']} record: {out['record'].strip()}")
+    for key, args in (("by_thread", "--sort pid,comm --percent-limit 0.5"),
+                      ("by_dso", "--sort pid,comm,dso --percent-limit 0.7"),
+                      ("renderthreads", "--comms RenderThread --sort pid,dso,symbol --percent-limit 0.5"),
+                      ("surfaceflinger", "--comms surfaceflinger --sort dso,symbol --percent-limit 0.5")):
+        status, text = g.sh(f"simpleperf report -i /data/local/tmp/perf.data {args} 2>&1"
                             f" | head -70 | cut -c1-200", 600)
         out[key] = text
         log(f"profile {app['name']} {key}:\n{text}")
@@ -641,6 +648,7 @@ def main():
     vm = snap.Machine(opts.qemu, argv, opts.work)
     log("QEMU started: " + " ".join(vm.args))
     timescale = int(variant.get("timescale", opts.timescale))
+    opts.ts = timescale
     if timescale > 1:
         result["timescale"] = set_time_scale(vm, timescale)
     if "launch_timeout" in variant:
