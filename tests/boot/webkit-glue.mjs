@@ -9,6 +9,9 @@
 //          from workers, clock reads (clock_time_get) and polls
 //   ffi    libffi's ffi_call_js without the arrays it allocates
 //   slice  instantiate_wasm copies a block's bytes once instead of twice
+//   pace, pace-<ms>
+//          threads that run the glue often let the engine collect every few
+//          PACE_MS (default 250 ms); see PACE_PRELUDE
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -103,6 +106,34 @@ function ffi_call_js(cif, fn, rvalue, avalue) {
 }
 `;
 
+// JavaScriptCore counts the shared WebAssembly memory as live in the heap
+// of every thread that holds it (the memory's size as extra memory, and its
+// buffer once more), so a thread's next collection waits until about twice
+// that much has been allocated after the last one: some 2.5 GB with 1280 MiB.
+// "pace" makes the threads that run the glue often create, every PACE_MS,
+// a shared memory as big as QEMU's and drop it: reserved, never touched, it
+// costs no RAM, but the engine counts its size as allocated, so a busy
+// thread collects after a few of them instead of after gigabytes of garbage.
+export const PACE_PRELUDE = (ms) => `
+var portyPaceCalls = 0, portyPaceNext = 0, portyPaceCount = 0;
+function portyPace() {
+  portyPaceCalls = 0;
+  var now = performance.now();
+  if (now < portyPaceNext) return;
+  portyPaceNext = now + ${ms};
+  try {
+    var pages = Math.max(256, Math.min(65536, wasmMemory.buffer.byteLength >>> 16));
+    new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+    portyPaceCount++;
+  } catch (e) {
+    portyPaceNext = Infinity;
+  }
+}
+function portyPaceTick() {
+  if (++portyPaceCalls > 1023) portyPace();
+}
+`;
+
 /** Insert text before Emscripten's import object, or else before the first invoke wrapper. */
 export function insertBeforeImports(js, text) {
     for (const anchor of [/\n\s*var wasmImports\s*=/, /\nfunction invoke_[a-z]+\(/]) {
@@ -142,6 +173,19 @@ export function glueRewrite(js, names, applied = {}) {
         if (!applied.ffi) {
             out = kept;
         }
+    }
+    const paceName = names.find((n) => /^pace(-\d+)?$/.test(n));
+    if (paceName) {
+        const ms = Math.max(20, Math.min(10000, Number(paceName.split('-')[1]) || 250));
+        const before = out.length;
+        out = insertBeforeImports(out, PACE_PRELUDE(ms));
+        let ticks = out.length > before ? 0 : -1000;
+        ticks += count(/(function (?:ffi_call_js|portyFfiSlow|instantiate_wasm|_clock_time_get)\([^)]*\)\s*\{)/g, (m, a) => `${a} portyPaceTick();`);
+        ticks += count(/((?:__emscripten_throw_longjmp\s*=\s*\(\)\s*=>)\s*\{)/, (m, a) => `${a} portyPaceTick();`);
+        ticks += count(/(function invoke_[a-zA-Z0-9]+\([^)]*\)\s*\{\s*var sp = stackSave\(\);)/g, (m, a) => `${a} portyPaceTick();`);
+        ticks += count(/(var ___syscall_poll\s*=\s*\([^)]*\)\s*=>\s*)(PTY_wrapPoll\(\(\) => xterm_pty_old_poll\([^)]*\)\));/,
+            (m, a, b) => `${a}(portyPaceTick(), ${b});`);
+        applied.pace = Math.max(0, ticks);
     }
     if (names.includes('slice')) {
         applied.slice = count(/new Uint8Array\(HEAP8\.slice\(([^()]*)\)\)/, (m, a) => `HEAP8.slice(${a})`);

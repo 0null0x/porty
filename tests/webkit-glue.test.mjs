@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
 import {
-    COUNT_PRELUDE, COUNTER_BASE, COUNTER_CONTEXTS, COUNTER_NAMES, COUNTER_ROWS, FFI_FAST, glueRewrite,
+    COUNT_PRELUDE, COUNTER_BASE, COUNTER_CONTEXTS, COUNTER_NAMES, COUNTER_ROWS, FFI_FAST, PACE_PRELUDE, glueRewrite,
 } from './boot/webkit-glue.mjs';
 
 let failures = 0;
@@ -246,6 +246,46 @@ check('each context counts in a row of its own', () => {
     assert.deepEqual(row(0), [2, 0, 1, 0, 0, 0, 0, 0, 0]);
     assert.deepEqual(row(1), [0, 0, 0, 0, 0, 0, 0, 1, 0]);
     assert.ok(COUNTER_ROWS + COUNTER_CONTEXTS * COUNTER_NAMES.length * 4 <= 1024, 'the rows stay below GLOBAL_BASE');
+});
+
+check('pace puts a tick into the busy functions, and the result parses', () => {
+    const applied = {};
+    const out = glueRewrite(GLUE, ['pace-400', 'count'], applied);
+    // ffi_call_js, instantiate_wasm, _clock_time_get, the throw, two invoke wrappers, the poll
+    assert.equal(applied.pace, 7);
+    assert.ok(out.includes('portyPaceNext = now + 400;'));
+    // eslint-disable-next-line no-new-func
+    new Function(out);
+});
+
+check('the pacer makes a shared memory as big as the main one, at most every PACE_MS', () => {
+    let made = [];
+    class FakeMemory {
+        constructor(d) {
+            made.push(d);
+        }
+    }
+    let now = 0;
+    // eslint-disable-next-line no-new-func
+    const make = new Function('wasmMemory', 'performance', 'WebAssembly',
+        `${PACE_PRELUDE(250)}; return { tick: portyPaceTick, count: () => portyPaceCount };`);
+    const p = make({ buffer: { byteLength: 1280 * 1048576 } }, { now: () => now }, { Memory: FakeMemory });
+    for (let i = 0; i < 5000; i++) {
+        p.tick();
+    }
+    assert.equal(made.length, 1);
+    assert.deepEqual(made[0], { initial: 20480, maximum: 20480, shared: true });
+    now = 100;
+    for (let i = 0; i < 5000; i++) {
+        p.tick();
+    }
+    assert.equal(made.length, 1);
+    now = 300;
+    for (let i = 0; i < 5000; i++) {
+        p.tick();
+    }
+    assert.equal(made.length, 2);
+    made = [];
 });
 
 check('nothing changes without names', () => {
