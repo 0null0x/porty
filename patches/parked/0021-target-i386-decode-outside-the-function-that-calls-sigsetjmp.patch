@@ -1,0 +1,94 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 07:30:00 +0000
+Subject: [PATCH] target/i386: decode outside the function that calls
+ sigsetjmp
+
+Under Emscripten without WebAssembly exceptions, a function that calls
+setjmp makes every call it contains through a JavaScript invoke_* wrapper
+that catches longjmp, and checks the function's setjmp table after each
+one.  disas_insn() calls sigsetjmp() for its two longjmps (an instruction
+too long, a page crossed in the middle of one), and the compiler inlined
+the whole decoder into it and it into i386_tr_translate_insn(): the dozens
+of calls to tcg_gen_*() and the gen_* helpers that translating one guest
+instruction makes all went through JavaScript, and the function grew to
+196772 bytes of WebAssembly.  JavaScriptCore never compiles a function
+body over Options::maximumOMGCandidateCost bytes (40000 in WebKit 2.48,
+100000 since) with its optimizing tier, so in Safari the translator ran as
+baseline code for good.
+
+The decoder is now disas_insn_body(), noinline, called from disas_insn()
+after the sigsetjmp(): one call per guest instruction goes through
+JavaScript, and a longjmp from the decoder still lands in disas_insn().
+setjmp_gen_code() is noinline for the same reason, so that only its own
+calls, not all of tb_gen_code()'s, are made through JavaScript.
+---
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 87324bc..310e7e3 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -264,8 +264,12 @@ void page_init(void)
+ /*
+  * Isolate the portion of code gen which can setjmp/longjmp.
+  * Return the size of the generated code, or negative on error.
++ *
++ * Porty: noinline, or under Emscripten every call of tb_gen_code() would
++ * go through a JavaScript invoke_* wrapper (see disas_insn_body() in
++ * target/i386/tcg/translate.c).
+  */
+-static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
++static int __attribute__((noinline)) setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
+                            vaddr pc, void *host_pc,
+                            int *max_insns, int64_t *ti)
+ {
+diff --git a/target/i386/tcg/translate.c b/target/i386/tcg/translate.c
+index 037bc47..9020c97 100644
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -3059,15 +3059,25 @@ static void gen_cmpxchg16b(DisasContext *s, CPUX86State *env, int modrm)
+ }
+ #endif
+ 
++/*
++ * Porty: the decoder proper, out of disas_insn(), which calls sigsetjmp().
++ * Under Emscripten (without WebAssembly exceptions) a function that calls
++ * setjmp makes every call it contains through a JavaScript invoke_*
++ * wrapper that catches longjmp, followed by a check of the setjmp table.
++ * With the decoder inlined into disas_insn() (and that into
++ * i386_tr_translate_insn()), each of the dozens of calls to tcg_gen_*()
++ * and the gen_* helpers per guest instruction went through JavaScript, and
++ * the function had grown to 197 KB, which JavaScriptCore never compiles
++ * with its optimizing tier (Options::maximumOMGCandidateCost, 40000 or
++ * 100000 bytes).  Now one call per instruction goes through JavaScript;
++ * a longjmp from the decoder (advance_pc()) still lands in disas_insn().
++ */
++static bool disas_insn_body(DisasContext *s, CPUState *cpu);
++
+ /* convert one instruction. s->base.is_jmp is set if the translation must
+    be stopped. Return the next pc value */
+ static bool disas_insn(DisasContext *s, CPUState *cpu)
+ {
+-    CPUX86State *env = cpu_env(cpu);
+-    int b, prefixes;
+-    int shift;
+-    MemOp ot, aflag, dflag;
+-    int modrm, reg, rm, mod, op, opreg, val;
+     bool orig_cc_op_dirty = s->cc_op_dirty;
+     CCOp orig_cc_op = s->cc_op;
+     target_ulong orig_pc_save = s->pc_save;
+@@ -3108,6 +3118,16 @@ static bool disas_insn(DisasContext *s, CPUState *cpu)
+     default:
+         g_assert_not_reached();
+     }
++    return disas_insn_body(s, cpu);
++}
++
++static bool __attribute__((noinline)) disas_insn_body(DisasContext *s, CPUState *cpu)
++{
++    CPUX86State *env = cpu_env(cpu);
++    int b, prefixes;
++    int shift;
++    MemOp ot, aflag, dflag;
++    int modrm, reg, rm, mod, op, opreg, val;
+ 
+     prefixes = 0;
+ 
