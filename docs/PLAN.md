@@ -918,6 +918,61 @@ Three agents on Opus (branches `swarm/webkit-memory`, `swarm/qemu-crash`,
 3. Bound the wasm32 backend's per-block arrays.
 4. A real touchscreen (`virtio-multitouch-pci`).
 
+**Thirteenth round: WebKit's tiers, the code buffer, touch (2026-11-17).**
+Four agents on Opus (`swarm/webkit-jit`, `swarm/tcg-bounds`,
+`swarm/touchscreen`, `swarm/guest-cpu`), stopped by server restarts four
+times and resumed.
+
+- Per-TB tables (merge 23c3e6e, patch 0018, live since 7535503): the
+  wasm32 backend's per-TB thread-local tables were guarded only by
+  `tcg_debug_assert`, a no-op here. In fact every `assert()` in this
+  build is compiled out (NDEBUG; osdep.h's guard is off under
+  Emscripten). Over about 75 M translations the helper types reached 194
+  of their 200 bytes. Every writer now checks first, a full table starts
+  the TB over with fewer instructions, and the tables are larger. No
+  restarts in real runs; performance neutral.
+- The code buffer: at `tb=128` it is flushed 13-35 times per app launch
+  in the browser (3-6 natively), and 1-3 M blocks are retranslated. About
+  80% of the buffer is the blocks' wasm modules, and only 0.5-1% of blocks
+  are ever compiled. A module ring outside the buffer (webkit-jit, patch
+  0024) cuts flushes to about 1 per launch. At `jitcap=4000` the cap then
+  dominates; at 8000 with the ring and a clock policy, WebKit opened
+  Gallery 33% faster with a lower peak. Being decided with 0027 present.
+- JavaScriptCore's tiers (merge b891519, patch 0027, live since 17:56):
+  JSC's optimizing tier (OMG, B3 at O2) makes the TCI interpreter,
+  `tcg_qemu_tb_exec_tci`, about 1.7x slower, and that was most of
+  WebKit's lag behind Chrome. JSC never optimizes a wasm function over
+  `maximumOMGCandidateCost` (100,000 bytes; 40,000 in WebKit 2.48), so
+  0027 inlines 0015's helper switch into the interpreter (115,874 bytes).
+  WebKit's Gallery start: -32 to -55% on x86 and -27% on ARM64 (Linux
+  WebKit); Chrome about +3%. Making the translator's functions small for
+  JSC (0021, 0025, 0026, parked at bc49082) helped Chrome by 15% but
+  slowed WebKit and stalled its first echo, because `new
+  WebAssembly.Module` queues its validation behind OMG compiles on JSC's
+  shared worklist.
+- "Not responding" reports (merge a76a5e0, `anrtraces=`, live since
+  7535503): the only ANR seen in the browser is SystemUI missing
+  TIME_TICK during a cold start. Pointing `dalvik.vm.stack-trace-dir` at
+  an uncreatable path skips every stack dump but the culprit's, a third
+  of the report's cost. After an app shows, the guest is busy with
+  SwiftShader's LLVM compiling routines in each new process; no
+  SwiftShader.ini setting changed it.
+- Touch (merge 7535503, patch 0020, live since 16:59): `-device
+  virtio-multitouch-pci` instead of the USB tablet. Android 9 sees an
+  internal touchscreen in direct mode, with no arrow, taps where the
+  finger is, swipes, two-finger pinch, and a mouse as one finger.
+  Regression found after deploying: with the touchscreen guest, Gallery's
+  first frame ("Displayed") is 2.3-2.5x slower natively even with `am
+  start` (run 44137863037), and about 5x in the browser (+27-32 guest s
+  against +4-14). Being bisected: Configuration.touchscreen, touch mode,
+  the USB controller that left with the tablet. `?touch=0` restores the
+  tablet (a full boot).
+- Chrome's JIT dies about 2 minutes into a full boot. Dropped blocks
+  wait at the cap for collections that V8 never reports, because the vCPU
+  worker no longer allocates. `jitgcwait=` (webkit-jit) un-sticks it,
+  bounded at 2x the cap, but costs memory and does not shorten the boot.
+  Off by default; resume is unaffected.
+
 ## 8. Open questions for the first real run
 
 - Exact size of `system.sfs` and of the `.wasm` (section 4).
