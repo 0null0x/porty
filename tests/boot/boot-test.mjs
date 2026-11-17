@@ -59,6 +59,7 @@ import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
 import path from 'node:path';
 import { PCPU_FUNCTION, cpuDelta, describeCpu, parseCpuLine } from './cpu-probe.mjs';
+import { describeTcgTables, readTcgWords, tcgTables } from './tcg-tables.mjs';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
 const puppeteer = require('puppeteer-core');
@@ -1205,6 +1206,23 @@ function emit(name, info, b64) {
     console.log('-----END PORTY SCREENSHOT-----');
 }
 
+/**
+ * QEMU patch 0018: how full the wasm32 backend's per-TB tables got, as a
+ * "TCG TABLES" line (tests/boot/tcg-tables.mjs); quiet when nothing changed
+ * unless `always`.
+ */
+let lastTcgLine = '';
+async function logTcgTables(always = false) {
+    const words = await page.evaluate(`(${readTcgWords})(globalThis.__porty)`).catch(() => null);
+    const t = tcgTables(words);
+    const line = `${describeTcgTables(t)}${t ? ` ${JSON.stringify(t)}` : ''}`;
+    if (always || (t && line !== lastTcgLine)) {
+        log(`TCG TABLES: ${line}`);
+    }
+    lastTcgLine = line;
+    return t;
+}
+
 let exitCode = 0;
 let launchResult = null;
 let booted = false;
@@ -1260,6 +1278,11 @@ try {
         }
     });
     log('started');
+    // Every minute, whichever phase the test is in.
+    const tcgTimer = setInterval(() => {
+        logTcgTables().catch(() => {});
+    }, 60000);
+    tcgTimer.unref();
 
     const deadline = t0 + minutes * 60000;
     // Progress: a commit status every two minutes (readable while the run is
@@ -1514,6 +1537,7 @@ const launchLine = launchResult
         `${launchResult.focusedAtEnd ? 'focused' : 'not focused'} at ${secs(launchResult.logAnsweredS)} ` +
         `(${launchResult.conditions})`
     : '';
+await logTcgTables(true).catch(() => {});
 log(`SUMMARY: ${verdict}; state=${finalState}; elapsed ${elapsed()}${launchLine ? `; ${launchLine}` : ''}`);
 if (stressMs) {
     // One line for tests/boot/crash-report.py: what died, and when.

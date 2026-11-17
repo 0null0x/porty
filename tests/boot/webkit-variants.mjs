@@ -305,6 +305,8 @@ function row(v, r) {
         jit: samples.length ? `${samples[samples.length - 1].alive}/${samples[samples.length - 1].compiled}` : '',
         threadCpu: (samples.filter((x) => x.cpu && (x.label === 'loop' || x.label === 'settle' || x.label === 'focus')).pop() || {}).cpu || '',
         counters, glueApplied: res.glueApplied || {}, errors: (res.errors || []).slice(0, 5),
+        // QEMU patch 0018: how full the wasm32 backend's per-TB tables got.
+        tcg: res.tcg || null,
         exit: r.code,
     };
 }
