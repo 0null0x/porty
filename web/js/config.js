@@ -37,8 +37,19 @@ const DEFAULTS = {
     // 1.25 GB for a 943 MB image and reached each stage later than with 64.
     // jitcap: compiled code blocks alive at once (0: the build's 15000).
     // Each is a module in the browser's own heap, so phones keep fewer.
-    desktop: { mem: 1024, tb: 384, cache: 64, jitcap: 0 },
-    mobile: { ...PHONE_LEVELS[0], jitcap: 4000 },
+    // jitring, jitpolicy: QEMU patches 0022-0024 (the module ring and the
+    // JIT cache policies), 0: off, QEMU-Wasm as before.
+    desktop: { mem: 1024, tb: 384, cache: 64, jitcap: 0, jitring: 0, jitpolicy: 0 },
+    mobile: { ...PHONE_LEVELS[0], jitcap: 4000, jitring: 0, jitpolicy: 0 },
+    // iPhones and iPads, where every browser is WebKit.  There much of an
+    // app launch went to translating blocks again after the translation
+    // cache was flushed (40 times per Gallery launch, as compiled forms took
+    // 80% of it).  The module ring keeps them out of the cache: 3 flushes,
+    // and Gallery 18-22% sooner with a lower peak (WebKit on Linux, x86-64
+    // and ARM64, QEMU patch 0027 in: A/B run 44142674558 and 44142696754).
+    // A cap of 8000 on top was worth 0-5% more for 100-300 MiB more.
+    // Chrome and desktops were not faster with the ring.
+    ios: { ...PHONE_LEVELS[0], jitcap: 4000, jitring: 24576, jitpolicy: 6 },
 };
 
 export const PARAM_HELP = [
@@ -51,6 +62,9 @@ export const PARAM_HELP = [
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
+    ['jitgcwait', 'ms the cap waits at most for the garbage collector to report dropped compiled blocks gone (default 0: as long as it takes).'],
+    ['jitpolicy', 'JIT cache policies, bits (default 0, iPhones and iPads 6): 1 compile at once after a flush what was hot before it, 2 at the cap give the blocks that ran since the last drop a second chance, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before.'],
+    ['jitring', 'KiB of the ring that keeps the compiled forms of code blocks out of the translation cache (default 0 = in the cache, as before; iPhones and iPads 24576).'],
     ['timescale', 'guest time runs this many times slower than real time (1-16, default 8; 1 = real time), so Android\'s timeouts allow for a slow emulator. The guest\'s clock then falls behind.'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
@@ -106,7 +120,16 @@ function safeWords(raw) {
 
 export function isMobile(env) {
     const ua = env.userAgent || '';
-    if (/iPhone|iPad|iPod|Android/i.test(ua)) {
+    if (/Android/i.test(ua)) {
+        return true;
+    }
+    return isAppleMobile(env);
+}
+
+/** iPhone, iPad or iPod: every browser there is WebKit. */
+export function isAppleMobile(env) {
+    const ua = env.userAgent || '';
+    if (/iPhone|iPad|iPod/i.test(ua)) {
         return true;
     }
     // iPadOS reports itself as a Mac; the touch point count gives it away.
@@ -120,7 +143,7 @@ export function isMobile(env) {
 export function parseConfig(search, env = {}) {
     const params = new URLSearchParams(search);
     const mobile = isMobile(env);
-    const base = mobile ? DEFAULTS.mobile : DEFAULTS.desktop;
+    const base = isAppleMobile(env) ? DEFAULTS.ios : (mobile ? DEFAULTS.mobile : DEFAULTS.desktop);
 
     let width = 480;
     let height = 800;
@@ -141,6 +164,9 @@ export function parseConfig(search, env = {}) {
         memExplicit: params.has('mem'),
         // Any memory parameter in the URL: then phones never step down.
         memoryExplicit: ['mem', 'tb', 'cache', 'wasmmem'].some((n) => params.has(n)),
+        // tb= also applies to a resume (snapshot.js): the translation cache
+        // is not part of the saved machine.
+        tbExplicit: params.has('tb'),
         // One CPU by default: with -smp 2, QEMU-Wasm dies within seconds
         // (first boot test, 2026-11-15).
         smp: intParam(params, 'smp', 1, 1, 4),
@@ -160,6 +186,11 @@ export function parseConfig(search, env = {}) {
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
         // false: patch 0010's "do not wait for the garbage collector".
         jitgc: boolParam(params, 'jitgc', true),
+        // QEMU patch 0023: how long the cap waits for the collector (0: no limit).
+        jitgcwait: intParam(params, 'jitgcwait', 0, 0, 600000),
+        // QEMU patches 0022-0024 (see PARAM_HELP); -1: the build's defaults (off).
+        jitpolicy: intParam(params, 'jitpolicy', base.jitpolicy, -1, 7),
+        jitring: intParam(params, 'jitring', base.jitring, -1, 262144),
         // Patch 0011's time dilation: the guest's clocks (and with them
         // Android's 60 s Watchdog) run this many times slower. 1: off.
         // Default 8: the first boots to sys.boot_completed in a browser

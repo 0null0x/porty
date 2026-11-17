@@ -29,6 +29,8 @@
 //                     local=1             the page's own files from this
 //                                         checkout's web/ (LOCAL_WEB), the
 //                                         rest from the site (site-proxy.mjs)
+//                     use=<minutes>       after the probe, start apps from the
+//                                         shell for this long (USE_MINUTES)
 //                   e.g. "name=base; name=nostack JSC_exceptionStackTraceLimit=0"
 //   BASE_QUERY      page parameters of every variant (default
 //                   wasmmem=1280&jitcap=4000)
@@ -70,7 +72,7 @@ export function parseVariant(text, base = '') {
     const words = text.trim().split(/\s+/).filter(Boolean);
     const v = {
         name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, proxy: false, local: false,
-        qemu: '', browser: 'webkit', mlwait: '', words: [],
+        qemu: '', browser: 'webkit', mlwait: '', use: 0, words: [],
     };
     for (const w of words) {
         if (!WORD.test(w)) {
@@ -104,6 +106,8 @@ export function parseVariant(text, base = '') {
             v.mlwait = /^\d{1,4}$/.test(value) ? value : '';
         } else if (key === 'loops') {
             v.loops = Math.max(1, Math.min(12, Number(value) || 3));
+        } else if (key === 'use') {
+            v.use = Math.max(0, Math.min(120, Number(value) || 0));
         }
     }
     v.query = v.query.toString();
@@ -203,7 +207,9 @@ function runOne(v, index) {
         const env = {
             ...process.env,
             BROWSER: v.browser,
-            DEVICE: 'iphone',
+            // Chrome as on an Android phone; on an iPhone every browser is WebKit,
+            // and the page's iPhone defaults are WebKit's (web/js/config.js).
+            DEVICE: v.browser === 'chrome' ? 'android' : 'iphone',
             QUERY: v.query,
             BROWSER_ENV: v.env.join(' '),
             GLUE: v.glue.join(','),
@@ -219,6 +225,7 @@ function runOne(v, index) {
             PROBE_SECONDS: String(probeSeconds),
             PROBE: v.probe ? '1' : '0',
             LOOP_ROUNDS: String(v.loops),
+            USE_MINUTES: String(v.use),
             STATUS_CONTEXT: `porty/webkit-mem r${replica} ${v.name}`,
             VARIANT: v.name,
             ...(gcLog ? { DEBUG: 'pw:browser' } : {}),
@@ -307,8 +314,26 @@ function row(v, r) {
         counters, glueApplied: res.glueApplied || {}, errors: (res.errors || []).slice(0, 5),
         // QEMU patch 0018: how full the wasm32 backend's per-TB tables got.
         tcg: res.tcg || null,
+        // Patch 0019: shares of the vCPU's time from the tap to Gallery, and counts.
+        phases: res.phases ? res.phases.launch : null,
+        phasesToLauncherGone: res.phases ? res.phases.toLauncherGone : null,
+        biggest: res.qemu && res.qemu.functions ? (res.qemu.functions.hot || []).slice(0, 8) : [],
+        // Patches 0022-0024: the module ring and the cache policies, at the end of the run.
+        ring: res.ring || null,
+        // use=<minutes>: apps started from the shell after the probe, and memory meanwhile.
+        use: res.use || null,
         exit: r.code,
     };
+}
+
+/** "wasm 40 tci 20 ..." of a phase delta (tests/boot/webkit-test.mjs), the main shares only. */
+export function phaseCell(d) {
+    if (!d || !d.shares) {
+        return '-';
+    }
+    const short = { other: 'oth', wasm: 'wasm', tci: 'tci', tciCap: 'cap', compile: 'comp', translate: 'tr', sleep: 'slp', idle: 'idle', bql: 'bql' };
+    return Object.entries(d.shares).filter(([, v]) => v >= 1).map(([k, v]) => `${short[k] || k} ${Math.round(v)}`).join(' ') +
+        ` (${d.counts.compiled} comp, ${d.counts.translated} tr, ${d.counts.flushes} fl)`;
 }
 
 const fmt = (x) => (x === null || x === undefined || x === '' ? '-' : String(x));
@@ -374,10 +399,10 @@ async function main() {
         '',
         `Base query \`${baseQuery}\`; ${rows[0] ? rows[0].version : ''}. RSS of the web content process in MiB.`,
         '',
-        '| variant | browser | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | tap to arrow ms | typing echo ms | disk MB | JIT alive/compiled | CPU by thread | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+        '| variant | browser | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | tap to arrow ms | typing echo ms | disk MB | JIT alive/compiled | vCPU % tap to Gallery | CPU by thread | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows.map((r) => `| ${r.name} (\`${r.words || '-'}\`) | ${(r.version || '').split(' ')[0] || '-'} | ${fmt(r.peakRss)} | ${fmt(r.steadyRss)} | ${fmt(r.peakHeaps)} | ` +
-            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ` +
+            `${fmt(r.resumed)} | ${(r.loops || []).map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${fmt(r.arrowMs)} | ${(r.echoMs || []).map(fmt).join('/') || '-'} | ${fmt(r.diskMb)} | ${r.jit || '-'} | ${phaseCell(r.phases)}${r.ring ? `; ring ${r.ring.kb} KiB, ${r.ring.gone} gone` : ''} | ` +
             `${(r.threadCpu || '').replace(/\|/g, '/') || '-'} | ` +
             `${(r.gc || []).filter((h) => h.allocatedMb > 50).slice(0, 4).map((h) => `${h.mbPerSecond ?? '?'}/s, ${Math.round(h.maxAllocatedKb / 1024)}`).join('; ') || '-'} | ` +
             `${Object.entries(r.counters).map(([t, row]) => `${t}: ${Object.entries(row).map(([k, x]) => `${k} ${x}`).join(' ')}`).join('; ') || '-'} | ` +

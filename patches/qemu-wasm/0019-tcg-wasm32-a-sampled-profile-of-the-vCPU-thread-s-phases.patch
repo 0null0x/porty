@@ -1,0 +1,359 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 07:00:00 +0000
+Subject: [PATCH] tcg/wasm32: a sampled profile of the vCPU thread's phases
+
+Where does the vCPU thread's time go while Android starts an app: compiled
+blocks, the interpreter while a block warms up, the interpreter because the
+JIT is at its cap, instantiating blocks, translating guest code, the sleeps
+at the cap, idle, waiting for the big lock?  Timing each of those on the
+vCPU thread would cost more than most of them take, so the thread only
+writes its phase to a word of the shared memory whenever it changes (one
+plain store) and counts a few events: blocks dispatched compiled, warming
+up and at the cap, blocks compiled, dropped and met again after a drop,
+translations, guest instructions translated, flushes, sleeps.  Another
+thread of the page reads the phase every half millisecond or so (Porty's
+tests/boot/webkit-test.mjs starts one), which gives the shares of time.
+
+Module._porty_prof_ptr() returns the address of a uint32 phase, a uint32
+version (1) and 16 uint64 counts; include/qemu/porty-prof.h lists them.
+Nothing changes for builds other than Emscripten's.
+---
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index 5b47362..1a082d1 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -45,6 +45,7 @@
+ #include "internal-common.h"
+ #include "internal-target.h"
+ #include "qemu/porty-stack.h"
++#include "qemu/porty-prof.h"
+ 
+ /* -icount align implementation. */
+ 
+@@ -1080,6 +1081,8 @@ static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
+     if (unlikely(sigsetjmp(cpu->jmp_env, 0) != 0)) {
+ #ifdef __EMSCRIPTEN__
+         porty_stack_set(sp);
++        /* Porty: a helper or the translator left with cpu_loop_exit(). */
++        porty_prof_set(PORTY_PH_OTHER);
+ #endif
+         cpu_exec_longjmp_cleanup(cpu);
+     }
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index 6867d8d..25c8b43 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -31,6 +31,7 @@
+ #include "tb-context.h"
+ #include "internal-common.h"
+ #include "internal-target.h"
++#include "qemu/porty-prof.h"
+ 
+ 
+ /* List iterators for lists of tagged pointers in TranslationBlock. */
+@@ -776,6 +777,9 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+     tcg_region_reset_all();
+     /* XXX: flush processor icache at this point if cache flush is expensive */
+     qatomic_inc(&tb_ctx.tb_flush_count);
++#ifdef __EMSCRIPTEN__
++    porty_prof_add(PORTY_C_FLUSHES, 1);
++#endif
+ 
+ done:
+     mmap_unlock();
+diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
+index 0685852..c19dc78 100644
+--- a/accel/tcg/tcg-accel-ops-mttcg.c
++++ b/accel/tcg/tcg-accel-ops-mttcg.c
+@@ -69,6 +69,7 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
+ #include <emscripten.h>
+ #include "qemu/atomic.h"
+ #include "qemu/porty-stack.h"
++#include "qemu/porty-prof.h"
+ 
+ /*
+  * Porty: the vCPU thread's C stack (see include/qemu/porty-stack.h).  One
+@@ -140,6 +141,19 @@ EMSCRIPTEN_KEEPALIVE uint32_t *porty_stack_stats(void)
+     }
+     return out;
+ }
++
++/*
++ * Porty: the vCPU thread's phase and event counts (include/qemu/porty-prof.h),
++ * for a sampler in the page: Module._porty_prof() is the address of a
++ * uint32 phase, a uint32 version, then PORTY_C_COUNT uint64 counts.
++ */
++PortyProf porty_prof = { .version = 1 };
++
++uint32_t *porty_prof_ptr(void);
++EMSCRIPTEN_KEEPALIVE uint32_t *porty_prof_ptr(void)
++{
++    return (uint32_t *)&porty_prof;
++}
+ #endif
+ 
+ static void *mttcg_cpu_thread_fn(void *arg)
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 79a88f5..87324bc 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -61,6 +61,7 @@
+ #include "tb-jmp-cache.h"
+ #include "tb-hash.h"
+ #include "tb-context.h"
++#include "qemu/porty-prof.h"
+ #include "internal-common.h"
+ #include "internal-target.h"
+ #include "perf.h"
+@@ -296,6 +297,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     int gen_code_size, search_size, max_insns;
+     int64_t ti;
+     void *host_pc;
++#ifdef __EMSCRIPTEN__
++    /* Porty: the vCPU's phase while translating (include/qemu/porty-prof.h). */
++    const uint32_t porty_phase = porty_prof_enter(PORTY_PH_TRANSLATE);
++#endif
+ 
+     assert_memory_lock();
+     qemu_thread_jit_write();
+@@ -535,6 +540,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+      */
+     if (tb_page_addr0(tb) == -1) {
+         assert_no_pages_locked();
++#ifdef __EMSCRIPTEN__
++        porty_prof_add(PORTY_C_TRANSLATED, 1);
++        porty_prof_add(PORTY_C_INSNS, tb->icount);
++        porty_prof_set(porty_phase);
++#endif
+         return tb;
+     }
+ 
+@@ -551,6 +561,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+      */
+     existing_tb = tb_link_page(tb);
+     assert_no_pages_locked();
++#ifdef __EMSCRIPTEN__
++    porty_prof_add(PORTY_C_TRANSLATED, 1);
++    porty_prof_add(PORTY_C_INSNS, tb->icount);
++    porty_prof_set(porty_phase);
++#endif
+ 
+     /* if the TB already exists, discard what we just translated */
+     if (unlikely(existing_tb != tb)) {
+diff --git a/include/qemu/porty-prof.h b/include/qemu/porty-prof.h
+new file mode 100644
+index 0000000..f87fb04
+--- /dev/null
++++ b/include/qemu/porty-prof.h
+@@ -0,0 +1,85 @@
++/*
++ * Porty: where the vCPU thread's time goes, sampled from outside.
++ *
++ * The vCPU thread writes what it is doing to porty_prof.phase whenever that
++ * changes, a plain store, and counts a few events.  Another thread of the
++ * page (tests/boot/webkit-test.mjs starts one) reads the phase every half
++ * millisecond or so through the shared WebAssembly memory: the share of
++ * samples in each phase is the share of the vCPU's time, without timing
++ * anything on the vCPU thread itself.  Module._porty_prof_ptr() returns the
++ * address of porty_prof.
++ *
++ * Helpers count to the phase of their caller: a compiled block's MMIO
++ * access is PORTY_PH_WASM, the interpreter's PORTY_PH_TCI.  Time the
++ * JavaScript collector takes from this thread counts to the phase it
++ * interrupted (allocation happens in instantiate_wasm() and in the
++ * invoke_* wrappers of setjmp, so mostly PORTY_PH_COMPILE and
++ * PORTY_PH_TRANSLATE).  With more than one vCPU the phase is the last
++ * writer's and the counts race; Porty runs one.
++ *
++ * Copyright (c) 2026 The Porty contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_PORTY_PROF_H
++#define QEMU_PORTY_PROF_H
++
++#ifdef __EMSCRIPTEN__
++
++enum {
++    PORTY_PH_OTHER = 0,     /* cpu_exec() and what is not below */
++    PORTY_PH_WASM,          /* a compiled block, and the helpers it calls */
++    PORTY_PH_TCI,           /* the interpreter, the block not hot yet */
++    PORTY_PH_TCI_CAP,       /* the interpreter, hot but the JIT is at its cap */
++    PORTY_PH_COMPILE,       /* instantiate_wasm(): a block's module, instance */
++    PORTY_PH_TRANSLATE,     /* tb_gen_code(): guest code to TCI and Wasm */
++    PORTY_PH_SLEEP,         /* emscripten_sleep(0) at the JIT's cap */
++    PORTY_PH_IDLE,          /* halted, waiting for an interrupt */
++    PORTY_PH_BQL,           /* waiting for the big QEMU lock */
++    PORTY_PH_COUNT
++};
++
++enum {
++    PORTY_C_EXEC_WASM = 0,  /* blocks the dispatcher ran compiled */
++    PORTY_C_EXEC_TCI,       /* ... in the interpreter, not hot yet */
++    PORTY_C_EXEC_TCI_CAP,   /* ... in the interpreter, hot, at the cap */
++    PORTY_C_COMPILED,       /* instantiate_wasm() */
++    PORTY_C_REARMED,        /* dropped blocks met again (compiled at once) */
++    PORTY_C_DROPS,          /* times compiled blocks were dropped at the cap */
++    PORTY_C_DROPPED,        /* compiled blocks dropped */
++    PORTY_C_TRANSLATED,     /* tb_gen_code() */
++    PORTY_C_INSNS,          /* guest instructions translated */
++    PORTY_C_FLUSHES,        /* tb_flush() of all translated code */
++    PORTY_C_SLEEPS,         /* emscripten_sleep(0) at the cap */
++    PORTY_C_COUNT = 16
++};
++
++typedef struct PortyProf {
++    uint32_t phase;         /* PORTY_PH_*, read by the sampler */
++    uint32_t version;       /* 1 */
++    uint64_t count[PORTY_C_COUNT];
++} PortyProf;
++
++extern PortyProf porty_prof;
++
++/* Set the phase; returns the one it replaces. */
++static inline uint32_t porty_prof_enter(uint32_t phase)
++{
++    uint32_t old = porty_prof.phase;
++
++    *(volatile uint32_t *)&porty_prof.phase = phase;
++    return old;
++}
++
++static inline void porty_prof_set(uint32_t phase)
++{
++    *(volatile uint32_t *)&porty_prof.phase = phase;
++}
++
++static inline void porty_prof_add(int counter, uint64_t n)
++{
++    porty_prof.count[counter] += n;
++}
++
++#endif /* __EMSCRIPTEN__ */
++
++#endif
+diff --git a/system/cpus.c b/system/cpus.c
+index a444a74..42593da 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -46,6 +46,7 @@
+ #include "hw/boards.h"
+ #include "hw/hw.h"
+ #include "trace.h"
++#include "qemu/porty-prof.h"
+ 
+ #ifdef CONFIG_LINUX
+ 
+@@ -428,7 +429,17 @@ void qemu_wait_io_event(CPUState *cpu)
+             slept = true;
+             qemu_plugin_vcpu_idle_cb(cpu);
+         }
++#ifdef __EMSCRIPTEN__
++        {
++            /* Porty: see include/qemu/porty-prof.h. */
++            uint32_t phase = porty_prof_enter(PORTY_PH_IDLE);
++
++            qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
++            porty_prof_set(phase);
++        }
++#else
+         qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
++#endif
+     }
+     if (slept) {
+         qemu_plugin_vcpu_resume_cb(cpu);
+@@ -502,7 +513,19 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line)
+     QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
+ 
+     g_assert(!qemu_mutex_iothread_locked());
++#ifdef __EMSCRIPTEN__
++    if (current_cpu) {
++        /* Porty: a vCPU thread waits for the main loop (porty-prof.h). */
++        uint32_t phase = porty_prof_enter(PORTY_PH_BQL);
++
++        bql_lock(&qemu_global_mutex, file, line);
++        porty_prof_set(phase);
++    } else {
++        bql_lock(&qemu_global_mutex, file, line);
++    }
++#else
+     bql_lock(&qemu_global_mutex, file, line);
++#endif
+     set_iothread_locked(true);
+ }
+ 
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index 3e19669..da3afe8 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -29,6 +29,7 @@
+ #include <emscripten.h>
+ #include <emscripten/threading.h>
+ #include <emscripten/stack.h>
++#include "qemu/porty-prof.h"
+ #include "wasm32.h"
+ 
+ int porty_jit_threshold = INSTANTIATE_NUM_DEFAULT;
+@@ -309,6 +310,10 @@ static void remove_instance_running_local()
+         return;
+     }
+     int to_remove = instance_running_local / 2;
++    if (to_remove > 0) {
++        porty_prof_add(PORTY_C_DROPS, 1);
++        porty_prof_add(PORTY_C_DROPPED, to_remove);
++    }
+     for (int i = 0; i < to_remove; i++) {
+         instance_running[instance_running_begin].tb = NULL;
+         to_remove_instance[to_remove_instance_idx++] = instance_running[instance_running_begin].fidx;
+@@ -347,6 +352,7 @@ static int get_instance_running_local(void *tb_ptr)
+         return 0;
+     }
+     if (elm->tb != tb_ptr) {
++        porty_prof_add(PORTY_C_REARMED, 1);
+         *(uint32_t*)tb_export_ptr = 0;
+         int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
+         *(uint32_t*)tb_counter_ptr = INSTANTIATE_NUM; // will be instanciated immediately
+@@ -361,7 +367,11 @@ static inline void trysleep()
+ {
+     if (--exec_cnt == 0) {
+         if (!can_add_instance()) {
++            uint32_t phase = porty_prof_enter(PORTY_PH_SLEEP);
++
++            porty_prof_add(PORTY_C_SLEEPS, 1);
+             emscripten_sleep(0); // return to the browser main loop
++            porty_prof_set(phase);
+             check_instance_garbage_collected();
+         }
+         exec_cnt = MAX_EXEC_NUM;
+@@ -1493,21 +1503,32 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+         uint32_t res;
+         int fidx = get_instance_running_local(ctx.tb_ptr);
+         if (fidx > 0) {
++            porty_prof_set(PORTY_PH_WASM);
++            porty_prof_add(PORTY_C_EXEC_WASM, 1);
+             res = ((wasm_func_ptr)(fidx))(&ctx);
+         } else if (*(int32_t*)tb_counter_ptr < INSTANTIATE_NUM) {
+             *(int32_t*)tb_counter_ptr += 1;
++            porty_prof_set(PORTY_PH_TCI);
++            porty_prof_add(PORTY_C_EXEC_TCI, 1);
+             res = tcg_qemu_tb_exec_tci(env);
+         } else if (!can_add_instance()) {
+             remove_instance_running_local();
+             check_instance_garbage_collected();
++            porty_prof_set(PORTY_PH_TCI_CAP);
++            porty_prof_add(PORTY_C_EXEC_TCI_CAP, 1);
+             res = tcg_qemu_tb_exec_tci(env);
+         } else {
++            porty_prof_set(PORTY_PH_COMPILE);
+             int fidx = instantiate_wasm();
+             qatomic_inc(&porty_jit_compiled);
++            porty_prof_add(PORTY_C_COMPILED, 1);
+             add_instance_running_local(fidx, ctx.tb_ptr);
++            porty_prof_set(PORTY_PH_WASM);
++            porty_prof_add(PORTY_C_EXEC_WASM, 1);
+             res = ((wasm_func_ptr)(fidx))(&ctx);
+         }
+         if ((uint32_t)ctx.tb_ptr == 0) {
++            porty_prof_set(PORTY_PH_OTHER);
+             return res;
+         }
+     }

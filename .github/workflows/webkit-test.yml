@@ -51,7 +51,7 @@ on:
         type: string
         default: first
       device:
-        description: iphone (an iPhone's user agent, so the page takes its phone defaults) or desktop
+        description: iphone (an iPhone's user agent, so the page takes its iPhone defaults), android (an Android phone's) or desktop
         type: string
         default: iphone
       coi:

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
 import {
-    PHONE_LEVELS, applyPhoneLevel, chooseWasmMemoryMb, fallbackLadder, isMobile, parseConfig,
+    PHONE_LEVELS, applyPhoneLevel, chooseWasmMemoryMb, fallbackLadder, isAppleMobile, isMobile, parseConfig,
     requiredWasmMemoryMb,
 } from '../web/js/config.js';
 import { LEVEL_KEY, RUN_KEY, RunLog, describeRun, nextLevel } from '../web/js/crash-guard.js';
@@ -15,6 +15,7 @@ import { checkEnvironment } from '../web/js/emulator.js';
 
 const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1';
 const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15';
+const ANDROID = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36';
 const manifest = {
     cmdline: 'root=/dev/ram0 androidboot.selinux=permissive buildvariant=userdebug',
     kernel: { file: 'kernel' }, initrd: { file: 'initrd.img' }, ramdisk: { file: 'ramdisk.img' },
@@ -27,6 +28,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(isMobile({ userAgent: IPHONE }), true);
     assert.equal(isMobile({ userAgent: MAC, maxTouchPoints: 0 }), false);
     assert.equal(isMobile({ userAgent: MAC, maxTouchPoints: 5 }), true, 'iPadOS in desktop mode');
+    assert.equal(isMobile({ userAgent: ANDROID }), true);
+    assert.deepEqual([IPHONE, ANDROID, MAC].map((userAgent) => isAppleMobile({ userAgent })), [true, false, false]);
+    assert.equal(isAppleMobile({ userAgent: MAC, maxTouchPoints: 5 }), true, 'iPadOS in desktop mode');
 
     const desktop = parseConfig('', { userAgent: MAC });
     assert.deepEqual([desktop.mem, desktop.tb, desktop.smp, desktop.width, desktop.height, desktop.dpi],
@@ -38,10 +42,22 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.equal(parseConfig('?jit=-5', {}).jit, -1);
     assert.equal(parseConfig('?jit=99999999999', {}).jit, 2147483647);
     const phone = parseConfig('', { userAgent: IPHONE });
+    const android = parseConfig('', { userAgent: ANDROID });
+    assert.deepEqual([android.mem, android.tb, android.cache, android.jitcap], [768, 128, 16, 4000]);
+    // iPhones: the module ring and policies 6 (QEMU patches 0022-0024), the phones' cap.
     assert.deepEqual([phone.mem, phone.tb, phone.cache, phone.jitcap], [768, 128, 16, 4000]);
+    assert.deepEqual([phone.jitring, phone.jitpolicy], [24576, 6]);
     assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
     assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
     assert.deepEqual([desktop.jitgc, parseConfig('?jitgc=0', {}).jitgc], [true, false]);
+    // QEMU patch 0023: the cap's wait for the collector, no limit by default
+    assert.deepEqual(['', '?jitgcwait=5000', '?jitgcwait=-3', '?jitgcwait=9999999'].map((q) => parseConfig(q, {}).jitgcwait),
+        [0, 5000, 0, 600000]);
+    // Elsewhere both are off: QEMU-Wasm as before.
+    assert.deepEqual([desktop.jitpolicy, desktop.jitring, android.jitpolicy, android.jitring], [0, 0, 0, 0]);
+    assert.deepEqual([parseConfig('?jitring=0', { userAgent: IPHONE }).jitring, parseConfig('?jitpolicy=-1', {}).jitpolicy], [0, -1]);
+    assert.deepEqual([parseConfig('?jitpolicy=0&jitring=0', {}).jitpolicy, parseConfig('?jitpolicy=0&jitring=0', {}).jitring], [0, 0]);
+    assert.deepEqual([parseConfig('?jitpolicy=9&jitring=999999', {}).jitpolicy, parseConfig('?jitpolicy=9&jitring=999999', {}).jitring], [7, 262144]);
     // time dilation: 8 by default (phones too), an integer from 1 (off) to 16
     assert.deepEqual([desktop.timescale, phone.timescale], [8, 8]);
     assert.deepEqual(['?timescale=1', '?timescale=0', '?timescale=99', '?timescale=x', '?timescale=2.9']
@@ -81,6 +97,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual(PHONE_LEVELS[0], { mem: phone.mem, tb: phone.tb, cache: phone.cache });
     const step1 = applyPhoneLevel(phone, 1);
     assert.deepEqual([step1.mem, step1.tb, step1.cache, step1.phoneLevel], [640, 96, 12, 1]);
+    // ...and an iPhone keeps its JIT cache settings
+    assert.deepEqual([step1.jitcap, step1.jitring, step1.jitpolicy], [4000, 24576, 6]);
     assert.equal(requiredWasmMemoryMb(step1), 1152);
     assert.equal(applyPhoneLevel(phone, 9).mem, 512, 'clamped to the last step');
     assert.equal(applyPhoneLevel(phone, 0), phone);

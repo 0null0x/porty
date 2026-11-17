@@ -1,0 +1,407 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 14:00:00 +0000
+Subject: [PATCH] tcg/wasm32: keep the blocks' wasm modules in a ring of their
+ own
+
+Every translated block carried the WebAssembly module of its compiled form
+in the translation cache, after its TCI code: about 80% of the cache,
+although only 0.5 to 1% of the blocks are ever compiled.  With phones'
+tb-size of 128 MiB the cache held some 80000 blocks, it was flushed every
+6 to 10 s while Android started an app, and everything was translated,
+interpreted and compiled again.
+
+tb_gen_code() now hands each new block to porty_jit_stash_module(), which
+copies the module into a ring buffer from QEMU's heap and leaves a 12-byte
+stub in its place; the import vector moves up and the block ends sooner,
+so the cache holds several times as many blocks (a Gallery launch in
+WebKit and in Chrome: 1 flush instead of 12-13, 0.43 M translations
+instead of 1.0-1.2 M).  The ring is off by default; porty_set_jit_ring_kb()
+sizes it (Porty's page asks for 24 MiB on iPhones).  instantiate_wasm()
+reads the module through the stub.  An entry is intact until the writer
+comes round to it again.  When a block gets hot after its module was
+overwritten, the dispatcher runs it in TCI once more and, with
+PORTY_JIT_RETRANSLATE (4) in porty_set_jit_policy(), invalidates it the
+way QEMU drops blocks whose guest code was written to
+(tb_phys_invalidate(): the block's page locks, which nothing holds while
+blocks run in the dispatcher, its jump lists and the lookup tables) and
+notes it in a bitmap, so that its translation lands in the ring again and
+is compiled at its first execution.  The old block's code stays where it
+is until the next flush.  Without that bit the block's counter is parked
+and it stays interpreted until the next flush.  A flush starts the ring
+over.
+
+porty_set_jit_policy() now defaults to no policy at all, so that
+QEMU-Wasm behaves as before unless the page asks; Porty's page turns
+PORTY_JIT_KEEP_USED | PORTY_JIT_RETRANSLATE on with the ring.
+PORTY_JIT_REHOT (Porty's patch 0022) compiled 2-3 times as many blocks
+while flushes were frequent, and with the ring they are rare.
+
+porty_jit_ring_stats() reports the ring's size, the modules stashed and
+their KiB, the laps, the modules gone and the blocks compiled at once
+after their translation again.
+---
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 5385faf..58434a8 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -429,6 +429,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+         }
+     }
+     tcg_ctx->gen_tb = NULL;
++#if !defined(CONFIG_TCG_INTERPRETER) && defined(EMSCRIPTEN)
++    /* Porty: the block's wasm module goes to the module ring (wasm32.c). */
++    gen_code_size = porty_jit_stash_module(gen_code_buf, gen_code_size);
++#endif
+ 
+     search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
+     if (unlikely(search_size < 0)) {
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index 69a766c..3399761 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -27,6 +27,7 @@
+ #include "tcg/tcg-ldst.h"
+ #include "exec/exec-all.h"
+ #include "qemu/cacheinfo.h"
++#include "qemu/thread.h"
+ #include <string.h>
+ #include <emscripten.h>
+ #include <emscripten/threading.h>
+@@ -143,10 +144,19 @@ EM_JS(int, instantiate_wasm, (), {
+         
+         const tmp_body_size = memory_v.getInt32(counter_vec_begin + counter_vec_size, true);
+         const tmp_body_begin = counter_vec_begin + counter_vec_size + 4;
+-        const wasm_size = memory_v.getInt32(tmp_body_begin + tmp_body_size, true);
+-        const wasm_begin = tmp_body_begin + tmp_body_size + 4;
+-        const import_vec_size = memory_v.getInt32(wasm_begin + wasm_size, true);
+-        const import_vec_begin = wasm_begin + wasm_size + 4;
++        let wasm_size = memory_v.getInt32(tmp_body_begin + tmp_body_size, true);
++        let wasm_begin = tmp_body_begin + tmp_body_size + 4;
++        let import_hdr = wasm_begin + wasm_size;
++        if (wasm_size === -1) {
++            // Porty: the module is in the module ring (porty_jit_stash_module());
++            // here is a stub {entry address, lap}, and an entry is {lap, size, bytes}.
++            const entry = memory_v.getUint32(wasm_begin, true);
++            import_hdr = wasm_begin + 8;
++            wasm_size = memory_v.getInt32(entry + 4, true);
++            wasm_begin = entry + 8;
++        }
++        const import_vec_size = memory_v.getInt32(import_hdr, true);
++        const import_vec_begin = import_hdr + 4;
+ 
+         // Create a full copy of the bytes instead of a subarray view to fix Firefox compatibility
+         // See: https://bugzilla.mozilla.org/show_bug.cgi?id=1965217
+@@ -309,25 +319,207 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_gc_wait_ms(int ms)
+  * after a flush what was hot before it, and drop the compiled blocks at
+  * the flush (porty_jit_tb_flush()).  PORTY_JIT_KEEP_USED: at the cap, the
+  * blocks that ran since the last drop get a second chance before the
+- * oldest half goes (remove_instance_running_local()).  Set by the page
+- * before main() starts any vCPU; a negative value restores the default;
+- * returns the value in effect.
++ * oldest half goes (remove_instance_running_local()).
++ * PORTY_JIT_RETRANSLATE: a block whose module is gone from the module ring
++ * is translated again and compiled at its first execution (else it stays
++ * interpreted until the next flush; porty_jit_module_gone()).  Set by the
++ * page before main() starts any vCPU; a negative value restores the
++ * default; returns the value in effect.
+  */
+ #define PORTY_JIT_REHOT 1
+ #define PORTY_JIT_KEEP_USED 2   /* see remove_instance_running_local() */
+-#define PORTY_JIT_POLICIES (PORTY_JIT_REHOT | PORTY_JIT_KEEP_USED)
+-static int porty_jit_policy = PORTY_JIT_POLICIES;
++#define PORTY_JIT_RETRANSLATE 4 /* see porty_jit_module_gone() */
++#define PORTY_JIT_POLICIES (PORTY_JIT_REHOT | PORTY_JIT_KEEP_USED | PORTY_JIT_RETRANSLATE)
++/*
++ * None by default: QEMU-Wasm behaves as before unless the page asks
++ * (Porty's web/js/config.js turns the module ring and
++ * PORTY_JIT_KEEP_USED | PORTY_JIT_RETRANSLATE on for iPhones).
++ * PORTY_JIT_REHOT is for experiments: while flushes were frequent it
++ * compiled 2-3 times as many blocks, and with the ring they are rare.
++ */
++#define PORTY_JIT_DEFAULT 0
++static int porty_jit_policy = PORTY_JIT_DEFAULT;
+ 
+ int porty_set_jit_policy(int bits);
+ EMSCRIPTEN_KEEPALIVE int porty_set_jit_policy(int bits)
+ {
+     if (bits < 0) {
+-        bits = PORTY_JIT_POLICIES;
++        bits = PORTY_JIT_DEFAULT;
+     }
+     qatomic_set(&porty_jit_policy, bits & PORTY_JIT_POLICIES);
+     return qatomic_read(&porty_jit_policy);
+ }
+ 
++/*
++ * Porty: the module ring.
++ *
++ * Every translated block carries the WebAssembly module of its compiled
++ * form in the translation cache, after its TCI code: about 80% of the
++ * cache, although only 0.5 to 1% of blocks are ever compiled.  With
++ * phones' 128 MiB the cache held some 80000 blocks and was flushed every
++ * 6 to 10 s while Android started an app, and everything was translated,
++ * interpreted and compiled again.  tb_gen_code() now hands each new block
++ * to porty_jit_stash_module(), which copies the module into this ring and
++ * leaves a stub in its place (the import vector moves up, the block ends
++ * sooner): a block takes about a fifth of the space it took.
++ *
++ * Ring entry: uint32 lap, uint32 size, the module, padded to 8 bytes.
++ * Stub, where the module's size was: int32 -1, uint32 entry address,
++ * uint32 lap.  An entry is intact while the writer has not come round to
++ * it again: written in this lap, or in the last one at or after the write
++ * position.  instantiate_wasm() reads the module through the stub; the
++ * dispatcher checks it first and, if the module is gone, calls
++ * porty_jit_module_gone().
++ *
++ * The ring comes from QEMU's heap on the first translation, of the size
++ * porty_set_jit_ring_kb() set before (?jitring=, KiB; Porty's page asks
++ * for 24 MiB on iPhones); 0, the default, keeps modules in the cache as
++ * before, also later (a stub already written stays valid).
++ * porty_ring_lock guards it for more than one vCPU.
++ */
++#define PORTY_RING_DEFAULT_KB 0   /* off unless the page asks (?jitring=) */
++static int porty_ring_kb = PORTY_RING_DEFAULT_KB;
++static uint8_t *porty_ring;
++static uint32_t porty_ring_size, porty_ring_pos, porty_ring_lap = 1;
++static QemuSpin porty_ring_lock;   /* zero is unlocked */
++/*
++ * [0] ring KiB (0: off), [1] modules stashed, [2] KiB stashed, [3] laps,
++ * [4] modules gone, [5] blocks translated again after that and compiled
++ * at their first execution.
++ */
++static uint32_t porty_ring_stats[6];
++static uint64_t porty_ring_bytes;
++
++int porty_set_jit_ring_kb(int kb);
++EMSCRIPTEN_KEEPALIVE int porty_set_jit_ring_kb(int kb)
++{
++    if (kb < 0) {
++        kb = PORTY_RING_DEFAULT_KB;
++    }
++    qatomic_set(&porty_ring_kb, MIN(kb, 256 * 1024));
++    return qatomic_read(&porty_ring_kb);
++}
++
++uint32_t *porty_jit_ring_stats(void);
++EMSCRIPTEN_KEEPALIVE uint32_t *porty_jit_ring_stats(void)
++{
++    porty_ring_stats[0] = qatomic_read(&porty_ring_kb) ? porty_ring_size / 1024 : 0;
++    porty_ring_stats[2] = (uint32_t)(porty_ring_bytes >> 10);
++    return porty_ring_stats;
++}
++
++/* Where the module's size field of a block lies (the layout tcg_gen_code() writes). */
++static uint32_t *porty_module_field(const void *tb_ptr)
++{
++    const uint8_t *p = tb_ptr;
++    const uint8_t *counters = p + 8 + *(const uint32_t *)(p + 4);
++    const uint8_t *tci = counters + 4 + *(const uint32_t *)counters;
++
++    return (uint32_t *)(tci + 4 + *(const uint32_t *)tci);
++}
++
++/* Called with porty_ring_lock held. */
++static bool porty_ring_intact(uint32_t entry, uint32_t lap)
++{
++    uint32_t off = entry - (uint32_t)(uintptr_t)porty_ring;
++
++    return porty_ring && off < porty_ring_size &&
++           (lap == porty_ring_lap || (lap + 1 == porty_ring_lap && off >= porty_ring_pos));
++}
++
++/*
++ * tb_gen_code(): move the new block's module (code_size bytes of code
++ * at buf) into the ring; returns the block's new code size.
++ */
++int porty_jit_stash_module(void *buf, int code_size)
++{
++    int kb = qatomic_read(&porty_ring_kb);
++    uint32_t *field, size, imports, need;
++    uint8_t *module, *import_hdr, *entry;
++
++    if (kb <= 0) {
++        return code_size;
++    }
++    field = porty_module_field(buf);
++    size = field[0];
++    module = (uint8_t *)(field + 1);
++    import_hdr = module + size;
++    imports = *(uint32_t *)import_hdr;
++    if ((int32_t)size <= 0 || import_hdr + 4 + imports != (uint8_t *)buf + code_size) {
++        return code_size;   /* not the expected layout: leave it */
++    }
++    need = 8 + ROUND_UP(size, 8);
++
++    qemu_spin_lock(&porty_ring_lock);
++    if (!porty_ring) {
++        porty_ring_size = (uint32_t)kb * 1024;
++        porty_ring = g_try_malloc(porty_ring_size);
++        if (!porty_ring) {
++            qemu_spin_unlock(&porty_ring_lock);
++            fprintf(stderr, "porty: no memory for a %d KiB module ring; modules stay in the cache\n", kb);
++            qatomic_set(&porty_ring_kb, 0);
++            return code_size;
++        }
++    }
++    if (need > porty_ring_size / 4) {
++        qemu_spin_unlock(&porty_ring_lock);
++        return code_size;
++    }
++    if (porty_ring_pos + need > porty_ring_size) {
++        porty_ring_pos = 0;
++        porty_ring_lap++;
++        porty_ring_stats[3]++;
++    }
++    entry = porty_ring + porty_ring_pos;
++    ((uint32_t *)entry)[0] = porty_ring_lap;
++    ((uint32_t *)entry)[1] = size;
++    memcpy(entry + 8, module, size);
++    porty_ring_pos += need;
++    field[0] = (uint32_t)-1;
++    field[1] = (uint32_t)(uintptr_t)entry;
++    field[2] = porty_ring_lap;
++    porty_ring_stats[1]++;
++    porty_ring_bytes += size;
++    qemu_spin_unlock(&porty_ring_lock);
++
++    memmove(field + 3, import_hdr, 4 + imports);
++    return (uint8_t *)(field + 3) + 4 + imports - (uint8_t *)buf;
++}
++
++/* Lock the ring if the block's module is intact (true), else nothing held. */
++static bool porty_jit_module_lock(const void *tb_ptr)
++{
++    const uint32_t *field = porty_module_field(tb_ptr);
++
++    if ((int32_t)field[0] != -1) {
++        return true;   /* in the cache, as before */
++    }
++    qemu_spin_lock(&porty_ring_lock);
++    if (porty_ring_intact(field[1], field[2])) {
++        return true;
++    }
++    qemu_spin_unlock(&porty_ring_lock);
++    return false;
++}
++
++static void porty_jit_module_unlock(const void *tb_ptr)
++{
++    if ((int32_t)porty_module_field(tb_ptr)[0] == -1) {
++        qemu_spin_unlock(&porty_ring_lock);
++    }
++}
++
++/* do_tb_flush(): every stub is gone with its block; start the ring over. */
++static void porty_jit_ring_flush(void)
++{
++    if (porty_ring) {
++        qemu_spin_lock(&porty_ring_lock);
++        porty_ring_pos = 0;
++        porty_ring_lap += 2;   /* nothing of before is intact any more */
++        qemu_spin_unlock(&porty_ring_lock);
++    }
++}
++
+ __thread int instance_running_begin = 0;
+ __thread int instance_running_end = 0;
+ 
+@@ -497,6 +689,8 @@ static void remove_instance_running_local()
+  */
+ #define PORTY_HOT_ORDER 18
+ static uint32_t porty_hot[2][1 << (PORTY_HOT_ORDER - 5)];   /* now, before */
++/* Porty: blocks whose module was gone from the ring, until translated again. */
++static uint32_t porty_gone[1 << (PORTY_HOT_ORDER - 5)];
+ 
+ static uint32_t porty_hot_key(const TranslationBlock *tb)
+ {
+@@ -518,7 +712,17 @@ void porty_jit_translated(TranslationBlock *tb)
+ {
+     uint32_t k = porty_hot_key(tb);
+ 
+-    if ((qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT) && counter_vec_off >= 0 &&
++    if (counter_vec_off < 0) {
++        return;
++    }
++    if (porty_gone[k >> 5] >> (k & 31) & 1) {
++        /* Porty: its module was gone from the ring (porty_jit_module_gone()). */
++        qatomic_and(&porty_gone[k >> 5], ~(1u << (k & 31)));
++        *(int32_t *)((uintptr_t)tb->tc.ptr + counter_vec_off) = INSTANTIATE_NUM;
++        porty_ring_stats[5]++;
++        return;
++    }
++    if ((qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT) &&
+         ((porty_hot[0][k >> 5] | porty_hot[1][k >> 5]) >> (k & 31) & 1)) {
+         *(int32_t *)((uintptr_t)tb->tc.ptr + counter_vec_off) = INSTANTIATE_NUM;
+         qatomic_inc(&porty_hot_again);
+@@ -536,6 +740,8 @@ void porty_jit_tb_flush(void)
+     int n = instance_running_local;
+ 
+     qatomic_inc(&porty_flush_gen);   /* see remove_instance_running_local() */
++    porty_jit_ring_flush();
++    memset(porty_gone, 0, sizeof(porty_gone));
+     if (!(qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT)) {
+         return;
+     }
+@@ -557,6 +763,32 @@ void porty_jit_tb_flush(void)
+     }
+ }
+ 
++/*
++ * Porty: a block got hot after its module was overwritten in the ring.
++ * With PORTY_JIT_RETRANSLATE it is invalidated, the way QEMU drops blocks
++ * whose guest code was written to (tb_phys_invalidate() takes the locks of
++ * the block's pages, which nothing holds while blocks run here, unlinks
++ * the jumps into it and takes it out of the lookup tables): the next time
++ * the guest gets there the block is translated again, with its module in
++ * the ring, and compiled at its first execution (porty_gone[], see
++ * porty_jit_translated()).  Its code stays where it is until the next
++ * flush, so running it this once in the interpreter is safe.  Without
++ * PORTY_JIT_RETRANSLATE its counter is parked so that it stays
++ * interpreted until the next flush.
++ */
++static void porty_jit_module_gone(void *tb_ptr)
++{
++    TranslationBlock *tb = porty_tb_of(tb_ptr);
++    uint32_t k = porty_hot_key(tb);
++
++    porty_ring_stats[4]++;
++    *(int32_t *)((uintptr_t)tb_ptr + counter_vec_off) = INT32_MIN / 2;
++    if (qatomic_read(&porty_jit_policy) & PORTY_JIT_RETRANSLATE) {
++        qatomic_or(&porty_gone[k >> 5], 1u << (k & 31));
++        tb_phys_invalidate(tb, -1);
++    }
++}
++
+ static void add_instance_running_local(int fidx, void *tb_ptr)
+ {
+     {
+@@ -1754,9 +1986,16 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+             porty_prof_set(PORTY_PH_TCI_CAP);
+             porty_prof_add(PORTY_C_EXEC_TCI_CAP, 1);
+             res = tcg_qemu_tb_exec_tci(env);
++        } else if (!porty_jit_module_lock(ctx.tb_ptr)) {
++            /* Porty: its module is gone from the ring. */
++            porty_jit_module_gone(ctx.tb_ptr);
++            porty_prof_set(PORTY_PH_TCI);
++            porty_prof_add(PORTY_C_EXEC_TCI, 1);
++            res = tcg_qemu_tb_exec_tci(env);
+         } else {
+             porty_prof_set(PORTY_PH_COMPILE);
+             int fidx = instantiate_wasm();
++            porty_jit_module_unlock(ctx.tb_ptr);
+             qatomic_inc(&porty_jit_compiled);
+             porty_prof_add(PORTY_C_COMPILED, 1);
+             add_instance_running_local(fidx, ctx.tb_ptr);
+diff --git a/tcg/wasm32.h b/tcg/wasm32.h
+index 72bc264..ffe587c 100644
+--- a/tcg/wasm32.h
++++ b/tcg/wasm32.h
+@@ -44,6 +44,8 @@ void init_wasm32();
+ struct TranslationBlock;
+ void porty_jit_translated(struct TranslationBlock *tb);
+ void porty_jit_tb_flush(void);
++/* Porty: tb_gen_code() moves a new block's module to the module ring. */
++int porty_jit_stash_module(void *buf, int code_size);
+ 
+ /*
+  * Executions of a TB before it is compiled to its own Wasm module (until

@@ -1,7 +1,7 @@
 // Unit tests for web/js/snapshot.js (run by tests/unit.test.mjs).
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
-import { parseConfig, requiredWasmMemoryMb } from '../web/js/config.js';
+import { applyPhoneLevel, parseConfig, requiredWasmMemoryMb } from '../web/js/config.js';
 import { buildQemuArgs } from '../web/js/qemu-args.js';
 import {
     RESUME_FAILED_KEY, SNAP_LOADING, STAGE_RESUMING, checkSnapshot, describeResume, readSnapshotStats,
@@ -56,6 +56,7 @@ const snapshot = () => ({
 
     assert.equal(resumeVeto({ search: '' }), '');
     assert.equal(resumeVeto({ search: '?serial=1&fps=10&jitcap=2000' }), '', 'page settings do not matter');
+    assert.equal(resumeVeto({ search: '?jitpolicy=0&jitring=0' }), '', 'nor the JIT cache settings');
     assert.match(resumeVeto({ search: '?resume=0' }), /resume=0/);
     assert.match(resumeVeto({ search: '?mem=1024&smp=2' }), /sets mem=, smp=/);
     assert.equal(resumeVeto({ search: '?mem=1024&resume=1' }), '', 'resume=1 overrides machine parameters');
@@ -119,22 +120,27 @@ const snapshot = () => ({
     const snap = snapshot();
     // A desktop whose own defaults are 1024/384/64 gets the snapshot's 768/128/16.
     const env = { userAgent: MAC };
-    const user = parseConfig('?serial=1&fps=12&jitcap=2000', env);
+    const user = parseConfig('?serial=1&fps=12&jitcap=2000&jitpolicy=2&jitring=64', env);
     const desktop = snapshotConfig(snap, user, env);
     assert.deepEqual(desktop.problems, []);
     assert.deepEqual([desktop.cfg.mem, desktop.cfg.tb, desktop.cfg.cache], [768, 128, 16]);
     assert.deepEqual([desktop.cfg.serial, desktop.cfg.fps, desktop.cfg.jitcap, desktop.cfg.mobile],
         [true, 12, 2000, false], 'page settings stay the visitor\'s');
+    assert.deepEqual([desktop.cfg.jitpolicy, desktop.cfg.jitring], [2, 64], 'so do the JIT cache settings');
     assert.equal(desktop.cfg.memoryExplicit, true);
     assert.equal(desktop.cfg.resume, true);
 
     // An iPhone that had stepped down to 640 MiB still resumes with 768.
     const phoneEnv = { userAgent: IPHONE };
-    const phoneUser = { ...parseConfig('', phoneEnv), mem: 640, tb: 96, cache: 12, phoneLevel: 1 };
+    const phoneUser = applyPhoneLevel(parseConfig('', phoneEnv), 1);
+    assert.deepEqual([phoneUser.mem, phoneUser.tb, phoneUser.cache, phoneUser.jitcap], [640, 96, 12, 4000]);
     const phone = snapshotConfig(snap, phoneUser, phoneEnv);
     assert.deepEqual(phone.problems, []);
     assert.deepEqual([phone.cfg.mem, phone.cfg.tb, phone.cfg.cache, phone.cfg.jitcap, phone.cfg.mobile],
         [768, 128, 16, 4000, true]);
+    // A fresh iPhone resumes with its own JIT cache settings.
+    const fresh = snapshotConfig(snap, parseConfig('', phoneEnv), phoneEnv);
+    assert.deepEqual([fresh.cfg.jitcap, fresh.cfg.jitring, fresh.cfg.jitpolicy], [4000, 24576, 6]);
     assert.equal(phone.cfg.phoneLevel, undefined);
     assert.equal(requiredWasmMemoryMb(phone.cfg), 1280);
 
@@ -197,6 +203,28 @@ const snapshot = () => ({
     const more = snapshotArgs(extra, pagePaths, '/i');
     assert.ok(more.includes('base=2026-11-16,clock=vm'));
     assert.ok(more.includes('if=none,id=x,file.driver=null-co,file.size=1M'));
+
+    // The translation cache is not part of the saved machine: a visitor's
+    // tb= goes into -accel, and only there; without it nothing changes.
+    const bigger = snapshotArgs(snap, pagePaths, '/img/snapshot.idx', 256);
+    assert.equal(bigger[bigger.indexOf('-accel') + 1], args[args.indexOf('-accel') + 1].replace('tb-size=128', 'tb-size=256'));
+    assert.ok(/tb-size=256/.test(bigger[bigger.indexOf('-accel') + 1]));
+    assert.deepEqual(bigger.filter((a, i) => bigger[i - 1] !== '-accel'), args.filter((a, i) => args[i - 1] !== '-accel'));
+    assert.deepEqual(snapshotArgs(snap, pagePaths, '/i', 0), snapshotArgs(snap, pagePaths, '/i'));
+}
+
+// --- tb= on a resume: the visitor's translation cache, no veto ---------------------------
+{
+    const snap = snapshot();
+    assert.equal(resumeVeto({ search: '?tb=256' }), '', 'tb= does not veto a resume');
+    const phoneEnv = { userAgent: IPHONE };
+    const phone = snapshotConfig(snap, parseConfig('?tb=256', phoneEnv), phoneEnv);
+    assert.deepEqual(phone.problems, [], 'an explicit tb= is allowed on a phone');
+    assert.deepEqual([phone.cfg.mem, phone.cfg.tb, phone.cfg.tbExplicit, phone.cfg.cache], [768, 256, true, 16]);
+    assert.equal(requiredWasmMemoryMb(phone.cfg), 1408);
+    const plain = snapshotConfig(snap, parseConfig('', phoneEnv), phoneEnv);
+    assert.deepEqual([plain.cfg.tb, plain.cfg.tbExplicit], [128, false], 'the snapshot\'s tb-size without tb=');
+    assert.equal(requiredWasmMemoryMb(plain.cfg), 1280);
 }
 
 // --- the chunk index QEMU reads ---------------------------------------------------------

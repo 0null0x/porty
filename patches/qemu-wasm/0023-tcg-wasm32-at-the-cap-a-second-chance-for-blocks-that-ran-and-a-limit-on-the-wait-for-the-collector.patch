@@ -1,0 +1,306 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 13:00:00 +0000
+Subject: [PATCH] tcg/wasm32: at the cap, a second chance for blocks that ran
+ and a limit on the wait for the collector
+
+When the cap on compiled blocks is reached, remove_instance_running_local()
+dropped the oldest half of them.  QEMU-Wasm compiles a block when it gets
+hot, so the oldest were the blocks hot first (the kernel's, the shell's):
+they were dropped and compiled again over and over, and with jitgc=1 the
+cap then waited for the collector each time.
+
+get_instance_running_local() now sets a byte per slot of the ring when it
+finds a block's compiled code, and with PORTY_JIT_KEEP_USED (2) in
+porty_set_jit_policy() (Porty's patch 0022) a drop goes round the ring
+like a clock: a block whose byte is set gets a second chance (the byte is
+cleared and the block moves to the end of the ring, the TB's slot with
+it), a block whose byte is clear is dropped, until half are gone as
+before; when every block had run, the second time round drops the oldest.
+Only live TBs' slots are written: each ring slot records the flush
+generation its block was compiled in, and a block from before the last
+flush is dropped, never moved.  porty_jit_stats()[5] counts the blocks
+kept.  Without that bit a drop takes the oldest half, as before.  (A first
+version dropped only the blocks that had not run, at most once per
+trysleep() period.  During app launches nearly every block had run, so it
+dropped next to nothing, and new hot blocks waited at the cap in the
+interpreter for 40-55% of the vCPU's time.)
+
+The wait for the collector gets a limit (porty_set_jit_gc_wait_ms(),
+?jitgcwait=; 0 by default: no limit, as before).  With jitgc=1 a dropped
+block counts against the cap until the FinalizationRegistry reports it
+collected, but a collector need not run while the vCPU worker allocates
+next to nothing, and it allocates next to nothing once it cannot compile.
+In Chrome, full boots at the phone settings stopped compiling after about
+2 minutes, with the cap full of dropped blocks never reported collected,
+and interpreted the remaining 20-25 minutes (QEMU-Wasm as on main, and
+with this series: Porty's runs 44098506791 and 44086625573).  After the
+limit at the cap with no report, the dropped blocks still waited for stop
+counting; later reports of them are not counted twice.  At most two caps'
+worth stay written off and unreported: past that the cap waits as before,
+so that what the browser holds stays bounded even if its collector never
+takes them.  porty_jit_stats()[6] counts the write-offs, [7] the blocks
+written off and not reported yet, [8] the dropped blocks still counting.
+---
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index bbec44d..69a766c 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -232,18 +232,30 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_max_instances(int n)
+  * Porty: [0] compiled TBs alive, counting dropped ones the JS garbage
+  * collector has not reclaimed yet, [1] the cap, [2] the JIT threshold,
+  * [3] TBs compiled since start, [4] translations compiled at once because
+- * they were hot before a flush (porty_jit_translated()).
++ * they were hot before a flush (porty_jit_translated()), [5] compiled TBs
++ * kept at a drop because they had run since the last one, [6] times the
++ * cap stopped waiting for the collector (porty_set_jit_gc_wait_ms()), [7]
++ * dropped TBs that stopped counting then and are not reported collected
++ * yet, [8] dropped TBs still counting while the collector is waited for.
+  */
+ static uint32_t porty_hot_again;
++static uint32_t porty_jit_kept;
++static uint32_t porty_gc_write_offs;
++static int porty_gc_unreported;   /* [7]: the vCPUs' porty_gc_written_off */
++static int porty_gc_pending;      /* [8]: the vCPU's instance_pending_gc_local() */
+ uint32_t *porty_jit_stats(void);
+ EMSCRIPTEN_KEEPALIVE uint32_t *porty_jit_stats(void)
+ {
+-    static uint32_t out[5];
++    static uint32_t out[9];
+     out[0] = qatomic_read(&instance_alive_global);
+     out[1] = qatomic_read(&porty_jit_max_alive);
+     out[2] = porty_jit_threshold;
+     out[3] = qatomic_read(&porty_jit_compiled);
+     out[4] = qatomic_read(&porty_hot_again);
++    out[5] = qatomic_read(&porty_jit_kept);
++    out[6] = qatomic_read(&porty_gc_write_offs);
++    out[7] = qatomic_read(&porty_gc_unreported);
++    out[8] = qatomic_read(&porty_gc_pending);
+     return out;
+ }
+ 
+@@ -265,16 +277,45 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_wait_gc(int on)
+     return on ? 1 : 0;
+ }
+ 
++/*
++ * Porty: how long the cap waits for the collector (?jitgcwait=, ms; 0, the
++ * default, waits as long as it takes).  A collector need not run while the
++ * vCPU worker allocates next to nothing, and it allocates next to nothing
++ * once it cannot compile: in Chrome, full boots at the phone settings
++ * stopped compiling after 2 minutes and interpreted the remaining 20-25
++ * with the cap full of dropped blocks that were never reported collected.
++ * After this long at the cap with no report, porty_jit_gc_wait_check()
++ * stops counting the dropped blocks still waited for; reports of them that
++ * come later are not counted twice (porty_gc_written_off).  It writes off
++ * no more than PORTY_GC_WRITE_OFF_CAPS caps' worth, so that if the
++ * collector never takes them, what the browser holds stays bounded: the
++ * cap waits again, as before.
++ */
++#define PORTY_GC_WRITE_OFF_CAPS 2
++static int porty_jit_gc_wait_ms;
++static __thread double porty_gc_wait_since;
++static __thread uint32_t porty_gc_written_off;
++
++int porty_set_jit_gc_wait_ms(int ms);
++EMSCRIPTEN_KEEPALIVE int porty_set_jit_gc_wait_ms(int ms)
++{
++    qatomic_set(&porty_jit_gc_wait_ms, ms > 0 ? ms : 0);
++    return qatomic_read(&porty_jit_gc_wait_ms);
++}
++
+ /*
+  * Porty: the JIT cache policies as a run-time switch (?jitpolicy=, for A/B
+  * tests and rollback without a rebuild).  PORTY_JIT_REHOT: compile at once
+  * after a flush what was hot before it, and drop the compiled blocks at
+- * the flush (porty_jit_tb_flush()).  Set by the page before main() starts
+- * any vCPU; a negative value restores the default; returns the value in
+- * effect.
++ * the flush (porty_jit_tb_flush()).  PORTY_JIT_KEEP_USED: at the cap, the
++ * blocks that ran since the last drop get a second chance before the
++ * oldest half goes (remove_instance_running_local()).  Set by the page
++ * before main() starts any vCPU; a negative value restores the default;
++ * returns the value in effect.
+  */
+ #define PORTY_JIT_REHOT 1
+-#define PORTY_JIT_POLICIES PORTY_JIT_REHOT
++#define PORTY_JIT_KEEP_USED 2   /* see remove_instance_running_local() */
++#define PORTY_JIT_POLICIES (PORTY_JIT_REHOT | PORTY_JIT_KEEP_USED)
+ static int porty_jit_policy = PORTY_JIT_POLICIES;
+ 
+ int porty_set_jit_policy(int bits);
+@@ -318,17 +359,78 @@ static void check_instance_garbage_collected()
+             instance_garbage_collected_local = 0;
+             return;
+         }
+-        if (instance_garbage_collected_local > instance_pending_gc_local()) {
++        /* Porty: the collector runs; blocks written off stopped counting before. */
++        uint32_t n = instance_garbage_collected_local;
++        uint32_t k = MIN(n, porty_gc_written_off);
++
++        porty_gc_wait_since = 0;
++        porty_gc_written_off -= k;
++        qatomic_sub(&porty_gc_unreported, (int)k);
++        n -= k;
++        if ((int)n > instance_pending_gc_local()) {
+             printf("unexpected number of removed instances %d > %d",
+-                   instance_garbage_collected_local, instance_pending_gc_local()); fflush(stdout);
++                   (int)n, instance_pending_gc_local()); fflush(stdout);
+             exit(1);
+         }
+-        qatomic_sub(&instance_alive_global, instance_garbage_collected_local);
+-        instance_alive_local -= instance_garbage_collected_local;
++        qatomic_sub(&instance_alive_global, n);
++        instance_alive_local -= n;
+         instance_garbage_collected_local = 0;
++        qatomic_set(&porty_gc_pending, instance_pending_gc_local());
+     }
+ }
+ 
++/* Porty: trysleep() at the cap; see porty_set_jit_gc_wait_ms(). */
++static void porty_jit_gc_wait_check(void)
++{
++    int ms = qatomic_read(&porty_jit_gc_wait_ms);
++    int pending = instance_pending_gc_local();
++    double now;
++
++    if (ms <= 0 || pending <= 0 || !qatomic_read(&porty_jit_wait_gc)) {
++        porty_gc_wait_since = 0;
++        return;
++    }
++    now = emscripten_get_now();
++    if (porty_gc_wait_since == 0) {
++        porty_gc_wait_since = now;
++    } else if (now - porty_gc_wait_since >= ms) {
++        int room = PORTY_GC_WRITE_OFF_CAPS * qatomic_read(&porty_jit_max_alive) -
++                   (int)porty_gc_written_off;
++        int n = MIN(pending, room);
++
++        porty_gc_wait_since = 0;
++        if (n > 0) {
++            porty_gc_written_off += n;
++            qatomic_add(&porty_gc_unreported, n);
++            qatomic_sub(&instance_alive_global, n);
++            instance_alive_local -= n;
++            qatomic_inc(&porty_gc_write_offs);
++            qatomic_set(&porty_gc_pending, instance_pending_gc_local());
++        }
++    }
++}
++
++/*
++ * Porty: which compiled blocks ran since the last drop, one byte per slot
++ * of instance_running[], set by get_instance_running_local().  At the cap,
++ * remove_instance_running_local() used to drop the oldest half of the
++ * compiled blocks; QEMU-Wasm compiles a block when it gets hot, so those
++ * were the blocks hot first (the kernel's, the shell's), dropped and
++ * compiled again over and over.  Now a drop still frees half, but it goes
++ * round the ring like a clock: a block that ran since the previous drop
++ * gets a second chance (its bit is cleared and it moves to the end of the
++ * ring, the TB's slot with it), one that did not is dropped; when every
++ * block ran, the second time round drops the oldest of them.  A block
++ * kept has its TB's slot rewritten, so it must belong to a live TB: each
++ * slot also records the flush generation it was compiled in, and a block
++ * from before the last flush (whose TB's memory may hold another TB by
++ * now) is dropped, never moved.  Without PORTY_JIT_KEEP_USED the drop is
++ * the oldest half, as before.
++ */
++static __thread uint8_t instance_used[INSTANCE_RUNNING_LEN];
++static __thread uint32_t instance_gen[INSTANCE_RUNNING_LEN];
++static uint32_t porty_flush_gen;
++
+ static void remove_instance_running_local()
+ {
+     bool wait_gc = qatomic_read(&porty_jit_wait_gc);
+@@ -336,17 +438,38 @@ static void remove_instance_running_local()
+     if (wait_gc && instance_pending_gc_local() > 0) {
+         return;
+     }
+-    int to_remove = instance_running_local / 2;
++    bool keep_used = qatomic_read(&porty_jit_policy) & PORTY_JIT_KEEP_USED;
++    int target = instance_running_local / 2;
++    /* With keep_used, twice round at most: the second time drops what the first kept. */
++    int examine = keep_used ? 2 * instance_running_local : instance_running_local;
++    int to_remove = 0;
++    uint32_t gen = qatomic_read(&porty_flush_gen);
++    for (int i = 0; i < examine && to_remove < target; i++) {
++        int from = instance_running_begin;
++
++        instance_running_begin = (instance_running_begin + 1) % INSTANCE_RUNNING_LEN;
++        if (keep_used && instance_used[from] && instance_gen[from] == gen) {
++            /* Ran since the last drop: keep it, at the end of the ring. */
++            int to = instance_running_end;
++
++            instance_running[to] = instance_running[from];
++            instance_used[to] = 0;
++            instance_gen[to] = gen;
++            *(uint32_t *)((uint32_t)instance_running[to].tb + export_vec_off) =
++                (uint32_t)&instance_running[to];
++            instance_running_end = (to + 1) % INSTANCE_RUNNING_LEN;
++            porty_jit_kept++;
++            continue;
++        }
++        instance_running[from].tb = NULL;
++        to_remove_instance[to_remove_instance_idx++] = instance_running[from].fidx;
++        instance_running_local--;
++        to_remove++;
++    }
+     if (to_remove > 0) {
+         porty_prof_add(PORTY_C_DROPS, 1);
+         porty_prof_add(PORTY_C_DROPPED, to_remove);
+     }
+-    for (int i = 0; i < to_remove; i++) {
+-        instance_running[instance_running_begin].tb = NULL;
+-        to_remove_instance[to_remove_instance_idx++] = instance_running[instance_running_begin].fidx;
+-        instance_running_local--;
+-        instance_running_begin = (instance_running_begin + 1)%INSTANCE_RUNNING_LEN;
+-    }
+     if (to_remove_instance_idx > 0) {
+         remove_module_js();
+     }
+@@ -355,6 +478,7 @@ static void remove_instance_running_local()
+         qatomic_sub(&instance_alive_global, to_remove);
+         instance_alive_local -= to_remove;
+     }
++    qatomic_set(&porty_gc_pending, instance_pending_gc_local());
+ }
+ 
+ /*
+@@ -411,11 +535,13 @@ void porty_jit_tb_flush(void)
+     bool wait_gc = qatomic_read(&porty_jit_wait_gc);
+     int n = instance_running_local;
+ 
++    qatomic_inc(&porty_flush_gen);   /* see remove_instance_running_local() */
+     if (!(qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT)) {
+         return;
+     }
+     memcpy(porty_hot[1], porty_hot[0], sizeof(porty_hot[0]));
+     memset(porty_hot[0], 0, sizeof(porty_hot[0]));
++    memset(instance_used, 0, sizeof(instance_used));
+     for (int i = 0; i < n; i++) {
+         instance_running[instance_running_begin].tb = NULL;
+         to_remove_instance[to_remove_instance_idx++] = instance_running[instance_running_begin].fidx;
+@@ -439,6 +565,8 @@ static void add_instance_running_local(int fidx, void *tb_ptr)
+ 
+         porty_hot[0][k >> 5] |= 1u << (k & 31);
+     }
++    instance_used[instance_running_end] = 0;
++    instance_gen[instance_running_end] = qatomic_read(&porty_flush_gen);
+     instance_running[instance_running_end].tb = tb_ptr;
+     instance_running[instance_running_end].fidx = fidx;
+ 
+@@ -465,6 +593,7 @@ static int get_instance_running_local(void *tb_ptr)
+         *(uint32_t*)tb_counter_ptr = INSTANTIATE_NUM; // will be instanciated immediately
+         return 0;
+     }
++    instance_used[elm - instance_running] = 1;   /* Porty: see remove_instance_running_local() */
+     return elm->fidx;
+ }
+ 
+@@ -480,6 +609,7 @@ static inline void trysleep()
+             emscripten_sleep(0); // return to the browser main loop
+             porty_prof_set(phase);
+             check_instance_garbage_collected();
++            porty_jit_gc_wait_check();
+         }
+         exec_cnt = MAX_EXEC_NUM;
+     }

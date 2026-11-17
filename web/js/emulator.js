@@ -341,7 +341,7 @@ export class Emulator {
         };
         // A resume runs the snapshot's own machine: its arguments, with
         // this page's paths, plus the stream to load (QEMU patch 0012).
-        const args = plan ? snapshotArgs(plan.snap, paths, SNAPSHOT_INDEX)
+        const args = plan ? snapshotArgs(plan.snap, paths, SNAPSHOT_INDEX, plan.cfg.tbExplicit ? plan.cfg.tb : 0)
             : buildQemuArgs(this.cfg, manifest, paths);
         if (plan) {
             // Its query should describe the same machine: page-side settings
@@ -421,6 +421,38 @@ export class Emulator {
                         this.notes.push('Dropped compiled blocks stop counting at once (jitgc=0).');
                     } else {
                         this.notes.push('This QEMU build cannot skip the garbage-collector wait; ?jitgc= ignored.');
+                    }
+                }
+                if (this.cfg.jitgcwait > 0) {
+                    if (typeof Module._porty_set_jit_gc_wait_ms === 'function') {
+                        const n = Module._porty_set_jit_gc_wait_ms(this.cfg.jitgcwait);
+                        this.notes.push(`The cap waits at most ${n} ms for the garbage collector (jitgcwait).`);
+                    } else {
+                        this.notes.push('This QEMU build has no limit on the garbage-collector wait; ?jitgcwait= ignored.');
+                    }
+                }
+                // QEMU patches 0022-0024: the JIT cache's policies and module
+                // ring (on by default on iPhones and iPads, config.js; a build
+                // without them stays as it is, so only a value that asks for
+                // something is worth a note).
+                if (this.cfg.jitpolicy >= 0) {
+                    if (typeof Module._porty_set_jit_policy === 'function') {
+                        const n = Module._porty_set_jit_policy(this.cfg.jitpolicy);
+                        if (n) {
+                            this.notes.push(`JIT cache policies: ${n} (jitpolicy).`);
+                        }
+                    } else if (this.cfg.jitpolicy > 0) {
+                        this.notes.push('This QEMU build has no JIT cache policies; jitpolicy ignored.');
+                    }
+                }
+                if (this.cfg.jitring >= 0) {
+                    if (typeof Module._porty_set_jit_ring_kb === 'function') {
+                        const n = Module._porty_set_jit_ring_kb(this.cfg.jitring);
+                        if (n) {
+                            this.notes.push(`Compiled forms of code blocks in a ${n} KiB ring (jitring).`);
+                        }
+                    } else if (this.cfg.jitring > 0) {
+                        this.notes.push('This QEMU build has no module ring; jitring ignored.');
                     }
                 }
                 if (this.cfg.timescale > 1) {
