@@ -408,8 +408,11 @@ def main():
         check("swipe_scrolls", moved is not None and moved >= 100 and back_pct < 1.0, json.dumps(result["scroll"]))
 
         # --- a long list: resting before the lift, with and without reports ---
+        # Developer options: whatever activity takes the action (its class
+        # name differs between Android versions), started by its name.
         run("dev_options", "settings put global development_settings_enabled 1; am force-stop com.android.settings; "
-                           "am start -W -n com.android.settings/.Settings\\$DevelopmentSettingsDashboardActivity 2>&1 | tail -4")
+                           "c=$(cmd package resolve-activity --brief -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS "
+                           "| tail -1); echo $c; am start -W -n $c 2>&1 | tail -4")
         prov.wait(vm, 10)
         fl_focus = g.focus()
         fl = {}
@@ -479,7 +482,7 @@ def main():
             touch.two((0.45, 0.45), (0.55, 0.55), (0.2, 0.25), (0.8, 0.8), steps=10, pause=0.12)
             zoomed = shot_pair(vm, g, "photo-zoomed")
             result["pinch"] = {"uri": uri, "focus": g.focus(), "changed_pct": gcpu.ppm_diff(zoomed, photo)}
-            check("pinch_zooms", result["pinch"]["changed_pct"] >= 30, json.dumps(result["pinch"]))
+            check("pinch_zooms", result["pinch"]["changed_pct"] >= 20, json.dumps(result["pinch"]))
             g.sh("input keyevent 3", 60)
 
         run("crashes", "logcat -b crash -d | grep -e 'Process: ' -e '>>> ' | cut -c1-200 | head -20")

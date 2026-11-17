@@ -1,4 +1,4 @@
-From e5dacdbbfef747cf9bad702e4ff9c8db14669b26 Mon Sep 17 00:00:00 2001
+From 1bf4169eae047a6b95570d7d375c812080d70043 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 17 Nov 2026 06:11:20 +0000
 Subject: [PATCH] ui/wasmfb: touch input for a virtio multitouch device (ring
@@ -15,20 +15,21 @@ The ring gets three event types, version 2 of its ABI
 slot (0..9) and position (0..0x7fff).  The main loop turns each into one
 input frame with console_handle_touch_event(), which QEMU's GTK and
 D-Bus displays use: every finger that is down is reported in every
-frame, a lifted one gets tracking id -1.  A finger's move that the next
-event in the ring moves again is dropped, so that one drain does not
-hand the guest two positions of one finger at the same time (Android's
-velocity tracker would see a jump in no time).
+frame, a lifted one gets tracking id -1.  Moves that follow each other
+in the ring become one frame, the last one's, with every finger at its
+newest position: the guest stamps events with the time they reach it,
+so frames of one drain would look like moves in no time to Android's
+velocity tracker, and fingers that moved together would come one by one.
 
 Native builds also read PORTY_INPUT_FIFO, a FIFO of "type:a:b:c" lines,
 each one event into the ring while the guest runs, so that native tests
 can touch the guest the way the page does.
 ---
- ui/wasmfb.c | 109 +++++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 108 insertions(+), 1 deletion(-)
+ ui/wasmfb.c | 118 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 117 insertions(+), 1 deletion(-)
 
 diff --git a/ui/wasmfb.c b/ui/wasmfb.c
-index 6857a7b..e01f1a1 100644
+index 6857a7b..10fa87b 100644
 --- a/ui/wasmfb.c
 +++ b/ui/wasmfb.c
 @@ -24,6 +24,14 @@
@@ -100,7 +101,7 @@ index 6857a7b..e01f1a1 100644
  }
  
  /*
-@@ -246,6 +268,33 @@ static void porty_handle_control(int cmd)
+@@ -246,6 +268,43 @@ static void porty_handle_control(int cmd)
      }
  }
  
@@ -131,10 +132,20 @@ index 6857a7b..e01f1a1 100644
 +                               mt, &error_warn);
 +}
 +
++/* A finger moved: its new position goes out with the next frame. */
++static void porty_touch_moved(int slot, int x, int y)
++{
++    if (slot >= 0 && slot < INPUT_EVENT_SLOTS_MAX &&
++        porty.touch_slots[slot].tracking_id != -1) {
++        porty.touch_slots[slot].x = MIN(MAX(x, 0), INPUT_EVENT_ABS_MAX);
++        porty.touch_slots[slot].y = MIN(MAX(y, 0), INPUT_EVENT_ABS_MAX);
++    }
++}
++
  static void porty_dispatch(const PortyInputEvent *ev)
  {
      static const InputButton btn_map[] = {
-@@ -284,6 +333,11 @@ static void porty_dispatch(const PortyInputEvent *ev)
+@@ -284,6 +343,11 @@ static void porty_dispatch(const PortyInputEvent *ev)
              qemu_input_event_sync();
          }
          break;
@@ -146,22 +157,21 @@ index 6857a7b..e01f1a1 100644
      case PORTY_EV_CONTROL:
          porty_handle_control(ev->a);
          break;
-@@ -301,11 +355,49 @@ static void porty_drain_input(void)
+@@ -301,11 +365,48 @@ static void porty_drain_input(void)
          PortyInputEvent ev = porty.ring[tail & (PORTY_RING_SIZE - 1)];
          tail++;
          qatomic_store_release(&porty.tail, tail);
 +        /*
-+         * A finger's move that the next event moves again is dropped: the
-+         * guest stamps events with the time they reach it, so two frames
-+         * in one drain would look like a jump in no time to Android's
-+         * velocity tracker (and fling).
++         * Moves that follow each other in the ring become one frame, the
++         * last one's, which reports every finger at its newest position.
++         * The guest stamps events with the time they reach it: frames of
++         * one drain would look like moves in no time to Android's velocity
++         * tracker, and fingers that moved together would come one by one.
 +         */
-+        if (ev.type == PORTY_EV_TOUCH_MOVE && tail != head) {
-+            const PortyInputEvent *next = &porty.ring[tail & (PORTY_RING_SIZE - 1)];
-+
-+            if (next->type == PORTY_EV_TOUCH_MOVE && next->a == ev.a) {
-+                continue;
-+            }
++        if (ev.type == PORTY_EV_TOUCH_MOVE && tail != head &&
++            porty.ring[tail & (PORTY_RING_SIZE - 1)].type == PORTY_EV_TOUCH_MOVE) {
++            porty_touch_moved(ev.a, ev.b, ev.c);
++            continue;
 +        }
          porty_dispatch(&ev);
      }
@@ -196,7 +206,7 @@ index 6857a7b..e01f1a1 100644
  static void porty_run_script(void)
  {
      int64_t now;
-@@ -473,7 +565,22 @@ static void wasmfb_init(DisplayState *ds, DisplayOptions *opts)
+@@ -473,7 +574,22 @@ static void wasmfb_init(DisplayState *ds, DisplayOptions *opts)
          porty.script_pos = porty.script;
          porty.script_t0 = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
      }

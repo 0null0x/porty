@@ -35,8 +35,11 @@
 //                  the later steps wait half and three quarters of it)
 //   PROBE_STEPS    "launch": the input probe ends after the Gallery launch
 //   PROBE_SWIPE    0: no swipe on Settings after the launch (default 1: the
-//                  input probe opens Settings, swipes up with a finger and
-//                  reports how far the list moved, from the canvas rows)
+//                  input probe opens the app drawer with a finger swipe up,
+//                  Settings with a tap on its icon, swipes up on Settings and
+//                  scrolls it back with the mouse wheel, and reports how far
+//                  the list moved each time, from the canvas rows; no shell
+//                  needed, which answers late or not at all on slow runners)
 //   PROBE_PINCH    1: then also a picture of that screen in Gallery and two
 //                  fingers spreading on it; how much of the screen changed
 //   PROBE_GUEST_EVERY  seconds between the guest's samples during the
@@ -1119,11 +1122,54 @@ async function inputProbe() {
         await shot('picture-pinched', true);
         await page.click('#nav-back').catch(() => {});
     };
+    // Until at least pct% of the canvas differs from `base` (or ms pass); seconds, -1 if not.
+    const changeFrom = async (base, pct, ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms) {
+            await sleep(2000);
+            if (changedPct(base, await canvasSample()) >= pct) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+        }
+        return -1;
+    };
+    // A finger along Android's coordinates [[x, y], ...]: down at the first
+    // point, `steps` moves to each next one, `stepMs` apart, a rest, up.
+    const finger = async (points, steps, stepMs, restMs) => {
+        const page2 = (p) => at(p[0], p[1] * (r.ch || 800) / 800);
+        let [x, y] = page2(points[0]);
+        await page.touchscreen.touchStart(x, y);
+        for (let k = 1; k < points.length; k++) {
+            const [x1, y1] = page2(points[k]);
+            for (let i = 1; i <= steps; i++) {
+                await sleep(stepMs);
+                await page.touchscreen.touchMove(x + ((x1 - x) * i) / steps, y + ((y1 - y) * i) / steps);
+            }
+            [x, y] = [x1, y1];
+        }
+        await sleep(restMs);
+        await page.touchscreen.touchEnd();
+    };
     if (probeSwipe) {
-        log('INPUT PROBE: Settings, then a finger swipe up');
-        await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
-        if (await focusWait('Settings in front', /settings/i, probeWaitMs / 2)) {
-            const settled = await still(90000);
+        log('INPUT PROBE: the app drawer by a finger swipe up, Settings by a tap on its icon, then a swipe on Settings');
+        await still(90000);
+        const home = await canvasSample();
+        await finger([[240, 650], [240, 200]], 6, 60, 0);
+        const drawerS = await changeFrom(home, 30, probeWaitMs / 2);
+        touchResult.drawer = { changedS: drawerS, quietS: await still(90000) };
+        const drawer = await canvasSample();
+        touchResult.drawer.changedPct = changedPct(home, drawer);
+        log(`INPUT PROBE: swipe up on the home screen: ${touchResult.drawer.changedPct}% of the screen changed ` +
+            `after ${drawerS} s (the app drawer)`);
+        await shot('drawer', true);
+        // Settings: the drawer's eleventh app, first of the third row.
+        const [sx0, sy0] = at(60, 375 * (r.ch || 800) / 800);
+        await page.touchscreen.tap(sx0, sy0);
+        const settingsS = await changeFrom(drawer, 30, probeWaitMs);
+        touchResult.settings = { changedS: settingsS };
+        log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s`);
+        if (settingsS >= 0) {
+            const settled = await still(120000);
             const top = await rowSig();
             await shot('settings', true);
             // From 640 to 280 of Android's 800 rows, in 1.2 s, then a rest
@@ -1167,19 +1213,25 @@ async function inputProbe() {
             }
         }
         await page.click('#nav-home').catch(() => {});
-        await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
+        await still(120000);
     }
 
-    const [sx, sy] = at((r.cw || 480) / 2, 91 * (r.ch || 800) / 800);
-    log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the search bar)`);
+    // The mouse: on the touchscreen its button is a finger, so a click on
+    // the Gallery icon opens Gallery (a warm start now).  (The search bar,
+    // clicked here before, opens nothing in this image.)
+    const homeAgain = await canvasSample();
+    const [sx, sy] = at(150, 565 * (r.ch || 800) / 800);
+    log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the Gallery icon)`);
     await page.mouse.move(sx - 20, sy);
     await page.mouse.move(sx, sy, { steps: 4 });
     await page.mouse.down();
     await sleep(150);
     await page.mouse.up();
-    await focusWait('search in front', /search|quicksearchbox|googlequicksearchbox/i, (probeWaitMs * 3) / 4);
+    touchResult.mouseClick = { changedS: await changeFrom(homeAgain, 30, (probeWaitMs * 3) / 4) };
+    log(`INPUT PROBE: mouse click on the Gallery icon: the screen changed after ${touchResult.mouseClick.changedS} s`);
     log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
     await shot('after-mouse', true);
+    await page.click('#nav-home').catch(() => {});
 
     // A mouse pointer, if Android showed one, is a sprite layer; and no
     // input device but the PC's PS/2 mouse (always there, never moved)
