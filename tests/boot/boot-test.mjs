@@ -34,6 +34,9 @@
 //   PROBE_WAIT     seconds the input probe waits for Gallery (default 240;
 //                  the later steps wait half and three quarters of it)
 //   PROBE_STEPS    "launch": the input probe ends after the Gallery launch
+//   PROBE_SWIPE    0: no swipe on Settings after the launch (default 1: the
+//                  input probe opens Settings, swipes up with a finger and
+//                  reports how far the list moved, from the canvas rows)
 //   PROBE_GUEST_EVERY  seconds between the guest's samples during the
 //                  launch (default 30).  0: none, to see how much the
 //                  sampling itself slows the launch; the page's counters
@@ -87,6 +90,7 @@ const netMbps = num('NET_MBPS', 0, 0, 10000);
 const netLatencyMs = num('NET_LATENCY_MS', 0, 0, 5000);
 const probeWaitMs = num('PROBE_WAIT', 240, 30, 7200) * 1000;
 const launchOnly = (process.env.PROBE_STEPS || '') === 'launch';
+const probeSwipe = process.env.PROBE_SWIPE !== '0';
 const resumeSettleMs = num('RESUME_SETTLE', 120, 0, 3600) * 1000;
 const guestEveryMs = num('PROBE_GUEST_EVERY', 30, 0, 600) * 1000;
 const stressMs = num('STRESS_MINUTES', 0, 0, 600) * 60000;
@@ -550,6 +554,10 @@ async function inputProbe() {
             if (/SFTSDONE:2:END/.test(line)) {
                 marks.sfts = 'done';
             }
+            m = line.match(/SPRITES:(\d+):(\d+):END/);
+            if (m) {
+                marks.sprites = { layers: Number(m[1]), pointerMappers: Number(m[2]) };
+            }
             if (/CALDONE:\d+:END/.test(line) && !marks.cal) {
                 marks.cal = Date.now();
             }
@@ -579,7 +587,7 @@ async function inputProbe() {
     log('INPUT PROBE: input devices, the kernel\'s and Android\'s view');
     await send('\rgrep -E "^(N|H|B: (EV|KEY|ABS|REL))" /proc/bus/input/devices\r');
     await sleep(5000);
-    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Mode:" | head -24\r');
+    await send('dumpsys input | grep -E "^    [0-9]+: |Classes:|Mode:|mode - |DeviceType:|AssociatedDisplay:|Viewport: displayId" | head -40\r');
     await sleep(20000);
     // A dialog for an app that stopped responding, even one not on screen
     // yet, means that app does not answer, and while SystemUI does not,
@@ -997,6 +1005,95 @@ async function inputProbe() {
     await page.click('#nav-home').catch((e) => log(`INPUT PROBE: no Home button (${e.message})`));
     await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
 
+    // --- a finger swipe scrolls Settings --------------------------------
+    // How far the list moved: the vertical shift that best lines up the
+    // canvas rows before and after (per-row sums of the green channel).
+    const rowSig = () => page.evaluate(() => {
+        const c = document.getElementById('screen');
+        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        const rows = [];
+        for (let y = 0; y < c.height; y++) {
+            let sum = 0;
+            for (let x = 24; x < c.width - 24; x += 3) {
+                sum += d[(y * c.width + x) * 4 + 1];
+            }
+            rows.push(sum);
+        }
+        return rows;
+    });
+    const vshift = (a, b, top = 90, bottom = 740, limit = 640) => {
+        const err = (sh) => {
+            const lo = Math.max(top, top - sh);
+            const hi = Math.min(bottom, bottom - sh, a.length - sh, b.length);
+            if (hi - lo < 100) {
+                return null;
+            }
+            let e = 0;
+            for (let y = lo; y < hi; y++) {
+                e += Math.abs(b[y] - a[y + sh]);
+            }
+            return e / (hi - lo);
+        };
+        const e0 = err(0);
+        let best = null;
+        let bestErr = null;
+        for (let sh = -limit; sh <= limit; sh++) {
+            const e = err(sh);
+            if (e !== null && (bestErr === null || e < bestErr)) {
+                best = sh;
+                bestErr = e;
+            }
+        }
+        const ok = bestErr !== null && bestErr <= 400 && (best === 0 || bestErr <= 0.25 * Math.max(e0, 1));
+        return { shift: ok ? best : null, err: Math.round(bestErr), err0: Math.round(e0) };
+    };
+    // Until the canvas stops changing (or ms pass): rows of two looks 3 s apart agree.
+    const still = async (ms) => {
+        const t = Date.now();
+        let prev = await rowSig();
+        while (Date.now() - t < ms) {
+            await sleep(3000);
+            const now = await rowSig();
+            const diff = now.reduce((n, v, i) => n + (Math.abs(v - prev[i]) > 200 ? 1 : 0), 0);
+            prev = now;
+            if (diff <= 4) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+        }
+        return -1;
+    };
+    const touchResult = { swipe: null };
+    if (probeSwipe) {
+        log('INPUT PROBE: Settings, then a finger swipe up');
+        await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
+        if (await focusWait('Settings in front', /settings/i, probeWaitMs / 2)) {
+            const settled = await still(90000);
+            const top = await rowSig();
+            await shot('settings', true);
+            // From 640 to 280 of Android's 800 rows, in 1.2 s, then a rest
+            // before the lift (no fling): the list should follow the finger.
+            const [x0, y0] = at(240, 640 * (r.ch || 800) / 800);
+            const [, y1] = at(240, 280 * (r.ch || 800) / 800);
+            await page.touchscreen.touchStart(x0, y0);
+            for (let i = 1; i <= 8; i++) {
+                await sleep(150);
+                await page.touchscreen.touchMove(x0, y0 + ((y1 - y0) * i) / 8);
+            }
+            await sleep(1500);
+            await page.touchscreen.touchEnd();
+            const quiet = await still(120000);
+            const moved = vshift(top, await rowSig());
+            touchResult.swipe = { fingerPx: 360, listPx: moved.shift, matchErr: moved.err, unmovedErr: moved.err0,
+                settledS: settled, quietS: quiet };
+            log(`INPUT PROBE: swipe on Settings: the list moved ${moved.shift === null ? 'farther than 640 px or not at all'
+                : `${moved.shift} px`} for a finger moved 360 px (row match ${moved.err}, unmoved ${moved.err0}); ` +
+                `screen still after ${quiet} s`);
+            await shot('after-swipe', true);
+        }
+        await page.click('#nav-home').catch(() => {});
+        await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
+    }
+
     const [sx, sy] = at((r.cw || 480) / 2, 91 * (r.ch || 800) / 800);
     log(`INPUT PROBE: mouse click at ${sx.toFixed(0)},${sy.toFixed(0)} (the search bar)`);
     await page.mouse.move(sx - 20, sy);
@@ -1007,6 +1104,19 @@ async function inputProbe() {
     await focusWait('search in front', /search|quicksearchbox|googlequicksearchbox/i, (probeWaitMs * 3) / 4);
     log(`INPUT PROBE: page saw ${JSON.stringify(await page.evaluate(() => globalThis.__portyProbe))}`);
     await shot('after-mouse', true);
+
+    // A mouse pointer, if Android showed one, is a sprite layer; and no
+    // input device but the PC's PS/2 mouse (always there, never moved)
+    // should be in pointer mode.
+    marks.sprites = null;
+    await send('echo SPRITES:$(dumpsys SurfaceFlinger --list | grep -c -i -e sprite -e pointer):' +
+        '$(dumpsys input | grep -c "Mode: pointer"):END\r');
+    for (let i = 0; i < 24 && !marks.sprites; i++) {
+        await sleep(5000);
+    }
+    touchResult.pointerSprites = marks.sprites ? marks.sprites.layers : -1;
+    touchResult.pointerModeDevices = marks.sprites ? marks.sprites.pointerMappers : -1;
+    log(`TOUCH RESULT: ${JSON.stringify(touchResult)}`);
 
     await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); head -40 /data/local/tmp/porty-ev.txt\r');
     await sleep(20000);

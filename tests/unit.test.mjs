@@ -10,7 +10,7 @@ import { LEVEL_KEY, RUN_KEY, RunLog, describeRun, nextLevel } from '../web/js/cr
 import { TABLET_DEVICE, TOUCH_DEVICE, buildKernelCmdline, buildQemuArgs, inputArgs, inputDevice, vesaMode } from '../web/js/qemu-args.js';
 import { CODE_TO_EVDEV, KEY, charToKey } from '../web/js/keymap.js';
 import { Display } from '../web/js/display.js';
-import { FLING_HORIZON_MS, Input, KEEP_MS, TOUCH_SLOTS, WHEEL_MARGIN, toTablet, wheelPixels } from '../web/js/input.js';
+import { FLING_HORIZON_MS, Input, KEEP_MS, TOUCH_SLOTS, WHEEL_MARGIN, toTablet, touchSlop, wheelPixels } from '../web/js/input.js';
 import { checkEnvironment } from '../web/js/emulator.js';
 
 const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1';
@@ -425,7 +425,12 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual(wheelPixels({ deltaX: 0, deltaY: 3, deltaMode: 1 }, 400), [0, 120]);
     assert.deepEqual(wheelPixels({ deltaX: 2, deltaY: 1, deltaMode: 2 }, 400), [800, 400]);
     sent = [];
-    const slow = new Input((...ev) => { sent.push(ev); return 1; }, canvas, field, { mode: 'touch', timescale: 2 });
+    // Android's touch slop (8 dp) and 4 pixels more, in tablet units: the
+    // wheel's first move is that much longer, so a small scroll is no tap.
+    assert.deepEqual(touchSlop(480, 800, 160), [Math.round(12 / 480 * 0x7fff), Math.round(12 / 800 * 0x7fff)]);
+    assert.deepEqual(touchSlop(720, 1280, 240), [Math.round(16 / 720 * 0x7fff), Math.round(16 / 1280 * 0x7fff)]);
+    const slop = [100, 200];
+    const slow = new Input((...ev) => { sent.push(ev); return 1; }, canvas, field, { mode: 'touch', timescale: 2, slop });
     assert.equal(slow.wheelRestMs(), FLING_HORIZON_MS * 2 + 2 * KEEP_MS);
     touch.detach();
     slow.attach();
@@ -436,7 +441,8 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     wheel(canvas, { deltaY: 400, ...at(0.5, 0.5) }); // still there: nothing new
     const [wx, wy] = T(0.5, 0.5);
     const eighth = Math.round(0x7fff / 8);
-    assert.deepEqual(sent.slice(0, 4), [[5, 0, wx, wy], [6, 0, wx, wy - eighth], [6, 0, wx, wy - 2 * eighth], [6, 0, wx, WHEEL_MARGIN]]);
+    assert.deepEqual(sent.slice(0, 4), [[5, 0, wx, wy], [6, 0, wx, wy - eighth - slop[1]], [6, 0, wx, wy - 2 * eighth - slop[1]],
+        [6, 0, wx, WHEEL_MARGIN]]);
     assert.equal(sent.length, 4);
     // A finger coming down lifts the wheel's at once.
     pointer(canvas, 'pointerdown', { pointerId: 4, ...at(0.2, 0.2) });
@@ -447,9 +453,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     // Sideways: shift+wheel and deltaX move x; then the rest lifts it.
     sent = [];
     wheel(canvas, { deltaY: 50, shiftKey: true, ...at(0.5, 0.5) });
-    assert.deepEqual(sent, [[5, 0, wx, wy], [6, 0, wx - Math.round(0x7fff / 4), wy]]);
+    assert.deepEqual(sent, [[5, 0, wx, wy], [6, 0, wx - Math.round(0x7fff / 4) - slop[0], wy]]);
     await sleep(slow.wheelRestMs() + 3 * KEEP_MS);
-    assert.deepEqual(sent[sent.length - 1], [7, 0, wx - Math.round(0x7fff / 4), wy]);
+    assert.deepEqual(sent[sent.length - 1], [7, 0, wx - Math.round(0x7fff / 4) - slop[0], wy]);
     assert.ok(sent.slice(2, -1).every((e) => e[0] === 6), 'only resting reports before the lift');
     // A trackpad's pinch (ctrl+wheel): two fingers spread around the pointer.
     sent = [];

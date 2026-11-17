@@ -6,7 +6,7 @@ import { RunLog, browserStorage, describeRun, nextLevel } from './crash-guard.js
 import { Emulator, StartError, checkEnvironment } from './emulator.js';
 import { describeDiet } from './boot-diet.js';
 import { DISKCACHE_HELP, DiskCache, describeUsage, megabytes } from './diskcache.js';
-import { CONTROL, Input } from './input.js';
+import { CONTROL, Input, touchSlop } from './input.js';
 import { SerialConsole } from './serial.js';
 import { resumeMode, resumeVeto, storeResumeFailure, takeResumeFailure } from './snapshot.js';
 
@@ -433,8 +433,13 @@ async function start() {
         $('resume-note').hidden = false;
     }
 
-    input = new Input(emulator.sendInput, $('screen'), $('softkeys'),
-        { mode: emulator.inputMode, timescale: emulator.cfg.timescale });
+    // The machine that runs (a resumed snapshot's own): its pointing
+    // device, time dilation and screen.
+    const machine = emulator.cfg;
+    input = new Input(emulator.sendInput, $('screen'), $('softkeys'), {
+        mode: emulator.inputMode, timescale: machine.timescale,
+        slop: touchSlop(machine.width, machine.height, machine.dpi),
+    });
     input.attach();
     // Touching the screen also dismisses the boot overlay (it cannot tell
     // every guest video mode apart from the BIOS text mode).

@@ -37,6 +37,17 @@ export const FLING_HORIZON_MS = 100;
 export const KEEP_MS = 100;
 // A wheel's line (deltaMode 1), in CSS pixels.
 const LINE_PX = 40;
+// Android's touch slop (8 dp) and a little more, in tablet units [x, y],
+// for a 480x800 screen at 160 dpi; see touchSlop() for others.  A wheel's
+// finger first moves this much farther, or a small scroll would be a
+// finger that lifts where it came down: a tap on whatever is there.
+const DEFAULT_SLOP = [Math.round((12 / 480) * ABS_MAX), Math.round((12 / 800) * ABS_MAX)];
+
+/** Android's touch slop plus a margin in tablet units, for a screen of width x height at dpi. */
+export function touchSlop(width, height, dpi) {
+    const px = Math.ceil((8 * (dpi || 160)) / 160) + 4;
+    return [Math.round((px / (width || 480)) * ABS_MAX), Math.round((px / (height || 800)) * ABS_MAX)];
+}
 // A pinch of the trackpad (ctrl+wheel): fingers start this far from the
 // pointer, and a wheel delta of 100 pixels spreads them by e.
 const PINCH_START = Math.round(0.12 * ABS_MAX);
@@ -61,10 +72,11 @@ export class Input {
      * @param {(type:number,a:number,b:number,c:number)=>number} send
      * @param {HTMLCanvasElement} canvas
      * @param {HTMLInputElement} textInput  hidden field that owns the soft keyboard
-     * @param {{mode?: string, timescale?: number}} [options]
+     * @param {{mode?: string, timescale?: number, slop?: number[]}} [options]
      *        mode: 'touch' (a touchscreen, the default), 'tablet' (the USB
      *        tablet, touch=0) or 'none' (usb=0); timescale: the guest's
-     *        time dilation (?timescale=), for how long the wheel's finger rests
+     *        time dilation (?timescale=), for how long the wheel's finger
+     *        rests; slop: touchSlop() of the guest's screen
      */
     constructor(send, canvas, textInput, options = {}) {
         this.send = send;
@@ -72,6 +84,7 @@ export class Input {
         this.textInput = textInput;
         this.mode = options.mode || 'touch';
         this.timescale = Math.max(1, Number(options.timescale) || 1);
+        this.slop = Array.isArray(options.slop) ? options.slop : DEFAULT_SLOP;
         this.activePointer = null;   // tablet: the pointer that holds the button
         this.fingers = new Map();    // touchscreen: pointerId -> { slot, x, y }
         this.wheel = null;           // touchscreen: the wheel's fingers, see wheelDrag()
@@ -249,11 +262,13 @@ export class Input {
     /**
      * The wheel and a trackpad's two-finger scrolling drag the screen with a
      * finger that comes down where the pointer is, moves against the scroll
-     * (content follows it) and stays inside the screen; it lifts once the
-     * wheel has rested long enough for Android to see no fling, or when a
-     * real finger or button comes down.  A trackpad's pinch (ctrl+wheel)
-     * spreads or closes two fingers around the pointer.  Not while a finger
-     * or button is down.
+     * (content follows it) and stays inside the screen; its first move is
+     * longer by Android's touch slop, which Android does not scroll by (and
+     * a finger that moved less would be a tap); it lifts once the wheel has
+     * rested long enough for Android to see no fling, or when a real finger
+     * or button comes down.  A trackpad's pinch (ctrl+wheel) spreads or
+     * closes two fingers around the pointer.  Not while a finger or button
+     * is down.
      */
     wheelDrag(ev, rect) {
         if (this.fingers.size || !(rect.width > 0 && rect.height > 0)) {
@@ -277,21 +292,29 @@ export class Input {
         if (!w) {
             const [x, y] = toTablet(ev.clientX, ev.clientY, rect);
             const at = pinch ? [[x - PINCH_START, y], [x + PINCH_START, y]] : [[x, y]];
-            w = this.wheel = { pinch, cx: inside(x), cy: inside(y), spread: PINCH_START, fingers: [], timer: 0 };
+            w = this.wheel = { pinch, cx: inside(x), cy: inside(y), spread: PINCH_START, fingers: [], timer: 0, fresh: true };
             for (const [fx, fy] of at) {
                 w.fingers.push(this.press(this.freeSlot(), inside(fx), inside(fy)));
             }
         }
+        const [slopX, slopY] = w.fresh ? this.slop : [0, 0];
+        w.fresh = false;
         if (pinch) {
             // Wheel up (negative) zooms in: the fingers spread.
-            w.spread = Math.max(0.02 * ABS_MAX, Math.min(0.45 * ABS_MAX, w.spread * Math.exp(-dy / PINCH_PX)));
+            const spread = w.spread * Math.exp(-dy / PINCH_PX) + Math.sign(-dy) * slopX;
+            w.spread = Math.max(0.02 * ABS_MAX, Math.min(0.45 * ABS_MAX, spread));
             const [a, b] = w.fingers;
             this.slide(a, inside(w.cx - w.spread), a.y);
             this.slide(b, inside(w.cx + w.spread), b.y);
         } else {
-            // In tablet units; the finger moves against the scroll.
+            // In tablet units; the finger moves against the scroll, the
+            // first time by the slop more along the longer of the two axes.
             const f = w.fingers[0];
-            this.slide(f, inside(f.x - (dx / rect.width) * ABS_MAX), inside(f.y - (dy / rect.height) * ABS_MAX));
+            const mx = -(dx / rect.width) * ABS_MAX;
+            const my = -(dy / rect.height) * ABS_MAX;
+            const along = Math.abs(dy) >= Math.abs(dx);
+            this.slide(f, inside(f.x + mx + (along ? 0 : Math.sign(mx) * slopX)),
+                inside(f.y + my + (along ? Math.sign(my) * slopY : 0)));
         }
         clearTimeout(w.timer);
         w.timer = setTimeout(() => this.endWheel(), this.wheelRestMs());
