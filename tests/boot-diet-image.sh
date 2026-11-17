@@ -111,15 +111,21 @@ for level in 1 2; do
     else
         bad "diet=$level: default.prop not as expected"
     fi
-    # Provisioning (boot-diet.js, PROVISION): one more action in the real init.rc.
+    # Provisioning (boot-diet.js, PROVISION) and no ANR dumps (ANR_TRACES):
+    # two more actions at the end of the real init.rc, in that order.
     if [[ "$said" == *"porty: provisioning at boot_completed (5 settings), hidden: nothing"* ]] \
+        && [[ "$said" == *"porty: no ANR dumps after the boot (dalvik.vm.stack-trace-dir=/proc/porty-no-anr-traces)"* ]] \
         && [[ "$(grep -c '^# porty: provisioning' "$work/android/init.rc")" == 1 ]] \
-        && [[ "$(tail -n 3 "$work/android/init.rc" | head -n 1)" == "# porty: provisioning (web/js/boot-diet.js)" ]] \
+        && [[ "$(grep -c '^# porty: no ANR dumps' "$work/android/init.rc")" == 1 ]] \
+        && [[ "$(tail -n 7 "$work/android/init.rc" | head -n 1)" == "# porty: provisioning (web/js/boot-diet.js)" ]] \
+        && [[ "$(tail -n 6 "$work/android/init.rc" | head -n 1)" == "on property:sys.boot_completed=1" ]] \
+        && tail -n 5 "$work/android/init.rc" | head -n 1 | grep -q -F 'exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; cmd settings put secure user_setup_complete 1; cmd settings put global window_animation_scale 0; cmd settings put global transition_animation_scale 0; cmd settings put global animator_duration_scale 0"' \
+        && [[ "$(tail -n 3 "$work/android/init.rc" | head -n 1)" == "# porty: no ANR dumps (web/js/boot-diet.js)" ]] \
         && [[ "$(tail -n 2 "$work/android/init.rc" | head -n 1)" == "on property:sys.boot_completed=1" ]] \
-        && tail -n 1 "$work/android/init.rc" | grep -q -F 'exec_background u:r:init:s0 -- /system/bin/sh -c "cmd settings put global device_provisioned 1; cmd settings put secure user_setup_complete 1; cmd settings put global window_animation_scale 0; cmd settings put global transition_animation_scale 0; cmd settings put global animator_duration_scale 0"'; then
-        pass "diet=$level: init.rc ends with the provisioning action ($(wc -l < "$work/ramdisk/init.rc") lines before)"
+        && [[ "$(tail -n 1 "$work/android/init.rc")" == "    setprop dalvik.vm.stack-trace-dir /proc/porty-no-anr-traces" ]]; then
+        pass "diet=$level: init.rc ends with the provisioning action and the ANR action ($(wc -l < "$work/ramdisk/init.rc") lines before)"
     else
-        bad "diet=$level: init.rc not as expected: $(tail -n 3 "$work/android/init.rc")"
+        bad "diet=$level: init.rc not as expected: $(tail -n 8 "$work/android/init.rc")"
     fi
     if [[ "$level" == 2 ]]; then
         check "diet=2: /init.zygote64.rc exists afterwards" test -s "$work/android/init.zygote64.rc"

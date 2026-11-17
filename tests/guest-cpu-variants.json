@@ -1,13 +1,15 @@
 {
-  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only). apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: after the starts, the same UI check for every variant (finger drags on Settings, pointer moves, typing in its search; screenshots in the log). Round 6: the UI check again with a tap on Settings' search bar before typing (round 5's search intent opened nothing), and two more Gallery starts by tap, surfaceflinger fixed (the default) against as shipped (sffix=0).",
+  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only); timescale: the page's time dilation for this variant (default 8); browser_like: after settling, QEMU is slowed (cgroup cpu.max) until the guest runs the browser probe's calibration loop in this many guest seconds, as the page's guest does (about 2 at timescale 8), so that Android's timeouts fire as in the browser; launch_timeout: seconds per start. apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: the UI check after the starts. Round 8: \"not responding\" reports at browser speed (slow*), what keeps the guest busy after Android drew Gallery, and SwiftShader's settings (ss*, /SwiftShader.ini, which every process that draws reads from its working directory /). Round 9: a profile of a Gallery start (base, simpleperf by thread and symbol), and whether SwiftShader reads /SwiftShader.ini at all (ThreadCount=4 gives surfaceflinger more threads). anr-stop*: SystemUI is stopped (SIGSTOP) for 75 guest seconds right after the boot, so that the next TIME_TICK broadcast times out for it, as during a slow launch; the setup prints the new am_anr entries, the trace files, the ticks of all Signal Catcher threads and the guest's /proc/stat around it: as is, with no trace path, and with SystemUI as ActivityManager's debug app (set, then the framework restarted). after_settle: shell commands typed once the guest has settled. Round 10: all of SwiftShader's IR optimization passes off, ThreadCount=4 with a surfaceflinger thread count, HWUI's OpenGL pipeline against Skia's (debug.hwui.renderer), with QEMU's code-buffer flushes per start; and the cost of one ANR on a settled guest, with traces and with an ANR trace directory nothing can be created in.",
   "base": "mem=768&tb=128&cache=16",
   "run": [
     "base",
-    "nosffix"
+    "ss-noopt-all",
+    "ss-threads4",
+    "hwui-opengl"
   ],
-  "jobs": 2,
+  "jobs": 1,
   "rounds": 1,
-  "ui": true,
+  "ui": false,
   "apps": [
     {
       "name": "gallery",
@@ -39,6 +41,111 @@
     },
     "nosffix": {
       "query": "sffix=0"
+    },
+    "slow": {
+      "query": "",
+      "timescale": 1,
+      "browser_like": 2.0,
+      "launch_timeout": 900,
+      "setup": [
+        "getprop | grep -e stack-trace -e ro.debuggable -e ro.build.type -e hide_error; settings get global debug_app"
+      ]
+    },
+    "slow-dbgui": {
+      "query": "",
+      "timescale": 1,
+      "browser_like": 2.0,
+      "launch_timeout": 900,
+      "setup": [
+        "getprop | grep -e stack-trace -e ro.debuggable -e ro.build.type -e hide_error; settings get global debug_app",
+        "am set-debug-app --persistent com.android.systemui; settings get global debug_app; kill $(pidof com.android.systemui); sleep 20; pidof com.android.systemui"
+      ]
+    },
+    "slow-notraces": {
+      "query": "",
+      "timescale": 1,
+      "browser_like": 2.0,
+      "launch_timeout": 900,
+      "setup": [
+        "getprop | grep -e stack-trace -e ro.debuggable -e ro.build.type -e hide_error; settings get global debug_app",
+        "setprop dalvik.vm.stack-trace-dir ''; setprop dalvik.vm.stack-trace-file /proc/porty-no-traces; getprop dalvik.vm.stack-trace-dir; getprop dalvik.vm.stack-trace-file"
+      ]
+    },
+    "ss-2d": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Quality]\\nTextureSampleQuality=0\\nMipmapQuality=0\\nPerspectiveCorrection=0\\n[Testing]\\nExactColorRounding=0\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
+    },
+    "ss-noopt": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Optimization]\\nOptimizationPass1=0\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
+    },
+    "ss-threads2": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Processor]\\nThreadCount=2\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
+    },
+    "base-count": {
+      "query": "",
+      "setup": [
+        "sleep 8; echo SFTASKS:$(ls /proc/$(pidof surfaceflinger)/task | wc -l); cat /proc/$(pidof surfaceflinger)/task/*/comm | sort | uniq -c | tr '\\n' ' '"
+      ]
+    },
+    "ss-threads4": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Processor]\\nThreadCount=4\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; ls -l /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted",
+        "sleep 8; echo SFTASKS:$(ls /proc/$(pidof surfaceflinger)/task | wc -l); cat /proc/$(pidof surfaceflinger)/task/*/comm | sort | uniq -c | tr '\\n' ' '"
+      ]
+    },
+    "anr-stop": {
+      "query": "",
+      "timescale": 1,
+      "setup": [
+        "SC() { t=0; for f in /proc/[0-9]*/task/[0-9]*/stat; do read -r l < $f || continue; case $l in *'(Signal Catcher)'*) set -- ${l##*) }; t=$((t+${12}+${13}));; esac; done 2>/dev/null; echo $t; }; p=$(pidof com.android.systemui); c0=$(SC); a0=$(logcat -b events -d | grep -c am_anr); f0=$(ls /data/anr | wc -l); s0=$(head -1 /proc/stat); kill -STOP $p; sleep 75; kill -CONT $p; sleep 60; s1=$(head -1 /proc/stat); c1=$(SC); echo ANRTEST: anr $(( $(logcat -b events -d | grep -c am_anr) - a0 )) files $(( $(ls /data/anr | wc -l) - f0 )) signal_catcher_ticks $((c1 - c0)); echo STAT0 $s0; echo STAT1 $s1; logcat -b events -d | grep am_anr | tail -2 | cut -c1-170; logcat -d -b system | grep -e dumpStackTraces -e 'ANR traces' -e 'trace path' -e 'ANR in' | tail -5 | cut -c1-170; ls -l /data/anr | tail -3; dumpsys window | grep -o 'Application Not Responding: [a-z.]*' | sort -u"
+      ]
+    },
+    "anr-stop-notraces": {
+      "query": "",
+      "timescale": 1,
+      "setup": [
+        "setprop dalvik.vm.stack-trace-dir ''; setprop dalvik.vm.stack-trace-file /proc/porty-no-traces; getprop dalvik.vm.stack-trace-dir; getprop dalvik.vm.stack-trace-file",
+        "SC() { t=0; for f in /proc/[0-9]*/task/[0-9]*/stat; do read -r l < $f || continue; case $l in *'(Signal Catcher)'*) set -- ${l##*) }; t=$((t+${12}+${13}));; esac; done 2>/dev/null; echo $t; }; p=$(pidof com.android.systemui); c0=$(SC); a0=$(logcat -b events -d | grep -c am_anr); f0=$(ls /data/anr | wc -l); s0=$(head -1 /proc/stat); kill -STOP $p; sleep 75; kill -CONT $p; sleep 60; s1=$(head -1 /proc/stat); c1=$(SC); echo ANRTEST: anr $(( $(logcat -b events -d | grep -c am_anr) - a0 )) files $(( $(ls /data/anr | wc -l) - f0 )) signal_catcher_ticks $((c1 - c0)); echo STAT0 $s0; echo STAT1 $s1; logcat -b events -d | grep am_anr | tail -2 | cut -c1-170; logcat -d -b system | grep -e dumpStackTraces -e 'ANR traces' -e 'trace path' -e 'ANR in' | tail -5 | cut -c1-170; ls -l /data/anr | tail -3; dumpsys window | grep -o 'Application Not Responding: [a-z.]*' | sort -u"
+      ]
+    },
+    "anr-stop-dbgui": {
+      "query": "",
+      "timescale": 1,
+      "setup": [
+        "am set-debug-app --persistent com.android.systemui; settings get global debug_app; setprop ctl.restart zygote; sleep 200; pidof com.android.systemui; dumpsys window | grep mCurrentFocus | head -1",
+        "SC() { t=0; for f in /proc/[0-9]*/task/[0-9]*/stat; do read -r l < $f || continue; case $l in *'(Signal Catcher)'*) set -- ${l##*) }; t=$((t+${12}+${13}));; esac; done 2>/dev/null; echo $t; }; p=$(pidof com.android.systemui); c0=$(SC); a0=$(logcat -b events -d | grep -c am_anr); f0=$(ls /data/anr | wc -l); s0=$(head -1 /proc/stat); kill -STOP $p; sleep 75; kill -CONT $p; sleep 60; s1=$(head -1 /proc/stat); c1=$(SC); echo ANRTEST: anr $(( $(logcat -b events -d | grep -c am_anr) - a0 )) files $(( $(ls /data/anr | wc -l) - f0 )) signal_catcher_ticks $((c1 - c0)); echo STAT0 $s0; echo STAT1 $s1; logcat -b events -d | grep am_anr | tail -2 | cut -c1-170; logcat -d -b system | grep -e dumpStackTraces -e 'ANR traces' -e 'trace path' -e 'ANR in' | tail -5 | cut -c1-170; ls -l /data/anr | tail -3; dumpsys window | grep -o 'Application Not Responding: [a-z.]*' | sort -u"
+      ]
+    },
+    "ss-noopt-all": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Optimization]\\nOptimizationPass1=0\\nOptimizationPass2=0\\nOptimizationPass3=0\\nOptimizationPass4=0\\nOptimizationPass5=0\\nOptimizationPass6=0\\nOptimizationPass7=0\\nOptimizationPass8=0\\nOptimizationPass9=0\\nOptimizationPass10=0\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; ls -l /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted",
+        "sleep 8; echo SFTASKS:$(ls /proc/$(pidof surfaceflinger)/task | wc -l); cat /proc/$(pidof surfaceflinger)/task/*/comm | sort | uniq -c | tr '\\n' ' '"
+      ]
+    },
+    "anr-quiet": {
+      "query": "",
+      "timescale": 1,
+      "after_settle": [
+        "SC() { t=0; for f in /proc/[0-9]*/task/[0-9]*/stat; do read -r l < $f || continue; case $l in *'(Signal Catcher)'*) set -- ${l##*) }; t=$((t+${12}+${13}));; esac; done 2>/dev/null; echo $t; }; p=$(pidof com.android.systemui); c0=$(SC); a0=$(logcat -b events -d | grep -c am_anr); f0=$(ls /data/anr | wc -l); s0=$(head -1 /proc/stat); kill -STOP $p; sleep 75; kill -CONT $p; sleep 60; s1=$(head -1 /proc/stat); c1=$(SC); echo ANRTEST: anr $(( $(logcat -b events -d | grep -c am_anr) - a0 )) files $(( $(ls /data/anr | wc -l) - f0 )) signal_catcher_ticks $((c1 - c0)); echo STAT0 $s0; echo STAT1 $s1; logcat -b events -d | grep am_anr | tail -2 | cut -c1-170; logcat -d -b system | grep -e dumpStackTraces -e 'ANR traces' -e 'trace path' -e 'ANR in' | tail -5 | cut -c1-170; ls -l /data/anr | tail -3; dumpsys window | grep -o 'Application Not Responding: [a-z.]*' | sort -u"
+      ]
+    },
+    "anr-quiet-nodump": {
+      "query": "",
+      "timescale": 1,
+      "after_settle": [
+        "setprop dalvik.vm.stack-trace-dir /proc/porty-no-anr-traces; getprop dalvik.vm.stack-trace-dir",
+        "SC() { t=0; for f in /proc/[0-9]*/task/[0-9]*/stat; do read -r l < $f || continue; case $l in *'(Signal Catcher)'*) set -- ${l##*) }; t=$((t+${12}+${13}));; esac; done 2>/dev/null; echo $t; }; p=$(pidof com.android.systemui); c0=$(SC); a0=$(logcat -b events -d | grep -c am_anr); f0=$(ls /data/anr | wc -l); s0=$(head -1 /proc/stat); kill -STOP $p; sleep 75; kill -CONT $p; sleep 60; s1=$(head -1 /proc/stat); c1=$(SC); echo ANRTEST: anr $(( $(logcat -b events -d | grep -c am_anr) - a0 )) files $(( $(ls /data/anr | wc -l) - f0 )) signal_catcher_ticks $((c1 - c0)); echo STAT0 $s0; echo STAT1 $s1; logcat -b events -d | grep am_anr | tail -2 | cut -c1-170; logcat -d -b system | grep -e dumpStackTraces -e 'ANR traces' -e 'trace path' -e 'ANR in' | tail -5 | cut -c1-170; ls -l /data/anr | tail -3; dumpsys window | grep -o 'Application Not Responding: [a-z.]*' | sort -u"
+      ]
     }
   }
 }

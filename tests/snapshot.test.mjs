@@ -161,6 +161,7 @@ const snapshot = () => ({
     assert.match(resumeVeto({ search: '?sffix=0' }), /sets sffix=/);
     // The pointing device (touchscreen or USB tablet) is part of the machine.
     assert.match(resumeVeto({ search: '?touch=0' }), /sets touch=/);
+    assert.match(resumeVeto({ search: '?anrtraces=1' }), /sets anrtraces=/);
 
     // A desktop-sized snapshot is not for phones.
     const big = snapshot();

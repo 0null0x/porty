@@ -79,6 +79,7 @@ import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { startSiteProxy } from './site-proxy.mjs';
+import { describeTcgTables, tcgTables } from './tcg-tables.mjs';
 import {
     COUNTER_BASE, COUNTER_CONTEXTS, COUNTER_NAMES, COUNTER_ROWS, glueRewrite as rewriteGlue,
 } from './webkit-glue.mjs';
@@ -148,7 +149,7 @@ const secs = (ms) => Math.round(ms / 100) / 10;
 const result = {
     browser: browserName, device, query: queryText, version: '', coi: '', features: null, bench: null,
     tableGrow, glue, variant: variantName, boot: {}, probe: {}, jit: [], memory: [], crashed: false, errors: [],
-    peakRss: 0, peakTotal: 0, peakAt: 0,
+    peakRss: 0, peakTotal: 0, peakAt: 0, tcg: null,
 };
 const note = (msg) => {
     result.errors.push(msg.slice(0, 300));
@@ -1365,6 +1366,7 @@ async function pageState() {
         let disk = null;
         let tci = null;
         let mainLoop = null;
+        let tcg = null;
         try {
             heap = e && e.module && e.heapStats ? e.heapStats() : null;
             disk = e && e.module && e.diskStats ? e.diskStats() : null;
@@ -1375,6 +1377,10 @@ async function pageState() {
             // Patch 0017: the main loop's polls, waits and wakes.
             if (e && e.module && typeof e.module._porty_main_loop_stats === 'function') {
                 mainLoop = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_main_loop_stats() >>> 0, 3));
+            }
+            // Patch 0018: how full the wasm32 backend's per-TB tables get (tests/boot/tcg-tables.mjs).
+            if (e && e.module && typeof e.module._porty_tcg_stats === 'function') {
+                tcg = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_tcg_stats() >>> 0, 2 + 6 * 6));
             }
         } catch (err) {
             heap = null;
@@ -1395,6 +1401,7 @@ async function pageState() {
             disk,
             tci,
             mainLoop,
+            tcg,
             resumed: e ? !!e.resumed : false,
             resuming: e ? !!e.resuming : false,
             resumeNote: e ? e.resumeNote || '' : '',
@@ -1448,6 +1455,11 @@ async function sample(label, every = 10000) {
         `${s.mainLoop ? ` mainloop=${s.mainLoop.join('/')}` : ''} | ${describeMemory(m)}` +
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
         (cpu ? ` | threads ${cpu}` : ''));
+    const tcg = tcgTables(s.tcg);
+    if (tcg && JSON.stringify(tcg) !== JSON.stringify(result.tcg)) {
+        log(`TCG TABLES: ${describeTcgTables(tcg)} ${JSON.stringify(tcg)}`);
+        result.tcg = tcg;
+    }
     return s;
 }
 

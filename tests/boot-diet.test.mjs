@@ -10,7 +10,8 @@ import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parseConfig } from '../web/js/config.js';
 import {
-    DIET_LEVELS, DIET_SCRIPT, LOWMEM_PROPS, PROVISION, SF_FIX, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps,
+    ANR_TRACES, DIET_LEVELS, DIET_SCRIPT, LOWMEM_PROPS, PROVISION, SF_FIX, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes,
+    dietProps,
     dietScript, parseProps,
 } from '../web/js/boot-diet.js';
 import { appendInitramfs, appendOffset, newcArchive, parseNewc } from '../web/js/initramfs.js';
@@ -76,16 +77,17 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         ['debug.sf.nobootanimation', '1'], ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract'],
         ['ro.lmk.medium', '1001'], ['ro.lmk.critical', '200']]);
     assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract'
-        + ' ro.lmk.medium=1001 ro.lmk.critical=200 ttmfix sffix provisioned');
+        + ' ro.lmk.medium=1001 ro.lmk.critical=200 ttmfix sffix provisioned noanrdumps');
     // the screen must come on: never the quiescent boot
     assert.ok(DIET_LEVELS.flat().every(([k]) => !/quiescent/.test(k)));
 
     const off = parseConfig('?diet=0&lowmem=0', {});
     assert.deepEqual(dietProps(off), []);
-    assert.equal(describeDiet(off), ' props: none ttmfix sffix provisioned');
-    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0&setup=1', {})), ' props: none');
-    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0', {})), ' props: none provisioned');
-    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0', {})), ' props: none sffix provisioned');
+    assert.equal(describeDiet(off), ' props: none ttmfix sffix provisioned noanrdumps');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0&setup=1&anrtraces=1', {})), ' props: none');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0&anrtraces=1', {})), ' props: none provisioned');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&anrtraces=1', {})), ' props: none sffix provisioned');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0&setup=1', {})), ' props: none noanrdumps');
     assert.deepEqual(dietProps(parseConfig('?diet=0&lowmem=0&props=a.b=c', {})), [['a.b', 'c']]);
 
     // lowmem: lmkd's levels, whatever the diet; off with lowmem=0; props override them
@@ -361,6 +363,54 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         out = run();
         assert.equal(String(out.stdout), 'porty: libsurfaceflinger.so is not the one known, left alone\n');
         assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-libsurfaceflinger.so')));
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+// --- "not responding" reports without the stack dumps -------------------------------------
+{
+    // On by default, whatever else is set; Android's dumps with anrtraces=1.
+    assert.equal(dietFixes(parseConfig('', {})).anr, ANR_TRACES);
+    assert.equal(dietFixes(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0&setup=1&gfx=vesa', {})).anr, ANR_TRACES);
+    assert.equal(dietFixes(parseConfig('?anrtraces=1', {})).anr, false);
+    assert.deepEqual(ANR_TRACES, { property: 'dalvik.vm.stack-trace-dir', off: '/proc/porty-no-anr-traces' });
+
+    // The script: last, and alone too; the same with anr: false as without.
+    const props = dietProps(parseConfig('', {}));
+    const before = dietScript(props, { ttm: TTM_FIX, sf: SF_FIX, provision: PROVISION });
+    const script = dietScript(props, { ttm: TTM_FIX, sf: SF_FIX, provision: PROVISION, anr: ANR_TRACES });
+    assert.equal(dietScript(props, { ttm: TTM_FIX, sf: SF_FIX, provision: PROVISION, anr: false }), before);
+    assert.ok(script.startsWith(before.slice(0, -1)), 'the ANR setting is appended to the script');
+    const action = '\n# porty: no ANR dumps (web/js/boot-diet.js)\non property:sys.boot_completed=1\n' +
+        '    setprop dalvik.vm.stack-trace-dir /proc/porty-no-anr-traces\n';
+    assert.ok(script.includes(`<<'PORTY_EOF'\n${action}PORTY_EOF\n`));
+    const alone = dietScript([], { anr: ANR_TRACES });
+    assert.ok(alone.includes('porty_anr') && !alone.includes('porty_provision') && !alone.includes('porty_module'));
+    const initrd = new Uint8Array([0x1f, 0x8b, 8, 0, 0]);
+    assert.equal(ascii(parseNewc(applyBootDiet(initrd, [], { anr: ANR_TRACES }), 8).entries[1].data), alone);
+    for (const bad of [{ property: 'a b' }, { property: 'x;reboot' }, { off: '/data/anr' }, { off: '/proc/a b' },
+        { off: '/proc/$(reboot)' }, { off: 'proc/x' }]) {
+        assert.throws(() => dietScript([], { anr: { ...ANR_TRACES, ...bad } }), /bad ANR setting/, JSON.stringify(bad));
+    }
+
+    // Run it like /init does: no init.rc, an init.rc, and twice.
+    const shell = have('busybox') ? ['busybox', 'sh'] : ['sh'];
+    const dir = mkdtempSync(path.join(tmpdir(), 'porty-anr-'));
+    const run = () => spawnSync(shell[0], [...shell.slice(1), '-c', '. ./script'], { cwd: dir, input: '' });
+    try {
+        writeFileSync(path.join(dir, 'script'), alone);
+        let out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: no init.rc, ANR dumps as shipped\n');
+        const rc = 'import /init.environ.rc\n\non property:sys.boot_completed=1\n    bootchart stop\n';
+        writeFileSync(path.join(dir, 'init.rc'), rc);
+        out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: no ANR dumps after the boot (dalvik.vm.stack-trace-dir=/proc/porty-no-anr-traces)\n');
+        assert.equal(readFileSync(path.join(dir, 'init.rc'), 'utf8'), rc + action);
+        run();
+        assert.equal(readFileSync(path.join(dir, 'init.rc'), 'utf8'), rc + action, 'the action once');
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

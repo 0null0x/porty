@@ -81,6 +81,28 @@ def main(paths):
                   f"| {med([share(x, {'surfaceflinger'}) for x in runs])} | {med([share(x, app_names) for x in runs])} "
                   f"| {med([share(x, {'system_server'}) for x in runs])} | {med([share(x, {'com.android.launcher3'}) for x in runs])} "
                   f"| {med([share(x, {'com.android.systemui'}) for x in runs])} | {top} |")
+    after = [(r, x) for r in results for x in r.get("launches", []) if x.get("cpu_after_drawn") or x.get("anr")]
+    if after:
+        print()
+        print("### After Android drew the app (from its am_activity_launch_time to quiet), and \"not responding\" reports")
+        print()
+        print("| variant | start | busy ticks | guest s | surfaceflinger % | app % | systemui % | system_server % "
+              "| top threads | not responding (new) | SystemUI frames |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|")
+        for r, x in after:
+            d = x.get("cpu_after_drawn") or {}
+            package = (x.get("component") or "").split("/")[0]
+            busy = max(1, d.get("busy") or 0)
+
+            def pct(names, d=d, busy=busy):
+                return round(100.0 * sum(p["ticks"] for p in d.get("procs", []) if p["comm"] in names) / busy, 1)
+            app = {p["comm"] for p in d.get("procs", []) if package and package.endswith(p["comm"])}
+            top = ", ".join(f"{t['proc'].split('.')[-1]}/{t['comm']} {t['ticks']}" for t in d.get("threads", [])[:4])
+            anr = "; ".join(line.split("am_anr")[-1].strip(" :")[:90] for line in x.get("anr", [])) or "0"
+            gfx = " ".join((x.get("gfx_systemui") or "").split())[:60]
+            print(f"| {r.get('variant')} | {x['app']} #{x['index']} | {d.get('busy')} | {d.get('guest_seconds')} "
+                  f"| {pct({'surfaceflinger'})} | {pct(app)} | {pct({'ndroid.systemui'})} | {pct({'system_server'})} "
+                  f"| {top} | {anr} | {gfx} |")
     uis = [r for r in results if r.get("ui")]
     if uis:
         print()

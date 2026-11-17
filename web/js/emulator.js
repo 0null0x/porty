@@ -321,6 +321,10 @@ export class Emulator {
                 'layer\'s frame at once, instead of composing the screen again on every vsync until then; sffix=0 leaves it.'
             : 'sffix=0: surfaceflinger is left as shipped; it composes the screen again on every vsync while a layer ' +
                 'change waits for another layer\'s frame.');
+        this.notes.push(fixes.anr
+            ? '"Not responding" reports come without the stack dumps of every process of interest (only the culprit\'s ' +
+                'own); anrtraces=1 keeps Android\'s dumps in /data/anr.'
+            : 'anrtraces=1: "not responding" reports come with Android\'s stack dumps in /data/anr.');
         this.notes.push(fixes.provision
             ? 'Android is marked as set up once it has booted, and its setup wizard, analytics service and ' +
                 'second launcher (Taskbar) are hidden, so the boot ends on the home screen; setup=1 leaves all that alone.'
