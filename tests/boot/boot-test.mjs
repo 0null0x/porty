@@ -1053,6 +1053,31 @@ async function inputProbe() {
         const ok = bestErr !== null && bestErr <= 400 && (best === 0 || bestErr <= 0.25 * Math.max(e0, 1));
         return { shift: ok ? best : null, err: Math.round(bestErr), err0: Math.round(e0) };
     };
+    // Rows of the list area that differ from its background (its commonest
+    // row): 0 for an empty list, as Settings shows before its tiles load.
+    const contentRows = (rows, top = 150, bottom = 740) => {
+        const part = rows.slice(top, bottom);
+        const counts = new Map();
+        let bg = part[0];
+        for (const v of part) {
+            counts.set(v, (counts.get(v) || 0) + 1);
+            if (counts.get(v) > counts.get(bg)) {
+                bg = v;
+            }
+        }
+        return part.filter((v) => Math.abs(v - bg) > 500).length;
+    };
+    // Until the list area has drawn rows (or ms pass); seconds, -1 if not.
+    const listWait = async (ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms) {
+            if (contentRows(await rowSig()) >= 40) {
+                return Math.round((Date.now() - t) / 1000);
+            }
+            await sleep(3000);
+        }
+        return -1;
+    };
     // Until the canvas stops changing (or ms pass): rows of two looks 3 s apart agree.
     const still = async (ms) => {
         const t = Date.now();
@@ -1193,6 +1218,13 @@ async function inputProbe() {
             settingsS = byShell;
         }
         if (settingsS >= 0) {
+            // Settings shows its window first and its list later (in
+            // 44092784196 the swipe went over an empty list): wait for rows.
+            const listS = await listWait(480000);
+            touchResult.settings.listS = listS;
+            log(`INPUT PROBE: the Settings list ${listS < 0 ? 'stayed empty for 480 s' : `was drawn after ${listS} s`}`);
+        }
+        if (settingsS >= 0 && touchResult.settings.listS >= 0) {
             const settled = await still(120000);
             const top = await rowSig();
             await shot('settings', true);
