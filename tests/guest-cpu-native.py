@@ -98,15 +98,25 @@ def parse_cpu(text, tag):
         if m and m.group(1) == tag:
             snap_["threads"][int(m.group(3))] = (int(m.group(2)), m.group(4), int(m.group(5)), int(m.group(6)), int(m.group(7)))
             continue
-        if re.match(rf"^CPE\|{tag}\|2$", line):
+        m = re.match(rf"^CPE\|{tag}\|2(?:\|(\d+)\|([\d.]+)\|cpu\s+([\d ]+))?$", line)
+        if m:
             snap_["done"] = True
+            if m.group(1):
+                snap_["self"] = int(m.group(1))
+                snap_["end_uptime"] = float(m.group(2))
+                snap_["end_stat"] = [int(v) for v in m.group(3).split()]
     return snap_
 
 
 def cpu_delta(a, b):
     if not a or not b or not a.get("stat") or not b.get("stat"):
         return None
-    st = [v - (a["stat"][i] if i < len(a["stat"]) else 0) for i, v in enumerate(b["stat"])]
+    # From the end of a to the start of b (tests/boot/cpu-probe.mjs); the
+    # shell that ran the snapshots is not a process of the guest here.
+    start = a.get("end_stat") or a["stat"]
+    st = [v - (start[i] if i < len(start) else 0) for i, v in enumerate(b["stat"])]
+    probe = {pid for pid in (a.get("self"), b.get("self")) if pid is not None}
+    probe_ticks = 0
     total = sum(st[:8])
     idle = st[3] + st[4]
     busy = total - idle
@@ -115,7 +125,9 @@ def cpu_delta(a, b):
         before = a["procs"].get(pid)
         same = before is not None and before[0] == comm
         d = ticks - (before[1] if same else 0)
-        if d > 0:
+        if pid in probe:
+            probe_ticks += max(0, d)
+        elif d > 0:
             procs.append({"pid": pid, "comm": comm, "ticks": d, "new": not same})
     procs.sort(key=lambda p: -p["ticks"])
     threads = []
@@ -127,10 +139,11 @@ def cpu_delta(a, b):
                             "ticks": d, "nice": nice, "policy": policy})
     threads.sort(key=lambda t: -t["ticks"])
     return {
-        "guest_seconds": round(b["uptime"] - a["uptime"], 2),
+        "guest_seconds": round(b["uptime"] - (a.get("end_uptime") or a["uptime"]), 2),
         "total": total, "busy": busy, "idle": idle,
         "user": st[0] + st[1], "system": st[2] + st[5] + st[6],
-        "uncounted": busy - sum(p["ticks"] for p in procs),
+        "uncounted": max(0, busy - sum(p["ticks"] for p in procs)),
+        "probe_ticks": probe_ticks,
         "frames": b["frames"] - a["frames"] if a["frames"] >= 0 and b["frames"] >= 0 else -1,
         "procs": procs[:30],
         "threads": threads[:40],

@@ -922,7 +922,7 @@ async function inputProbe() {
         log(`INPUT PROBE: QEMU's display was updated ${displayUpdates} times from the tap to the end`);
         result.cpu = {
             busy: whole.busy, total: whole.total, user: whole.user, system: whole.system, guestSeconds: whole.guestSeconds,
-            sfFrames: whole.frames, displayUpdates, uncounted: whole.uncounted,
+            sfFrames: whole.frames, displayUpdates, uncounted: whole.uncounted, probeTicks: whole.probeTicks,
             top: whole.procs.slice(0, 10).map((p) => [p.comm, p.ticks]),
             threads: whole.threads.slice(0, 12).map((t) => [`${t.proc}/${t.comm}`, t.ticks]),
         };

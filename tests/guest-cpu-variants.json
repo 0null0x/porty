@@ -1,11 +1,11 @@
 {
-  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only). apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: after the starts, the same UI check for every variant (finger drags on Settings, pointer moves, typing in its search; screenshots in the log). Round 6: the UI check again with a tap on Settings' search bar before typing (round 5's search intent opened nothing), and two more Gallery starts by tap, surfaceflinger fixed (the default) against as shipped (sffix=0).",
+  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only). apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: after the starts, the same UI check for every variant (finger drags on Settings, pointer moves, typing in its search; screenshots in the log). Round 7 (one job): the CPU probe's end marker with the shell's pid and /proc/stat, so that a difference spans from the end of one snapshot to the start of the next and the probe's own shell is reported apart (tests/boot/cpu-probe.mjs); otherwise round 6.",
   "base": "mem=768&tb=128&cache=16",
   "run": [
     "base",
     "nosffix"
   ],
-  "jobs": 2,
+  "jobs": 1,
   "rounds": 1,
   "ui": true,
   "apps": [
