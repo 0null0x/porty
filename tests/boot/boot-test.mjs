@@ -444,6 +444,9 @@ async function dumpFiles() {
 // takes none.
 const probeCpu = process.env.PROBE_CPU !== '0';
 const probeCpuEvery = num('PROBE_CPU_EVERY', 2, 1, 100);
+// surfaceflinger's frames per layer (TimeStats) from the tap to the end;
+// PROBE_SFSTATS=0: not asked for.
+const probeSfStats = process.env.PROBE_SFSTATS !== '0';
 
 async function inputProbe() {
     const send = (cmd) => page.evaluate((c) => globalThis.__send(c), cmd);
@@ -522,6 +525,9 @@ async function inputProbe() {
             }
             if (/LOGDONE:2:END/.test(line)) {
                 logDone = Date.now();
+            }
+            if (/SFTSDONE:2:END/.test(line)) {
+                marks.sfts = 'done';
             }
             if (/CALDONE:\d+:END/.test(line) && !marks.cal) {
                 marks.cal = Date.now();
@@ -724,6 +730,22 @@ async function inputProbe() {
         await send(`${PCPU_FUNCTION}\r`);
         await sleep(3000);
     }
+    // surfaceflinger's own count of the frames it composes, per layer
+    // (TimeStats, Android 9): on and cleared now, read at the end.  Both
+    // are binder calls (and a permission check with system_server), so
+    // they stay out of the launch.
+    const sfStats = async (cmd, ms) => {
+        if (!probeSfStats) {
+            return;
+        }
+        marks.sfts = '';
+        const t = Date.now();
+        await send(`${cmd}; echo SFTSDONE:$((1+1)):END\r`);
+        while (marks.sfts !== 'done' && Date.now() - t < ms) {
+            await sleep(2000);
+        }
+    };
+    await sfStats('dumpsys SurfaceFlinger --timestats -enable -clear > /dev/null 2>&1', 60000);
     const cpuBefore = await cpuSnap('before', true, 180000);
     const cpuTags = cpuBefore ? ['before'] : [];
     let prevSt = marks.st;
@@ -852,6 +874,9 @@ async function inputProbe() {
     // Where the guest's CPU went: from the tap to now, and between the
     // snapshots taken during the launch.
     const cpuEnd = cpuBefore ? await cpuSnap('end', true, 240000) : null;
+    await sfStats('dumpsys SurfaceFlinger --timestats -dump -maxlayers 16 2>&1 | grep -E ' +
+        '"layerName|totalFrames|droppedFrames|missedFrames|clientCompositionFrames|statsStart|statsEnd|displayOnTime" ' +
+        '| sed "s/^/SFTS|/"', 120000);
     if (cpuEnd) {
         cpuTags.push('end');
         const whole = cpuDelta(cpuBefore, cpuEnd);
