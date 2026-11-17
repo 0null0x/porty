@@ -1,7 +1,7 @@
 // Unit tests for web/js/snapshot.js (run by tests/unit.test.mjs).
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
-import { parseConfig, requiredWasmMemoryMb } from '../web/js/config.js';
+import { applyPhoneLevel, parseConfig, requiredWasmMemoryMb } from '../web/js/config.js';
 import { buildQemuArgs } from '../web/js/qemu-args.js';
 import {
     RESUME_FAILED_KEY, SNAP_LOADING, STAGE_RESUMING, checkSnapshot, describeResume, readSnapshotStats,
@@ -130,13 +130,18 @@ const snapshot = () => ({
     assert.equal(desktop.cfg.memoryExplicit, true);
     assert.equal(desktop.cfg.resume, true);
 
-    // An iPhone that had stepped down to 640 MiB still resumes with 768.
+    // An iPhone that had stepped down to 640 MiB still resumes with 768
+    // (and keeps the smaller cap on compiled blocks of its step).
     const phoneEnv = { userAgent: IPHONE };
-    const phoneUser = { ...parseConfig('', phoneEnv), mem: 640, tb: 96, cache: 12, phoneLevel: 1 };
+    const phoneUser = applyPhoneLevel(parseConfig('', phoneEnv), 1);
+    assert.deepEqual([phoneUser.mem, phoneUser.tb, phoneUser.cache, phoneUser.jitcap], [640, 96, 12, 4000]);
     const phone = snapshotConfig(snap, phoneUser, phoneEnv);
     assert.deepEqual(phone.problems, []);
     assert.deepEqual([phone.cfg.mem, phone.cfg.tb, phone.cfg.cache, phone.cfg.jitcap, phone.cfg.mobile],
         [768, 128, 16, 4000, true]);
+    // A fresh iPhone resumes with its own JIT cache settings.
+    const fresh = snapshotConfig(snap, parseConfig('', phoneEnv), phoneEnv);
+    assert.deepEqual([fresh.cfg.jitcap, fresh.cfg.jitring, fresh.cfg.jitpolicy], [8000, 24576, 6]);
     assert.equal(phone.cfg.phoneLevel, undefined);
     assert.equal(requiredWasmMemoryMb(phone.cfg), 1280);
 

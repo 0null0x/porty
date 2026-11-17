@@ -20,7 +20,8 @@
 //   QUERY           page parameters, e.g. "wasmmem=1280&jitcap=4000"
 //   BROWSER         webkit (default) or chrome
 //   DEVICE          iphone (default: an iPhone's user agent, so the page
-//                   takes its phone defaults) or desktop
+//                   takes its iPhone defaults), android (an Android
+//                   phone's: the defaults of other phones) or desktop
 //   MINUTES         deadline for the whole run (default 30)
 //   PROBE_SECONDS   how long to wait for Gallery after the tap (default 480)
 //   BENCH           0 skips part 2; "only" stops after it
@@ -382,6 +383,8 @@ if (useProxy) {
 
 const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 ' +
     '(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/131.0.0.0 Mobile Safari/537.36';
 let browser;
 let page;
 let closing = false;
@@ -407,6 +410,7 @@ try {
         // with COI=route the page's service workers stay off.
         ...(coiMode === 'route' ? { serviceWorkers: 'block' } : {}),
         ...(device === 'iphone' ? { userAgent: IPHONE_UA } : {}),
+        ...(device === 'android' ? { userAgent: ANDROID_UA } : {}),
     });
     page = await context.newPage();
 } catch (e) {

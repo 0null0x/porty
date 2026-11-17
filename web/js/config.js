@@ -37,8 +37,19 @@ const DEFAULTS = {
     // 1.25 GB for a 943 MB image and reached each stage later than with 64.
     // jitcap: compiled code blocks alive at once (0: the build's 15000).
     // Each is a module in the browser's own heap, so phones keep fewer.
-    desktop: { mem: 1024, tb: 384, cache: 64, jitcap: 0 },
-    mobile: { ...PHONE_LEVELS[0], jitcap: 4000 },
+    // jitring, jitpolicy: QEMU patches 0022-0024 (the module ring and the
+    // JIT cache policies), 0: off, QEMU-Wasm as before.
+    desktop: { mem: 1024, tb: 384, cache: 64, jitcap: 0, jitring: 0, jitpolicy: 0 },
+    mobile: { ...PHONE_LEVELS[0], jitcap: 4000, jitring: 0, jitpolicy: 0 },
+    // iPhones and iPads, where every browser is WebKit.  There the time of
+    // an app launch went to translating blocks again after the translation
+    // cache was flushed (every 6-10 s, as compiled forms took 80% of it) and
+    // to waiting at the cap for the collector to take dropped blocks.  The
+    // module ring keeps compiled forms out of the cache (one flush per
+    // launch instead of 13), and 8000 blocks hold the launch's working set:
+    // Gallery in 75 s instead of 112 s, with no higher peak memory (WebKit
+    // on Linux, A/B run 44098484966).  Chrome and desktops were not faster.
+    ios: { ...PHONE_LEVELS[0], jitcap: 8000, jitring: 24576, jitpolicy: 6 },
 };
 
 export const PARAM_HELP = [
@@ -49,10 +60,10 @@ export const PARAM_HELP = [
     ['touch', '1 gives Android a touchscreen (virtio multitouch: taps, swipes and two-finger gestures as on a phone; a mouse acts as one finger, its wheel drags, its right button is Back) instead of the USB tablet (default 0: a mouse, an arrow follows the finger and a tap is a click). Off by default for now: with a touchscreen, apps take about twice as long to draw their first frame.'],
     ['usb', '0 leaves out the pointing device, touchscreen or USB tablet (no touch input; for diagnosis).'],
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
-    ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
+    ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000, iPhones and iPads 8000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
-    ['jitpolicy', 'JIT cache policies, bits (default 6): 1 compile at once after a flush what was hot before it, 2 at the cap give the blocks that ran since the last drop a second chance, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before (with jitring=0).'],
-    ['jitring', 'KiB of the ring that keeps the compiled forms of code blocks out of the translation cache (default 24576; 0 = in the cache, as before).'],
+    ['jitpolicy', 'JIT cache policies, bits (default 0, iPhones and iPads 6): 1 compile at once after a flush what was hot before it, 2 at the cap give the blocks that ran since the last drop a second chance, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before.'],
+    ['jitring', 'KiB of the ring that keeps the compiled forms of code blocks out of the translation cache (default 0 = in the cache, as before; iPhones and iPads 24576).'],
     ['timescale', 'guest time runs this many times slower than real time (1-16, default 8; 1 = real time), so Android\'s timeouts allow for a slow emulator. The guest\'s clock then falls behind.'],
     ['cpu', 'QEMU CPU model (default Nehalem: SSE4.2 + POPCNT, no AVX).'],
     ['res', 'guest resolution WxH (default 480x800).'],
@@ -108,7 +119,16 @@ function safeWords(raw) {
 
 export function isMobile(env) {
     const ua = env.userAgent || '';
-    if (/iPhone|iPad|iPod|Android/i.test(ua)) {
+    if (/Android/i.test(ua)) {
+        return true;
+    }
+    return isAppleMobile(env);
+}
+
+/** iPhone, iPad or iPod: every browser there is WebKit. */
+export function isAppleMobile(env) {
+    const ua = env.userAgent || '';
+    if (/iPhone|iPad|iPod/i.test(ua)) {
         return true;
     }
     // iPadOS reports itself as a Mac; the touch point count gives it away.
@@ -122,7 +142,7 @@ export function isMobile(env) {
 export function parseConfig(search, env = {}) {
     const params = new URLSearchParams(search);
     const mobile = isMobile(env);
-    const base = mobile ? DEFAULTS.mobile : DEFAULTS.desktop;
+    const base = isAppleMobile(env) ? DEFAULTS.ios : (mobile ? DEFAULTS.mobile : DEFAULTS.desktop);
 
     let width = 480;
     let height = 800;
@@ -163,11 +183,12 @@ export function parseConfig(search, env = {}) {
         // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
         jit: intParam(params, 'jit', -1, -1, 2147483647),
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),
+        jitcapExplicit: params.has('jitcap'),
         // false: patch 0010's "do not wait for the garbage collector".
         jitgc: boolParam(params, 'jitgc', true),
-        // -1: the build's defaults (QEMU patches 0022-0024; see PARAM_HELP).
-        jitpolicy: intParam(params, 'jitpolicy', -1, -1, 7),
-        jitring: intParam(params, 'jitring', -1, -1, 262144),
+        // QEMU patches 0022-0024 (see PARAM_HELP); -1: the build's defaults (off).
+        jitpolicy: intParam(params, 'jitpolicy', base.jitpolicy, -1, 7),
+        jitring: intParam(params, 'jitring', base.jitring, -1, 262144),
         // Patch 0011's time dilation: the guest's clocks (and with them
         // Android's 60 s Watchdog) run this many times slower. 1: off.
         // Default 8: the first boots to sys.boot_completed in a browser
@@ -241,7 +262,10 @@ export function applyPhoneLevel(cfg, level) {
         return cfg;
     }
     const step = PHONE_LEVELS[Math.min(PHONE_LEVELS.length - 1, Math.floor(level))];
-    return { ...cfg, ...step, phoneLevel: PHONE_LEVELS.indexOf(step) };
+    // After a start the browser killed, iPhones also go back to other
+    // phones' cap on compiled blocks.
+    const cap = !cfg.jitcapExplicit && cfg.jitcap > DEFAULTS.mobile.jitcap ? { jitcap: DEFAULTS.mobile.jitcap } : {};
+    return { ...cfg, ...step, ...cap, phoneLevel: PHONE_LEVELS.indexOf(step) };
 }
 
 /**

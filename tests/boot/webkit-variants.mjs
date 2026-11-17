@@ -203,7 +203,9 @@ function runOne(v, index) {
         const env = {
             ...process.env,
             BROWSER: v.browser,
-            DEVICE: 'iphone',
+            // Chrome as on an Android phone; on an iPhone every browser is WebKit,
+            // and the page's iPhone defaults are WebKit's (web/js/config.js).
+            DEVICE: v.browser === 'chrome' ? 'android' : 'iphone',
             QUERY: v.query,
             BROWSER_ENV: v.env.join(' '),
             GLUE: v.glue.join(','),
