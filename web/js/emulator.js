@@ -341,7 +341,7 @@ export class Emulator {
         };
         // A resume runs the snapshot's own machine: its arguments, with
         // this page's paths, plus the stream to load (QEMU patch 0012).
-        const args = plan ? snapshotArgs(plan.snap, paths, SNAPSHOT_INDEX)
+        const args = plan ? snapshotArgs(plan.snap, paths, SNAPSHOT_INDEX, plan.cfg.tbExplicit ? plan.cfg.tb : 0)
             : buildQemuArgs(this.cfg, manifest, paths);
         if (plan) {
             // Its query should describe the same machine: page-side settings

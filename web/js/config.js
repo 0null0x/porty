@@ -141,6 +141,9 @@ export function parseConfig(search, env = {}) {
         memExplicit: params.has('mem'),
         // Any memory parameter in the URL: then phones never step down.
         memoryExplicit: ['mem', 'tb', 'cache', 'wasmmem'].some((n) => params.has(n)),
+        // tb= also applies to a resume (snapshot.js): the translation cache
+        // is not part of the saved machine.
+        tbExplicit: params.has('tb'),
         // One CPU by default: with -smp 2, QEMU-Wasm dies within seconds
         // (first boot test, 2026-11-15).
         smp: intParam(params, 'smp', 1, 1, 4),

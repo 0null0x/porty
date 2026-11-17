@@ -18,7 +18,9 @@ export const SNAP_FAILED = 3;
 
 // URL parameters that shape the machine. A snapshot only fits the machine
 // it was saved on, so a visitor who sets one of these gets a normal boot.
-const MACHINE_PARAMS = ['mem', 'tb', 'smp', 'usb', 'touch', 'cpu', 'res', 'dpi', 'gfx', 'disk', 'setup',
+// (tb= is not among them: QEMU's translation cache is not part of the saved
+// state, so a resume takes the visitor's; see snapshotConfig().)
+const MACHINE_PARAMS = ['mem', 'smp', 'usb', 'touch', 'cpu', 'res', 'dpi', 'gfx', 'disk', 'setup',
     'cache', 'parallel', 'append', 'cmdline', 'qemu', 'timescale', 'diet', 'props', 'lowmem', 'ttmfix', 'sffix',
     'anrtraces'];
 // Settings of the page and of this device that a resume keeps.
@@ -216,6 +218,13 @@ export function snapshotConfig(snap, userCfg, env = {}) {
     if (tb > 0) {
         cfg.tb = tb;
     }
+    // The translation cache is not part of the saved machine: a visitor's
+    // tb= wins (snapshotArgs() puts it into -accel).
+    cfg.tbExplicit = false;
+    if (userCfg.tbExplicit && userCfg.tb > 0) {
+        cfg.tb = userCfg.tb;
+        cfg.tbExplicit = true;
+    }
     if (cache > 0) {
         cfg.cache = cache;
     }
@@ -225,7 +234,7 @@ export function snapshotConfig(snap, userCfg, env = {}) {
     delete cfg.phoneLevel;
     cfg.resume = true;
     if (cfg.mobile) {
-        const limit = requiredWasmMemoryMb({ ...cfg, ...PHONE_LEVELS[0] });
+        const limit = requiredWasmMemoryMb({ ...cfg, ...PHONE_LEVELS[0], ...(cfg.tbExplicit ? { tb: cfg.tb } : {}) });
         const need = requiredWasmMemoryMb(cfg);
         if (need > limit) {
             problems.push(`it needs ${need} MiB of memory, more than the ${limit} MiB a phone gets`);
@@ -241,14 +250,19 @@ export function snapshotConfig(snap, userCfg, env = {}) {
  * @param snap       a manifest that passed checkSnapshot()
  * @param paths      { bios, kernel, initrd, ramdisk, diskUrl } as for buildQemuArgs()
  * @param indexPath  where the page puts snapshotIndex() in QEMU's filesystem
+ * @param tb         if given, the translation cache in MiB (-accel's
+ *                   tb-size), which is not part of the saved machine
  */
-export function snapshotArgs(snap, paths, indexPath) {
+export function snapshotArgs(snap, paths, indexPath, tb = 0) {
     const esc = (s) => String(s).replace(/,/g, ',,');
     const direct = { '-L': paths.bios, '-kernel': paths.kernel, '-initrd': paths.initrd };
     const args = snap.argv.map((arg, i) => {
         const flag = snap.argv[i - 1];
         if (Object.prototype.hasOwnProperty.call(direct, flag)) {
             return direct[flag];
+        }
+        if (flag === '-accel' && tb > 0) {
+            return splitOptions(arg).map((part) => (part.startsWith('tb-size=') ? `tb-size=${tb}` : part)).join(',');
         }
         if (flag !== '-drive') {
             return arg;

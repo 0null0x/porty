@@ -197,6 +197,28 @@ const snapshot = () => ({
     const more = snapshotArgs(extra, pagePaths, '/i');
     assert.ok(more.includes('base=2026-11-16,clock=vm'));
     assert.ok(more.includes('if=none,id=x,file.driver=null-co,file.size=1M'));
+
+    // The translation cache is not part of the saved machine: a visitor's
+    // tb= goes into -accel, and only there; without it nothing changes.
+    const bigger = snapshotArgs(snap, pagePaths, '/img/snapshot.idx', 256);
+    assert.equal(bigger[bigger.indexOf('-accel') + 1], args[args.indexOf('-accel') + 1].replace('tb-size=128', 'tb-size=256'));
+    assert.ok(/tb-size=256/.test(bigger[bigger.indexOf('-accel') + 1]));
+    assert.deepEqual(bigger.filter((a, i) => bigger[i - 1] !== '-accel'), args.filter((a, i) => args[i - 1] !== '-accel'));
+    assert.deepEqual(snapshotArgs(snap, pagePaths, '/i', 0), snapshotArgs(snap, pagePaths, '/i'));
+}
+
+// --- tb= on a resume: the visitor's translation cache, no veto ---------------------------
+{
+    const snap = snapshot();
+    assert.equal(resumeVeto({ search: '?tb=256' }), '', 'tb= does not veto a resume');
+    const phoneEnv = { userAgent: IPHONE };
+    const phone = snapshotConfig(snap, parseConfig('?tb=256', phoneEnv), phoneEnv);
+    assert.deepEqual(phone.problems, [], 'an explicit tb= is allowed on a phone');
+    assert.deepEqual([phone.cfg.mem, phone.cfg.tb, phone.cfg.tbExplicit, phone.cfg.cache], [768, 256, true, 16]);
+    assert.equal(requiredWasmMemoryMb(phone.cfg), 1408);
+    const plain = snapshotConfig(snap, parseConfig('', phoneEnv), phoneEnv);
+    assert.deepEqual([plain.cfg.tb, plain.cfg.tbExplicit], [128, false], 'the snapshot\'s tb-size without tb=');
+    assert.equal(requiredWasmMemoryMb(plain.cfg), 1280);
 }
 
 // --- the chunk index QEMU reads ---------------------------------------------------------
