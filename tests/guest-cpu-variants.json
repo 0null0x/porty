@@ -1,13 +1,14 @@
 {
-  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only). apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: after the starts, the same UI check for every variant (finger drags on Settings, pointer moves, typing in its search; screenshots in the log). Round 7 (one job): the CPU probe's end marker with the shell's pid and /proc/stat, so that a difference spans from the end of one snapshot to the start of the next and the probe's own shell is reported apart (tests/boot/cpu-probe.mjs); otherwise round 6.",
+  "comment": "Variants for .github/workflows/guest-cpu.yml (tests/guest-cpu-native.py). query: page parameters added to the base; setup: shell commands typed into the guest right after sys.boot_completed=1 (experiments only); timescale: the page's time dilation for this variant (default 8); browser_like: after settling, QEMU is slowed (cgroup cpu.max) until the guest runs the browser probe's calibration loop in this many guest seconds, as the page's guest does (about 2 at timescale 8), so that Android's timeouts fire as in the browser; launch_timeout: seconds per start. apps: what is started after the guest settled, each a cold start; how=tap is a finger tap at x,y (fractions of the screen) as the page sends it, how=start is am start. ui: the UI check after the starts. Round 8: \"not responding\" reports at browser speed (slow*), what keeps the guest busy after Android drew Gallery, and SwiftShader's settings (ss*, /SwiftShader.ini, which every process that draws reads from its working directory /).",
   "base": "mem=768&tb=128&cache=16",
   "run": [
-    "base",
-    "nosffix"
+    "slow",
+    "slow-dbgui",
+    "slow-notraces"
   ],
   "jobs": 1,
   "rounds": 1,
-  "ui": true,
+  "ui": false,
   "apps": [
     {
       "name": "gallery",
@@ -39,6 +40,53 @@
     },
     "nosffix": {
       "query": "sffix=0"
+    },
+    "slow": {
+      "query": "",
+      "timescale": 1,
+      "browser_like": 2.0,
+      "launch_timeout": 900,
+      "setup": [
+        "getprop | grep -e stack-trace -e ro.debuggable -e ro.build.type -e hide_error; settings get global debug_app"
+      ]
+    },
+    "slow-dbgui": {
+      "query": "",
+      "timescale": 1,
+      "browser_like": 2.0,
+      "launch_timeout": 900,
+      "setup": [
+        "getprop | grep -e stack-trace -e ro.debuggable -e ro.build.type -e hide_error; settings get global debug_app",
+        "am set-debug-app --persistent com.android.systemui; settings get global debug_app; kill $(pidof com.android.systemui); sleep 20; pidof com.android.systemui"
+      ]
+    },
+    "slow-notraces": {
+      "query": "",
+      "timescale": 1,
+      "browser_like": 2.0,
+      "launch_timeout": 900,
+      "setup": [
+        "getprop | grep -e stack-trace -e ro.debuggable -e ro.build.type -e hide_error; settings get global debug_app",
+        "setprop dalvik.vm.stack-trace-dir ''; setprop dalvik.vm.stack-trace-file /proc/porty-no-traces; getprop dalvik.vm.stack-trace-dir; getprop dalvik.vm.stack-trace-file"
+      ]
+    },
+    "ss-2d": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Quality]\\nTextureSampleQuality=0\\nMipmapQuality=0\\nPerspectiveCorrection=0\\n[Testing]\\nExactColorRounding=0\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
+    },
+    "ss-noopt": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Optimization]\\nOptimizationPass1=0\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
+    },
+    "ss-threads2": {
+      "query": "",
+      "setup": [
+        "mount -o remount,rw / && printf '[Processor]\\nThreadCount=2\\n' > /SwiftShader.ini; mount -o remount,ro /; cat /SwiftShader.ini; setprop ctl.restart surfaceflinger; sleep 5; echo restarted"
+      ]
     }
   }
 }

@@ -349,7 +349,11 @@ def launch(g, app, opts, index):
     seen = int(before_events) if before_events.isdigit() else 0
     _, base = screen_diff(vm, "base", None)
     g.sh("dumpsys SurfaceFlinger --timestats -enable -clear > /dev/null 2>&1; dumpsys SurfaceFlinger --latency-clear > /dev/null 2>&1", 120)
+    anr0 = g.sh("logcat -b events -d | grep -c am_anr", 60)[1].strip()
+    anr0 = int(anr0) if anr0.isdigit() else 0
+    g.sh("dumpsys gfxinfo com.android.systemui reset > /dev/null 2>&1", 120)
     a = g.cpu("a", threads=True)
+    d_snap = None
     t0 = time.monotonic()
     if app["how"] == "tap":
         tap(vm, app["x"], app["y"])
@@ -371,6 +375,11 @@ def launch(g, app, opts, index):
         count = lines[-1].strip() if len(lines) > 1 else ""
         if drawn is None and count.isdigit() and int(count) > seen:
             drawn = now_t
+            # From here on: what keeps the guest busy after the app shows.
+            out["sf_timestats_to_drawn"] = g.sh("dumpsys SurfaceFlinger --timestats -dump -maxlayers 16 2>&1 | grep -E"
+                                                " 'layerName|totalFrames' | cut -c1-120; dumpsys SurfaceFlinger --timestats -clear"
+                                                " > /dev/null 2>&1", 120)[1]
+            d_snap = g.cpu("d", threads=True)
         diff, _ = screen_diff(vm, "now", base)
         if changed is None and diff >= 40:
             changed = now_t
@@ -415,6 +424,21 @@ def launch(g, app, opts, index):
     out["launch_ms"] = int(m.group(1)) if m else None
     out["launch_total_ms"] = int(m.group(2)) if m else None
     out["focus_after"] = g.focus()
+    after = cpu_delta(d_snap, b) if d_snap else None
+    if after:
+        out["cpu_after_drawn"] = after
+        log(f"    after Android drew it: {describe(after, 10)}")
+        for t in after["threads"][:12]:
+            log(f"      thread {t['proc']}/{t['comm']} (nice {t['nice']}, policy {t['policy']}): {t['ticks']}")
+    anr_lines = g.sh(f"logcat -b events -d | grep am_anr | tail -n +{anr0 + 1} | cut -c1-200", 60)[1].strip()
+    out["anr"] = [line for line in anr_lines.split("\n") if "am_anr" in line]
+    if out["anr"]:
+        out["anr_log"] = g.sh("logcat -d -b system -b main | grep -A3 'ANR in ' | tail -24 | cut -c1-170", 120)[1]
+        log("    not responding: " + " | ".join(out["anr"])[:1500])
+        log("    ANR log: " + " | ".join(line.strip() for line in out["anr_log"].split("\n") if line.strip())[:2500])
+    out["anr_files"] = g.sh("ls /data/anr 2>/dev/null | wc -l", 30)[1].strip()
+    out["gfx_systemui"] = g.sh("dumpsys gfxinfo com.android.systemui | grep -e 'Total frames' -e 'Janky frames' | cut -c1-80", 120)[1]
+    log("    SystemUI's frames: " + " | ".join(line.strip() for line in out["gfx_systemui"].split("\n") if line.strip()))
     d = cpu_delta(a, b)
     out["cpu"] = d
     out["screen"] = vm.screenshot(f"{app['name']}-{index}", show=opts.show_screens)
@@ -423,7 +447,10 @@ def launch(g, app, opts, index):
     if d:
         for t in d["threads"][:14]:
             log(f"    thread {t['proc']}/{t['comm']} (nice {t['nice']}, policy {t['policy']}): {t['ticks']}")
-    log("    sf timestats: " + " | ".join(line.strip() for line in out["sf_timestats"].split("\n") if line.strip())[:3000])
+    if out.get("sf_timestats_to_drawn"):
+        log("    sf timestats until drawn: " + " | ".join(line.strip() for line in out["sf_timestats_to_drawn"].split("\n")
+                                                         if line.strip())[:2000])
+    log(f"    sf timestats{' after drawn' if d_snap else ''}: " + " | ".join(line.strip() for line in out["sf_timestats"].split("\n") if line.strip())[:3000])
     gfx = g.sh(f"dumpsys gfxinfo {package} | grep -e 'Total frames' -e 'Janky' -e 'Pipeline' -e '90th' | cut -c1-120", 120)[1]
     out["gfxinfo"] = gfx
     g.sh("input keyevent 3", 60)
@@ -486,6 +513,57 @@ def set_time_scale(vm, scale):
     except (OSError, subprocess.SubprocessError) as e:
         log(f"time scale via gdb failed: {e}")
         return f"error: {e}"
+
+
+CAL_LOOP = ("t0=$(cut -d' ' -f1 /proc/uptime); i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; "
+            "t1=$(cut -d' ' -f1 /proc/uptime); echo CAL:$t0:$t1:END")
+
+
+def calibrate(vm):
+    """Guest seconds for the browser probe's calibration (20000 rounds of a
+    shell loop, tests/boot/boot-test.mjs): in the browser 10-21 s of wall
+    time at timescale 8, so 1.2-2.6 guest seconds."""
+    status, text = vm.sh(CAL_LOOP, 600)
+    m = re.search(r"CAL:([\d.]+):([\d.]+):END", text or "")
+    return round(float(m.group(2)) - float(m.group(1)), 3) if m else None
+
+
+def limit_cpu(vm, fraction):
+    """Limit QEMU, all its threads, to `fraction` of one CPU (cgroup v2
+    cpu.max); 0 lifts the limit.  Returns cpu.max as set.  The period is as
+    short as the kernel's 1 ms least quota allows, so that the guest's
+    pauses stay short, as in the browser, where it never stops but runs
+    slowly."""
+    import math
+    import subprocess
+    path = "/sys/fs/cgroup/porty-qemu"
+    if fraction:
+        period = max(10000, math.ceil(1000 / fraction))
+        quota = max(1000, int(period * fraction))
+        cmd = (f"grep -qw cpu /sys/fs/cgroup/cgroup.subtree_control || echo +cpu > /sys/fs/cgroup/cgroup.subtree_control; "
+               f"mkdir -p {path} && echo '{quota} {period}' > {path}/cpu.max && echo {vm.proc.pid} > {path}/cgroup.procs && cat {path}/cpu.max")
+    else:
+        cmd = f"echo max > {path}/cpu.max; cat {path}/cpu.max"
+    try:
+        r = subprocess.run(["sudo", "-n", "sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+        return (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"error: {e}"
+
+
+def browser_like(vm, target, result):
+    """Slow QEMU down until the guest runs the browser's calibration loop in
+    `target` guest seconds, as the page's guest does (about 2 at timescale 8):
+    Android's timeouts then fire as they do in the browser."""
+    before = calibrate(vm)
+    info = {"target_guest_s": target, "unlimited_guest_s": before}
+    if before and before < target:
+        fraction = before / target
+        info["fraction"] = round(fraction, 4)
+        info["cpu_max"] = limit_cpu(vm, fraction)
+        info["limited_guest_s"] = calibrate(vm)
+    result["browser_like"] = info
+    log(f"browser-like speed: {info}")
 
 
 def dismiss_anr(vm):
@@ -562,8 +640,11 @@ def main():
               "milestones": {}, "launches": [], "guest": {}}
     vm = snap.Machine(opts.qemu, argv, opts.work)
     log("QEMU started: " + " ".join(vm.args))
-    if opts.timescale > 1:
-        result["timescale"] = set_time_scale(vm, opts.timescale)
+    timescale = int(variant.get("timescale", opts.timescale))
+    if timescale > 1:
+        result["timescale"] = set_time_scale(vm, timescale)
+    if "launch_timeout" in variant:
+        opts.launch_timeout = float(variant["launch_timeout"])
     g = Guest(vm, pcpu)
 
     def run(key, command, timeout=240):
@@ -595,6 +676,8 @@ def main():
             if opts.facts:
                 for key, command in FACTS:
                     run(key, command)
+            if variant.get("browser_like"):
+                browser_like(vm, float(variant["browser_like"]), result)
             result["home_screen"] = vm.screenshot("home", show=True)
             result["focus_home"] = g.focus()
             apps = []
