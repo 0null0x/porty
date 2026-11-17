@@ -94,6 +94,9 @@ const scanBlocksAtEnd = process.env.SCAN !== '0';
 const probeAfterLoops = process.env.PROBE !== '0';
 const loopRounds = Math.max(1, Math.min(12, Number(process.env.LOOP_ROUNDS) || 3));
 const variantName = (process.env.VARIANT || '').replace(/[^A-Za-z0-9_=&.,:%+ -]/g, '').slice(0, 60);
+// Patch 0017: the main loop's longest wait in ms, set once QEMU runs (0: spin as before).
+const mlWait = /^\d{1,4}$/.test(process.env.MLWAIT || '') ? Number(process.env.MLWAIT) : null;
+let mlWaitSet = null;
 const queryText = (process.env.QUERY || '').trim().replace(/^\?/, '');
 const params = new URLSearchParams(queryText);
 params.set('serial', '1');
@@ -1341,12 +1344,17 @@ async function pageState() {
         let heap = null;
         let disk = null;
         let tci = null;
+        let mainLoop = null;
         try {
             heap = e && e.module && e.heapStats ? e.heapStats() : null;
             disk = e && e.module && e.diskStats ? e.diskStats() : null;
             // Patch 0015: the interpreter's helper calls, direct and through libffi.
             if (e && e.module && typeof e.module._porty_tci_stats === 'function') {
                 tci = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_tci_stats() >>> 0, 2));
+            }
+            // Patch 0017: the main loop's polls, waits and wakes.
+            if (e && e.module && typeof e.module._porty_main_loop_stats === 'function') {
+                mainLoop = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_main_loop_stats() >>> 0, 3));
             }
         } catch (err) {
             heap = null;
@@ -1366,6 +1374,7 @@ async function pageState() {
             heap,
             disk,
             tci,
+            mainLoop,
             resumed: e ? !!e.resumed : false,
             resuming: e ? !!e.resuming : false,
             resumeNote: e ? e.resumeNote || '' : '',
@@ -1411,10 +1420,12 @@ async function sample(label, every = 10000) {
         ...(counters && counters.rate ? { rates: counters.rate } : {}),
         ...(cpu ? { cpu } : {}),
         ...(s.tci ? { tci: s.tci } : {}),
+        ...(s.mainLoop ? { mainLoop: s.mainLoop } : {}),
     };
     result.jit.push(row);
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
-        `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''} | ${describeMemory(m)}` +
+        `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
+        `${s.mainLoop ? ` mainloop=${s.mainLoop.join('/')}` : ''} | ${describeMemory(m)}` +
         (counters ? ` | per s ${JSON.stringify(counters.rate || {})} total ${JSON.stringify(counters.total)}` : '') +
         (cpu ? ` | threads ${cpu}` : ''));
     return s;
@@ -1451,6 +1462,19 @@ async function boot() {
             continue;
         }
         await drainSerial();
+        if (mlWait !== null && !mlWaitSet) {
+            mlWaitSet = await page.evaluate((ms) => {
+                const e = globalThis.__porty;
+                if (!e || !e.module || typeof e.module._porty_set_main_loop_wait !== 'function') {
+                    return null;
+                }
+                return `${e.module._porty_set_main_loop_wait(ms)}`;
+            }, mlWait).catch(() => null);
+            if (mlWaitSet) {
+                log(`main loop wait set to ${mlWaitSet} ms (MLWAIT)`);
+                b.mlWait = Number(mlWaitSet);
+            }
+        }
         if (!printed && s.cfg && s.wasmMb) {
             printed = true;
             b.config = `${s.cfg} wasm=${s.wasmMb}`;

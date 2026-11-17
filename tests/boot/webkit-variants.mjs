@@ -21,6 +21,8 @@
 //                     qemu=local          QEMU-Wasm from LOCAL_QEMU_DIR (this
 //                                         branch's build), the rest from the site
 //                     browser=chrome      Chrome instead of WebKit
+//                     mlwait=<ms>         patch 0017: the main loop's longest
+//                                         wait (0: spin as before)
 //                     local=1             the page's own files from this
 //                                         checkout's web/ (LOCAL_WEB), the
 //                                         rest from the site (site-proxy.mjs)
@@ -63,7 +65,7 @@ export function parseVariant(text, base = '') {
     const words = text.trim().split(/\s+/).filter(Boolean);
     const v = {
         name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, proxy: false, local: false,
-        qemu: '', browser: 'webkit', words: [],
+        qemu: '', browser: 'webkit', mlwait: '', words: [],
     };
     for (const w of words) {
         if (!WORD.test(w)) {
@@ -93,6 +95,8 @@ export function parseVariant(text, base = '') {
             v.qemu = value === 'local' ? 'local' : '';
         } else if (key === 'browser') {
             v.browser = value === 'chrome' ? 'chrome' : 'webkit';
+        } else if (key === 'mlwait') {
+            v.mlwait = /^\d{1,4}$/.test(value) ? value : '';
         } else if (key === 'loops') {
             v.loops = Math.max(1, Math.min(12, Number(value) || 3));
         }
@@ -203,6 +207,7 @@ function runOne(v, index) {
             PROXY: v.proxy ? '1' : (v.glue.length || v.local || v.qemu ? '1' : '0'),
             LOCAL_WEB: v.local ? localWeb : '',
             LOCAL_QEMU: v.qemu === 'local' ? localQemu : '',
+            MLWAIT: v.mlwait,
             BENCH: '0',
             SCAN: '0',
             MINUTES: String(minutes),
