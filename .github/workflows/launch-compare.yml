@@ -61,7 +61,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: launch-compare-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.queries }}-${{ inputs.shells }}
+  group: launch-compare-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.baseline_ref }}-${{ inputs.queries }}-${{ inputs.shells }}-${{ inputs.env }}
   cancel-in-progress: true
 
 defaults:
