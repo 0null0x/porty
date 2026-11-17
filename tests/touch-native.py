@@ -362,7 +362,7 @@ def main():
             node = ""
         # A count, so that getevent ends by itself and writes out what it has
         # (killed, it would lose its buffered output).
-        run("getevent_start", f"getevent -lt -c 60 {node} > /data/local/tmp/porty-raw.txt 2>&1 & echo started", 60)
+        run("getevent_start", f"getevent -lt -c 30 {node} > /data/local/tmp/porty-raw.txt 2>&1 & echo started", 60)
         prov.wait(vm, 2)
         g.sh("am start -n com.android.settings/.Settings > /dev/null 2>&1", 120)
         prov.wait(vm, 10)
@@ -370,7 +370,7 @@ def main():
 
         def hold():
             return run("held", "dumpsys input | sed -n '/Input Reader State/,/Input Dispatcher State/p' | "
-                               "grep -A14 -E 'Last (Raw|Cooked) Touch' | cut -c1-170", 240)
+                               "grep -A14 -E 'Last (Raw|Cooked) Touch' | cut -c1-240", 240)
         # Two fingers in the lower half of Settings (nothing there takes a long press).
         held = touch.two((0.3, 0.6), (0.7, 0.75), (0.35, 0.62), (0.65, 0.72), steps=4, pause=0.15, hold=hold)
         prov.wait(vm, 3)
@@ -390,6 +390,8 @@ def main():
         g.sh("am force-stop com.android.settings; am start -n com.android.settings/.Settings > /dev/null 2>&1", 120)
         prov.wait(vm, 8)
         top = shot_pair(vm, g, "settings-top")
+        # A picture with something in it for the pinch below: this screen.
+        run("picture_taken", "mkdir -p /sdcard/Pictures; screencap -p /sdcard/Pictures/porty.png; ls -l /sdcard/Pictures/porty.png")
         touch.swipe(0.5, 0.8, 0.5, 0.35, steps=12, pause=0.25)  # a slow drag: the list follows the finger
         dragged = shot_pair(vm, g, "settings-dragged")
         drag_pct = gcpu.ppm_diff(dragged, top)
@@ -406,9 +408,10 @@ def main():
         check("swipe_scrolls", moved is not None and moved >= 100 and back_pct < 1.0, json.dumps(result["scroll"]))
 
         # --- a long list: resting before the lift, with and without reports ---
-        g.sh("settings put global development_settings_enabled 1; am force-stop com.android.settings; "
-             "am start -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS > /dev/null 2>&1", 120)
+        run("dev_options", "settings put global development_settings_enabled 1; am force-stop com.android.settings; "
+                           "am start -W -n com.android.settings/.Settings\\$DevelopmentSettingsDashboardActivity 2>&1 | tail -4")
         prov.wait(vm, 10)
+        fl_focus = g.focus()
         fl = {}
         s0 = shot_pair(vm, g, "dev-top")
         touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=True)
@@ -424,6 +427,7 @@ def main():
         s4 = shot_pair(vm, g, "dev-swipe")
         fl["swipe"] = vshift(s3, s4)
         fl["finger_px"] = round(0.3 * 800)
+        fl["focus"] = fl_focus
         result["fling"] = fl
         log("fling: " + json.dumps(fl))
         kept = fl["drag_rest_kept"][0]
@@ -462,9 +466,7 @@ def main():
 
         # --- two fingers spread on a picture: it zooms ------------------------
         if opts.inject != "pointer":
-            g.sh("am force-stop com.android.settings; am start -n com.android.settings/.Settings > /dev/null 2>&1", 120)
-            prov.wait(vm, 8)
-            pic = run("picture", "mkdir -p /sdcard/Pictures; screencap -p /sdcard/Pictures/porty.png; "
+            pic = run("picture", ""
                                  "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Pictures/porty.png "
                                  "> /dev/null 2>&1; sleep 3; content query --uri content://media/external/images/media "
                                  "--projection _id:_data 2>&1 | tail -3")
