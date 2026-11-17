@@ -108,3 +108,23 @@ jobs:
           strings -t x out/facts/libsurfaceflinger.so | grep -e 'sync point' -e 'barrier' -e 'Unable to promote' | head -20 || true
           echo "::endgroup::"
           readelf -lW out/facts/libsurfaceflinger.so | grep -e LOAD -e 'Entry' | head -6
+          # The library is stripped: find the code by the strings it logs.
+          # File offset -> address through the first LOAD segment; then the
+          # instructions that load each string's address, with the code
+          # around them.
+          so=out/facts/libsurfaceflinger.so
+          delta=$(( $(readelf -lW "$so" | awk '$1 == "LOAD" { print $3; exit }') - $(readelf -lW "$so" | awk '$1 == "LOAD" { print $2; exit }') ))
+          objdump -d "$so" > "$RUNNER_TEMP/text.s"
+          wc -l "$RUNNER_TEMP/text.s"
+          for text in 'Unable to promote barrier Layer' 'No local sync point found' 'Unexpected sync point frame number'; do
+            off=$(strings -t x "$so" | grep -F "$text" | head -1 | awk '{ print $1 }')
+            [[ -n "$off" ]] || continue
+            addr=$(printf '%x' $(( 16#$off + delta )))
+            echo "::group::code that loads \"$text\" (file offset 0x$off, address 0x$addr)"
+            grep -n "# $addr" "$RUNNER_TEMP/text.s" | head -4
+            line=$(grep -n "# $addr" "$RUNNER_TEMP/text.s" | head -1 | cut -d: -f1)
+            if [[ -n "$line" ]]; then
+              sed -n "$(( line > 160 ? line - 160 : 1 )),$(( line + 90 ))p" "$RUNNER_TEMP/text.s"
+            fi
+            echo "::endgroup::"
+          done
