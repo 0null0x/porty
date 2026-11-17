@@ -37,6 +37,8 @@
 //   PROBE_SWIPE    0: no swipe on Settings after the launch (default 1: the
 //                  input probe opens Settings, swipes up with a finger and
 //                  reports how far the list moved, from the canvas rows)
+//   PROBE_PINCH    1: then also a picture of that screen in Gallery and two
+//                  fingers spreading on it; how much of the screen changed
 //   PROBE_GUEST_EVERY  seconds between the guest's samples during the
 //                  launch (default 30).  0: none, to see how much the
 //                  sampling itself slows the launch; the page's counters
@@ -91,6 +93,7 @@ const netLatencyMs = num('NET_LATENCY_MS', 0, 0, 5000);
 const probeWaitMs = num('PROBE_WAIT', 240, 30, 7200) * 1000;
 const launchOnly = (process.env.PROBE_STEPS || '') === 'launch';
 const probeSwipe = process.env.PROBE_SWIPE !== '0';
+const probePinch = process.env.PROBE_PINCH === '1';
 const resumeSettleMs = num('RESUME_SETTLE', 120, 0, 3600) * 1000;
 const guestEveryMs = num('PROBE_GUEST_EVERY', 30, 0, 600) * 1000;
 const stressMs = num('STRESS_MINUTES', 0, 0, 600) * 60000;
@@ -1063,6 +1066,59 @@ async function inputProbe() {
         return -1;
     };
     const touchResult = { swipe: null };
+    // How much of the canvas differs between two looks (48x80 samples).
+    const canvasSample = () => page.evaluate(() => {
+        const c = document.getElementById('screen');
+        const t = document.createElement('canvas');
+        t.width = 48;
+        t.height = 80;
+        t.getContext('2d').drawImage(c, 0, 0, 48, 80);
+        return Array.from(t.getContext('2d').getImageData(0, 0, 48, 80).data);
+    });
+    const changedPct = (a, b) => {
+        let n = 0;
+        for (let i = 0; i < a.length; i += 4) {
+            n += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]) > 48 ? 1 : 0;
+        }
+        return Math.round((1000 * n) / (a.length / 4)) / 10;
+    };
+    // Two fingers spread on a picture of the screen in Gallery: it zooms.
+    const pinch = async () => {
+        log('INPUT PROBE: a picture of this screen in Gallery, then two fingers spreading on it');
+        await send('mkdir -p /sdcard/Pictures; screencap -p /sdcard/Pictures/porty.png; ' +
+            'am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Pictures/porty.png > /dev/null 2>&1; ' +
+            'am start -a android.intent.action.VIEW -t image/png -d file:///sdcard/Pictures/porty.png ' +
+            '-n com.android.gallery3d/.app.GalleryActivity > /dev/null 2>&1\r');
+        if (!await focusWait('the picture in Gallery', /gallery/i, probeWaitMs)) {
+            touchResult.pinch = { shown: false };
+            return;
+        }
+        const settled = await still(120000);
+        await shot('picture', true);
+        const before = await canvasSample();
+        const [cx, cy] = at(240, 400 * (r.ch || 800) / 800);
+        const [dx] = at(40, 0);
+        const [wide] = at(200, 0);
+        const near = dx - r.x;
+        const far = wide - r.x;
+        const a = await page.touchscreen.touchStart(cx - near, cy - near);
+        const b = await page.touchscreen.touchStart(cx + near, cy + near);
+        for (let i = 1; i <= 8; i++) {
+            await sleep(150);
+            const d = near + ((far - near) * i) / 8;
+            await a.move(cx - d, cy - d);
+            await b.move(cx + d, cy + d);
+        }
+        await sleep(1500);
+        await b.end();
+        await a.end();
+        const quiet = await still(120000);
+        const changed = changedPct(before, await canvasSample());
+        touchResult.pinch = { shown: true, settledS: settled, changedPct: changed, quietS: quiet };
+        log(`INPUT PROBE: two fingers spread on the picture: ${changed}% of the screen changed; still after ${quiet} s`);
+        await shot('picture-pinched', true);
+        await page.click('#nav-back').catch(() => {});
+    };
     if (probeSwipe) {
         log('INPUT PROBE: Settings, then a finger swipe up');
         await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
@@ -1106,6 +1162,9 @@ async function inputProbe() {
                 ? 'farther than 640 px or not at all' : `${wheeled.shift} px`} (row match ${wheeled.err}); ` +
                 `screen still after ${wquiet} s`);
             await shot('after-wheel', true);
+            if (probePinch) {
+                await pinch();
+            }
         }
         await page.click('#nav-home').catch(() => {});
         await focusWait('launcher in front', /launcher/i, probeWaitMs / 2);
