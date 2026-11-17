@@ -186,6 +186,21 @@
       "after_settle": [
         "for d in /sys/bus/virtio/drivers/virtio_input/virtio*; do n=$(cat $d/input/input*/name 2>/dev/null); case \"$n\" in *MultiTouch*) echo unbind ${d##*/} $n; echo ${d##*/} > /sys/bus/virtio/drivers/virtio_input/unbind;; esac; done; sleep 20; grep -c MultiTouch /proc/bus/input/devices; dumpsys input | grep -c 'QEMU Virtio MultiTouch'"
       ]
+    },
+    "gal-t1": {
+      "query": "touch=1"
+    },
+    "gal-t0": {
+      "query": "touch=0"
+    },
+    "gal-t1-notouchcfg": {
+      "query": "touch=1",
+      "setup": [
+        "mount -o remount,rw /; ls -ld /odm /oem 2>&1; mkdir -p /odm/etc/permissions; echo \"<permissions><unavailable-feature name=\\\"android.hardware.touchscreen\\\" /></permissions>\" > /odm/etc/permissions/porty-notouch.xml; cat /odm/etc/permissions/porty-notouch.xml; mount -o remount,ro /; pm list features | grep -c 'feature:android.hardware.touchscreen$'; setprop ctl.restart zygote; echo zygote restarting"
+      ],
+      "after_settle": [
+        "pm list features | grep touchscreen; am get-config | grep -o -e '-finger-' -e '-notouch-' -e '-stylus-' | head -1"
+      ]
     }
   }
 }
