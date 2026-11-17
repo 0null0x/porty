@@ -15,7 +15,11 @@ then:
     kernel's multitouch slots?), and "dumpsys input" while both are down
     (InputReader's last raw and cooked touch: how many pointers, where);
   - a finger tap on the Gallery icon of the home screen: Gallery opens;
-  - finger swipes on Settings: it scrolls (screenshots before and after);
+  - finger swipes on Settings: it scrolls (how far, from the screenshots
+    before and after: the vertical shift that lines them up);
+  - on a long list (Developer options): a slow drag that rests before the
+    finger lifts, with and without the page's resting reports (web/js/
+    input.js, KEEP_MS), and a quick swipe: how far the list went;
   - no mouse pointer: SurfaceFlinger has no pointer sprite layer;
   - a two-finger spread on a picture in Gallery: it zooms.
 
@@ -87,6 +91,7 @@ class Touch:
         self.fifo = fifo
         self.slots = [None] * SLOTS  # QMP mode: (tracking id, x, y) per active slot
         self.sent = 0
+        self.last = None
 
     def _ring(self, *event):
         self.fifo.write(":".join(str(int(v)) for v in event) + "\n")
@@ -148,6 +153,31 @@ class Touch:
     def at(fx, fy):
         return max(0, min(ABS_MAX, round(fx * ABS_MAX))), max(0, min(ABS_MAX, round(fy * ABS_MAX)))
 
+    def rest(self, slot, seconds, keep=True, every=0.1):
+        """A finger rests; keep=True reports it now and then, to and fro by one
+        unit, as the page does (web/js/input.js, keepReporting())."""
+        end = time.monotonic() + seconds
+        jitter = 0
+        while time.monotonic() < end:
+            time.sleep(every)
+            if keep and self.inject in ("fifo", "qmp") and self.last is not None:
+                jitter ^= 1
+                x, y = self.last
+                self.move(slot, x + jitter if x < ABS_MAX else x - jitter, y)
+
+    def drag(self, fx0, fy0, fx1, fy1, steps=10, pause=0.25, rest=0.0, keep=True):
+        """Down, moves, then optionally a rest before the lift."""
+        x, y = self.at(fx0, fy0)
+        self.down(0, x, y)
+        for i in range(1, steps + 1):
+            time.sleep(pause)
+            x, y = self.at(fx0 + (fx1 - fx0) * i / steps, fy0 + (fy1 - fy0) * i / steps)
+            self.move(0, x, y)
+        self.last = (x, y)
+        if rest:
+            self.rest(0, rest, keep)
+        self.up(0, x, y)
+
     def tap(self, fx, fy, hold=0.08):
         x, y = self.at(fx, fy)
         self.down(0, x, y)
@@ -183,6 +213,43 @@ class Touch:
         time.sleep(pause)
         self.up(0, ax, ay)
         return held
+
+
+def ppm_rows(data):
+    """Per-row signatures of a P6 PPM: the green channel summed over the middle columns."""
+    head = data.split(b"\n", 3)
+    width, height = map(int, head[1].split())
+    pixels = head[3]
+    rows = []
+    for y in range(height):
+        row = pixels[y * width * 3:(y + 1) * width * 3]
+        rows.append(sum(row[x * 3 + 1] for x in range(24, width - 24, 3)))
+    return rows
+
+
+def vshift(a, b, top=90, bottom=740, limit=640):
+    """How far the content moved up from screenshot a to b, in pixels, from
+    the shift that lines up their rows best: (shift, error, error unshifted),
+    or (None, ...) when no shift of up to `limit` lines them up (moved farther)."""
+    if not a or not b:
+        return None, -1, -1
+    ra, rb = ppm_rows(a), ppm_rows(b)
+
+    def err(s):
+        lo, hi = max(top, top - s), min(bottom, bottom - s)
+        if hi - lo < 100:
+            return None
+        return sum(abs(rb[y] - ra[y + s]) for y in range(lo, hi)) / (hi - lo)
+    e0 = err(0)
+    best, best_err = None, None
+    for s in range(-limit, limit + 1):
+        e = err(s)
+        if e is not None and (best_err is None or e < best_err):
+            best, best_err = s, e
+    # A match must be close: much better than no shift, and small.
+    if best_err is None or (best != 0 and best_err > 0.25 * max(e0, 1)) or best_err > 400:
+        return None, round(best_err or -1, 1), round(e0 or -1, 1)
+    return best, round(best_err, 1), round(e0, 1)
 
 
 def shot_pair(vm, g, name):
@@ -265,13 +332,15 @@ def main():
 
         # --- what Android made of the devices --------------------------------
         din = guest.get("dumpsys_input", "")
-        touch_dev = re.search(r"Device \d+: (QEMU Virtio MultiTouch|[^\n]*[Tt]ouch[^\n]*)\n(.*?)(?=\n  Device \d+:|\Z)", din, re.S)
-        cursor = re.findall(r"Device \d+: ([^\n]+)\n[^D]*?Classes: (0x[0-9a-f]+)", din)
-        result["devices"] = cursor
+        # Event Hub State: "    3: QEMU Virtio MultiTouch\n      Classes: 0x00000014"
+        devices = re.findall(r"\n\s+-?\d+: ([^\n]+)\n\s+Classes: (0x[0-9a-f]+)", din)
+        result["devices"] = devices
         if opts.inject != "pointer":
-            block = touch_dev.group(2) if touch_dev else ""
-            check("touchscreen_classes", touch_dev and re.search(r"Classes: 0x0*1[45]\b", block),
-                  (touch_dev.group(1) + ": " + " ".join(re.findall(r"Classes: \S+", block))) if touch_dev else "no touch device in dumpsys input")
+            touch_dev = [(n, c) for n, c in devices if "MultiTouch" in n]
+            # 0x04 touch, 0x10 multitouch; not 0x08 cursor, not 0x80000000 external
+            check("touchscreen_classes", touch_dev and int(touch_dev[0][1], 16) & 0x14 == 0x14
+                  and not int(touch_dev[0][1], 16) & 0x80000008,
+                  "; ".join(f"{n}: {c}" for n, c in devices))
             check("touchscreen_abs_mt", "ABS_MT_POSITION_X" in guest.get("getevent_p", "") and "ABS_MT_POSITION_Y" in guest.get("getevent_p", ""),
                   "getevent -lp lists ABS_MT_POSITION_X/Y" if "ABS_MT_POSITION_X" in guest.get("getevent_p", "") else "no ABS_MT_POSITION_X")
         reader = run("input_reader", "dumpsys input | sed -n '/Input Reader State/,/Input Dispatcher State/p' | "
@@ -281,15 +350,19 @@ def main():
         if opts.inject != "pointer":
             check("touchscreen_direct", re.search(r"Mode: direct|DeviceType: touchScreen", reader),
                   " | ".join(line.strip() for line in reader.split("\n") if re.search(r"Mode:|DeviceType|Viewport|SurfaceWidth|SurfaceHeight", line))[:400])
-            check("no_cursor_mapper", "CursorInputMapper" not in reader and "Mode: pointer" not in reader,
-                  "no device in pointer mode" if "Mode: pointer" not in reader else "a device is in pointer mode")
+            # The PC's PS/2 mouse is always there (Android: a cursor device),
+            # but nothing moves it; there must be no USB tablet.
+            check("no_tablet", not any("Tablet" in n for n, _ in devices),
+                  "cursor devices: " + (", ".join(n for n, c in devices if int(c, 16) & 0x08) or "none"))
 
         # --- raw events: do slots reach user space? --------------------------
         node = run("touch_node", "for d in /sys/class/input/event*; do n=$(cat $d/device/name); "
                                  "case \"$n\" in *[Tt]ouch*|*[Tt]ablet*) echo /dev/input/${d##*/} $n;; esac; done").split("\n")[0].split(" ")[0]
         if not node.startswith("/dev/input/"):
             node = ""
-        run("getevent_start", f"getevent -lt {node} > /data/local/tmp/porty-raw.txt 2>&1 & echo started", 60)
+        # A count, so that getevent ends by itself and writes out what it has
+        # (killed, it would lose its buffered output).
+        run("getevent_start", f"getevent -lt -c 60 {node} > /data/local/tmp/porty-raw.txt 2>&1 & echo started", 60)
         prov.wait(vm, 2)
         g.sh("am start -n com.android.settings/.Settings > /dev/null 2>&1", 120)
         prov.wait(vm, 10)
@@ -308,7 +381,7 @@ def main():
         result["raw"] = {"slot_values": slots_seen, "tracking_ids": tids,
                          "syn_mt_report": raw.count("SYN_MT_REPORT"), "btn_touch": raw.count("BTN_TOUCH")}
         if opts.inject != "pointer":
-            check("raw_mt_events", "ABS_MT_POSITION_X" in raw and "ABS_MT_TRACKING_ID" in raw,
+            check("raw_mt_events", "ABS_MT_POSITION_X" in raw and len(slots_seen) >= 2 and len(tids) >= 2,
                   json.dumps(result["raw"]))
             counts = [int(n) for n in re.findall(r"pointerCount=(\d+)", held or "")]
             check("two_pointers", counts and max(counts) >= 2, f"pointerCount values while both fingers were down: {counts}")
@@ -326,8 +399,35 @@ def main():
         touch.swipe(0.5, 0.8, 0.5, 0.4, steps=6, pause=0.03)    # a quick swipe: a fling
         flung = shot_pair(vm, g, "settings-flung")
         fling_pct = gcpu.ppm_diff(flung, top)
-        result["scroll"] = {"drag_pct": drag_pct, "back_to_top_pct": back_pct, "fling_pct": fling_pct}
-        check("swipe_scrolls", drag_pct >= 15 and back_pct < drag_pct, json.dumps(result["scroll"]))
+        result["scroll"] = {"drag_pct": drag_pct, "back_to_top_pct": back_pct, "fling_pct": fling_pct,
+                            "drag_shift": vshift(top, dragged), "back_shift": vshift(top, back),
+                            "fling_shift": vshift(top, flung)}
+        moved = result["scroll"]["drag_shift"][0]
+        check("swipe_scrolls", moved is not None and moved >= 100 and back_pct < 1.0, json.dumps(result["scroll"]))
+
+        # --- a long list: resting before the lift, with and without reports ---
+        g.sh("settings put global development_settings_enabled 1; am force-stop com.android.settings; "
+             "am start -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS > /dev/null 2>&1", 120)
+        prov.wait(vm, 10)
+        fl = {}
+        s0 = shot_pair(vm, g, "dev-top")
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=True)
+        s1 = shot_pair(vm, g, "dev-rest-kept")
+        fl["drag_rest_kept"] = vshift(s0, s1)
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=1.5, keep=False)
+        s2 = shot_pair(vm, g, "dev-rest-silent")
+        fl["drag_rest_silent"] = vshift(s1, s2)
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=10, pause=0.25, rest=0, keep=False)
+        s3 = shot_pair(vm, g, "dev-drag-lift")
+        fl["drag_lift"] = vshift(s2, s3)
+        touch.drag(0.5, 0.75, 0.5, 0.45, steps=4, pause=0.03, rest=0, keep=False)
+        s4 = shot_pair(vm, g, "dev-swipe")
+        fl["swipe"] = vshift(s3, s4)
+        fl["finger_px"] = round(0.3 * 800)
+        result["fling"] = fl
+        log("fling: " + json.dumps(fl))
+        kept = fl["drag_rest_kept"][0]
+        check("rest_then_lift_no_fling", kept is not None and 120 <= kept <= 300, json.dumps(fl))
         g.sh("input keyevent 3", 60)
         prov.wait(vm, 3)
         g.quiet(timeout=90)
@@ -362,6 +462,8 @@ def main():
 
         # --- two fingers spread on a picture: it zooms ------------------------
         if opts.inject != "pointer":
+            g.sh("am force-stop com.android.settings; am start -n com.android.settings/.Settings > /dev/null 2>&1", 120)
+            prov.wait(vm, 8)
             pic = run("picture", "mkdir -p /sdcard/Pictures; screencap -p /sdcard/Pictures/porty.png; "
                                  "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Pictures/porty.png "
                                  "> /dev/null 2>&1; sleep 3; content query --uri content://media/external/images/media "
@@ -375,7 +477,7 @@ def main():
             touch.two((0.45, 0.45), (0.55, 0.55), (0.2, 0.25), (0.8, 0.8), steps=10, pause=0.12)
             zoomed = shot_pair(vm, g, "photo-zoomed")
             result["pinch"] = {"uri": uri, "focus": g.focus(), "changed_pct": gcpu.ppm_diff(zoomed, photo)}
-            check("pinch_zooms", result["pinch"]["changed_pct"] >= 20, json.dumps(result["pinch"]))
+            check("pinch_zooms", result["pinch"]["changed_pct"] >= 30, json.dumps(result["pinch"]))
             g.sh("input keyevent 3", 60)
 
         run("crashes", "logcat -b crash -d | grep -e 'Process: ' -e '>>> ' | cut -c1-200 | head -20")

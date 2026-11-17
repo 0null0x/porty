@@ -1,0 +1,224 @@
+From e5dacdbbfef747cf9bad702e4ff9c8db14669b26 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 06:11:20 +0000
+Subject: [PATCH] ui/wasmfb: touch input for a virtio multitouch device (ring
+ ABI 2)
+
+Android-x86 drives the USB tablet as a mouse: an arrow follows the finger
+and a tap is a click, and a swipe does not scroll as a finger's would.
+With "-device virtio-multitouch-pci" instead, Android sees a touchscreen
+(INPUT_PROP_DIRECT, ABS_MT axes and slots; the guest kernel's
+virtio_input sets up multitouch slots).
+
+The ring gets three event types, version 2 of its ABI
+(porty_abi_version()): a finger down, moved and lifted, each with its
+slot (0..9) and position (0..0x7fff).  The main loop turns each into one
+input frame with console_handle_touch_event(), which QEMU's GTK and
+D-Bus displays use: every finger that is down is reported in every
+frame, a lifted one gets tracking id -1.  A finger's move that the next
+event in the ring moves again is dropped, so that one drain does not
+hand the guest two positions of one finger at the same time (Android's
+velocity tracker would see a jump in no time).
+
+Native builds also read PORTY_INPUT_FIFO, a FIFO of "type:a:b:c" lines,
+each one event into the ring while the guest runs, so that native tests
+can touch the guest the way the page does.
+---
+ ui/wasmfb.c | 109 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/ui/wasmfb.c b/ui/wasmfb.c
+index 6857a7b..e01f1a1 100644
+--- a/ui/wasmfb.c
++++ b/ui/wasmfb.c
+@@ -24,6 +24,14 @@
+  *                            (at most once per second)
+  *   PORTY_INPUT_SCRIPT="ms:type:a:b:c;ms:type:a:b:c;..."
+  *                            inject input events at the given times
++ *   PORTY_INPUT_FIFO=<path>  a FIFO (or file) of "type:a:b:c" lines, read
++ *                            while the guest runs, each line one event
++ *                            into the ring as the page would send it
++ *
++ * Touch (ring ABI 2): with a virtio multitouch device ("-device
++ * virtio-multitouch-pci"), the page sends one finger per slot (0..9) and
++ * the main loop reports every finger that is down in each frame, the way
++ * QEMU's GTK and D-Bus displays do (console_handle_touch_event()).
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -32,6 +40,7 @@
+ #include "qemu/module.h"
+ #include "qemu/timer.h"
+ #include "qemu/error-report.h"
++#include "qapi/error.h"
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "ui/surface.h"
+@@ -87,6 +96,10 @@ enum {
+     PORTY_EV_BTN     = 2,  /* a = 0 left / 1 middle / 2 right, b = down */
+     PORTY_EV_KEY     = 3,  /* a = Linux evdev key code, b = down */
+     PORTY_EV_WHEEL   = 4,  /* a > 0 up, a < 0 down */
++    /* ABI 2: a finger on a touchscreen, a = slot (0..9), b = x, c = y */
++    PORTY_EV_TOUCH_DOWN = 5,
++    PORTY_EV_TOUCH_MOVE = 6,
++    PORTY_EV_TOUCH_UP   = 7, /* b, c: where it lifted (not used) */
+     PORTY_EV_CONTROL = 10, /* a = PORTY_CTL_* */
+ };
+ 
+@@ -117,6 +130,9 @@ static struct {
+     uint32_t tail; /* written by the consumer (QEMU main loop) */
+     uint32_t dropped;
+ 
++    /* fingers that are down (tracking_id -1: none), see porty_touch() */
++    struct touch_slot touch_slots[INPUT_EVENT_SLOTS_MAX];
++
+ #ifndef __EMSCRIPTEN__
+     const char *dump_prefix;
+     uint32_t dump_frame;
+@@ -124,6 +140,8 @@ static struct {
+     char *script;
+     char *script_pos;
+     int64_t script_t0;
++    int fifo_fd;
++    GString *fifo_line;
+ #endif
+ } porty = {
+     .live = { .magic = PORTY_FB_MAGIC },
+@@ -184,10 +202,14 @@ int porty_input_event(int type, int a, int b, int c)
+     return 1;
+ }
+ 
++/*
++ * 1: display, pointer, keys, wheel, control.
++ * 2: also touch events (PORTY_EV_TOUCH_*).
++ */
+ PORTY_EXPORT int porty_abi_version(void);
+ int porty_abi_version(void)
+ {
+-    return 1;
++    return 2;
+ }
+ 
+ /*
+@@ -246,6 +268,33 @@ static void porty_handle_control(int cmd)
+     }
+ }
+ 
++/*
++ * One finger down, moved or lifted.  Each call is one input frame in which
++ * every finger that is down is reported (slot, tracking id, BTN_TOUCH,
++ * position), as QEMU's GTK and D-Bus displays do; a lifted finger's slot
++ * gets tracking id -1.  Coordinates are 0..0x7fff, the device's range.
++ */
++static void porty_touch(int type, int slot, int x, int y)
++{
++    InputMultiTouchType mt = type == PORTY_EV_TOUCH_DOWN ? INPUT_MULTI_TOUCH_TYPE_BEGIN
++                             : type == PORTY_EV_TOUCH_MOVE ? INPUT_MULTI_TOUCH_TYPE_UPDATE
++                             : INPUT_MULTI_TOUCH_TYPE_END;
++
++    if (slot < 0 || slot >= INPUT_EVENT_SLOTS_MAX) {
++        return;
++    }
++    if (mt == INPUT_MULTI_TOUCH_TYPE_END) {
++        /* where the finger was last seen, not where it lifted */
++        x = porty.touch_slots[slot].x;
++        y = porty.touch_slots[slot].y;
++    }
++    console_handle_touch_event(porty.con, porty.touch_slots, slot,
++                               INPUT_EVENT_ABS_MAX, INPUT_EVENT_ABS_MAX,
++                               MIN(MAX(x, 0), INPUT_EVENT_ABS_MAX),
++                               MIN(MAX(y, 0), INPUT_EVENT_ABS_MAX),
++                               mt, &error_warn);
++}
++
+ static void porty_dispatch(const PortyInputEvent *ev)
+ {
+     static const InputButton btn_map[] = {
+@@ -284,6 +333,11 @@ static void porty_dispatch(const PortyInputEvent *ev)
+             qemu_input_event_sync();
+         }
+         break;
++    case PORTY_EV_TOUCH_DOWN:
++    case PORTY_EV_TOUCH_MOVE:
++    case PORTY_EV_TOUCH_UP:
++        porty_touch(ev->type, ev->a, ev->b, ev->c);
++        break;
+     case PORTY_EV_CONTROL:
+         porty_handle_control(ev->a);
+         break;
+@@ -301,11 +355,49 @@ static void porty_drain_input(void)
+         PortyInputEvent ev = porty.ring[tail & (PORTY_RING_SIZE - 1)];
+         tail++;
+         qatomic_store_release(&porty.tail, tail);
++        /*
++         * A finger's move that the next event moves again is dropped: the
++         * guest stamps events with the time they reach it, so two frames
++         * in one drain would look like a jump in no time to Android's
++         * velocity tracker (and fling).
++         */
++        if (ev.type == PORTY_EV_TOUCH_MOVE && tail != head) {
++            const PortyInputEvent *next = &porty.ring[tail & (PORTY_RING_SIZE - 1)];
++
++            if (next->type == PORTY_EV_TOUCH_MOVE && next->a == ev.a) {
++                continue;
++            }
++        }
+         porty_dispatch(&ev);
+     }
+ }
+ 
+ #ifndef __EMSCRIPTEN__
++/* PORTY_INPUT_FIFO: "type:a:b:c" lines, each one event into the ring. */
++static void porty_fifo_read(void *opaque)
++{
++    char buf[1024];
++    ssize_t n = read(porty.fifo_fd, buf, sizeof(buf));
++    char *nl;
++
++    if (n <= 0) {
++        return;
++    }
++    g_string_append_len(porty.fifo_line, buf, n);
++    while ((nl = memchr(porty.fifo_line->str, '\n', porty.fifo_line->len))) {
++        int type, a, b, c;
++
++        *nl = '\0';
++        if (sscanf(porty.fifo_line->str, "%d:%d:%d:%d", &type, &a, &b, &c) == 4) {
++            porty_input_event(type, a, b, c);
++        } else if (porty.fifo_line->str[0]) {
++            error_report("wasmfb: bad PORTY_INPUT_FIFO line '%s'",
++                         porty.fifo_line->str);
++        }
++        g_string_erase(porty.fifo_line, 0, nl - porty.fifo_line->str + 1);
++    }
++}
++
+ static void porty_run_script(void)
+ {
+     int64_t now;
+@@ -473,7 +565,22 @@ static void wasmfb_init(DisplayState *ds, DisplayOptions *opts)
+         porty.script_pos = porty.script;
+         porty.script_t0 = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+     }
++    porty.fifo_fd = -1;
++    if (getenv("PORTY_INPUT_FIFO")) {
++        /* read-write, so that the FIFO never reads as closed between writers */
++        porty.fifo_fd = open(getenv("PORTY_INPUT_FIFO"), O_RDWR | O_NONBLOCK);
++        if (porty.fifo_fd < 0) {
++            error_report("wasmfb: cannot open PORTY_INPUT_FIFO %s: %s",
++                         getenv("PORTY_INPUT_FIFO"), strerror(errno));
++        } else {
++            porty.fifo_line = g_string_new(NULL);
++            qemu_set_fd_handler(porty.fifo_fd, porty_fifo_read, NULL, NULL);
++        }
++    }
+ #endif
++    for (int i = 0; i < INPUT_EVENT_SLOTS_MAX; i++) {
++        porty.touch_slots[i].tracking_id = -1;
++    }
+ 
+     porty.live.x0 = UINT32_MAX;
+     porty.live.y0 = UINT32_MAX;
+-- 
+2.43.0
+

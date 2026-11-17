@@ -58,7 +58,7 @@ jobs:
         run: |
           python3 -I -c '
           import json, os, re, sys
-          default = "mt-qmp|mem=768&tb=128&cache=16&usb=0&qemu=-device%20virtio-multitouch-pci|qmp"
+          default = "touch|mem=768&tb=128&cache=16|fifo"
           text = os.environ.get("VARIANTS", "").strip() or default
           include = []
           for item in text.split(";"):

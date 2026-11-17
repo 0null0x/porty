@@ -159,6 +159,8 @@ const snapshot = () => ({
     // ttm.ko fixed or not is decided when the saved machine boots.
     assert.match(resumeVeto({ search: '?ttmfix=0' }), /sets ttmfix=/);
     assert.match(resumeVeto({ search: '?sffix=0' }), /sets sffix=/);
+    // The pointing device (touchscreen or USB tablet) is part of the machine.
+    assert.match(resumeVeto({ search: '?touch=0' }), /sets touch=/);
 
     // A desktop-sized snapshot is not for phones.
     const big = snapshot();

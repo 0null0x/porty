@@ -46,7 +46,8 @@ export const PARAM_HELP = [
     ['wasmmem', 'size of the WebAssembly memory in MiB. Default: sized to fit.'],
     ['tb', 'TCG translation cache in MiB (64-1024). Default 384, phones 128.'],
     ['smp', 'guest CPUs, 1-4 (default 1).'],
-    ['usb', '0 leaves out the USB tablet (no touch input; for diagnosis).'],
+    ['touch', '0 gives Android a USB tablet (a mouse: an arrow follows the finger and a tap is a click) instead of a touchscreen (virtio multitouch, default: taps, swipes and two-finger gestures as on a phone; a mouse acts as one finger, its wheel drags, its right button is Back).'],
+    ['usb', '0 leaves out the pointing device, touchscreen or USB tablet (no touch input; for diagnosis).'],
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
@@ -142,7 +143,12 @@ export function parseConfig(search, env = {}) {
         // One CPU by default: with -smp 2, QEMU-Wasm dies within seconds
         // (first boot test, 2026-11-15).
         smp: intParam(params, 'smp', 1, 1, 4),
+        // false: no pointing device at all (diagnosis).
         usb: boolParam(params, 'usb', true),
+        // Android's pointing device: a touchscreen (virtio-multitouch-pci,
+        // QEMU patch 0020 feeds it) or, with touch=0, the USB tablet, which
+        // Android-x86 drives as a mouse.
+        touch: boolParam(params, 'touch', true),
         // -1: keep the build's JIT threshold (tcg/wasm32.h, 1500).
         jit: intParam(params, 'jit', -1, -1, 2147483647),
         jitcap: intParam(params, 'jitcap', base.jitcap, 0, 15000),

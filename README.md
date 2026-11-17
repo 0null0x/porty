@@ -109,8 +109,9 @@ for a much newer Android.
   Android reads them, from QEMU's own worker threads, and QEMU unpacks them
   (the image is a compressed qcow2 of the ext4 system partition).
 - The guest's video memory is shared with the page, which copies the rows
-  that changed onto a canvas every frame. Taps, clicks and keys enter the
-  guest as a USB tablet and a keyboard.
+  that changed onto a canvas every frame. Taps, swipes and clicks enter the
+  guest as a touchscreen (QEMU's virtio multitouch device, one slot per
+  finger), keys as a keyboard.
 - QEMU's threads need `SharedArrayBuffer`, which browsers only allow on
   cross-origin-isolated pages. GitHub Pages cannot send the headers that
   turn this on, so a service worker
@@ -169,7 +170,8 @@ and say how far it got, with that message.
 | `wasmmem` | sized to fit | Size of the WebAssembly memory in MiB |
 | `tb` | 384 (phones: 128) | TCG translation cache in MiB |
 | `smp` | 1 | Guest CPUs, 1 to 4 (`smp=2` crashes QEMU-Wasm with this guest today) |
-| `usb` | on | `0` leaves out the USB tablet (no touch input; for diagnosis) |
+| `touch` | 1 | Android gets a touchscreen (QEMU's virtio multitouch device): taps, swipes, flings and two-finger gestures as on a phone, no mouse pointer. A mouse is one finger while its left button is down; its wheel (and a trackpad's two-finger scrolling) drags the screen with a finger that lifts by itself, a trackpad's pinch spreads two fingers, the right button is Back. `0` gives Android the USB tablet of before instead, which it treats as a mouse: an arrow follows the finger and a tap is a click |
+| `usb` | on | `0` leaves out the pointing device, touchscreen or USB tablet (no touch input; for diagnosis) |
 | `jit` | 1500 | Runs of a code block in the interpreter before it is compiled to WebAssembly; `0` compiles at once, `2147483647` means interpreter only |
 | `jitcap` | 15000 (phones: 4000) | Compiled code blocks kept at once (256 to 15000). Each is a module in the browser's own memory |
 | `timescale` | 8 | Guest time runs this many times slower than real time (1 to 16; `1` is real time), so that Android's fixed timeouts (the 60 s system_server Watchdog, "not responding" after 5 to 10 s) allow for a slow emulator. Android's clock falls behind by the same factor. Needs QEMU patch 0011 |
@@ -214,8 +216,10 @@ Example: `https://0null0x.github.io/porty/?serial=1&mem=1024&smp=1&res=1024x768`
 - **No network** in the guest, so also no app installs from the internet.
   No Google Play or Google apps, no cellular, SMS, calls, camera, sound,
   sensors or GPS.
-- **One pointer.** Touches are delivered through a USB tablet: Android shows
-  a mouse pointer and there are no multi-touch gestures.
+- **Slow motion.** Android's clock runs `timescale` (8) times slower than
+  real time, so a swipe looks 8 times faster to it and flings far, and a
+  long press needs 8 times longer (4 s). A finger that rests before it
+  lifts does not fling.
 - **Text input** from the on-screen keyboard is limited to US-ASCII.
 - **Hosting.** GitHub Pages has a 1 GB site limit and a 100 GB/month soft
   bandwidth limit; the site is close to the first. See the size budget in

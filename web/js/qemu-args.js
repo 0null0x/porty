@@ -70,6 +70,37 @@ export function buildKernelCmdline(cfg, manifest) {
     return words.join(' ');
 }
 
+// Android's pointing device.  A touchscreen by default: QEMU's virtio
+// multitouch device (hw/input/virtio-input-hid.c) has INPUT_PROP_DIRECT and
+// the ABS_MT axes, so Android's EventHub and InputReader make it a touch
+// screen on the built-in display (bus virtual, so not external); the page
+// sends it one finger per slot through ui/wasmfb.c's ring (patch 0020).
+// With touch=0 the USB tablet of Android-x86's qemu-android script, which
+// Android-x86 drives as a mouse (CursorInputMapper, an arrow on screen).
+export const TOUCH_DEVICE = 'virtio-multitouch-pci';
+export const TABLET_DEVICE = 'usb-tablet';
+
+/** The pointing device's arguments for a config (none with usb=0). */
+export function inputArgs(cfg) {
+    if (!cfg.usb) {
+        return [];
+    }
+    return cfg.touch === false ? ['-usb', '-device', TABLET_DEVICE] : ['-device', TOUCH_DEVICE];
+}
+
+/**
+ * The pointing device an argument vector gives the guest: 'touch',
+ * 'tablet' or 'none'.  The page's input follows the machine it runs (a
+ * resumed snapshot brings its own arguments).
+ */
+export function inputDevice(args) {
+    const devices = args.filter((a, i) => args[i - 1] === '-device').map((a) => a.split(',')[0]);
+    if (devices.includes(TOUCH_DEVICE)) {
+        return 'touch';
+    }
+    return devices.includes(TABLET_DEVICE) ? 'tablet' : 'none';
+}
+
 /**
  * @param cfg       result of parseConfig()
  * @param manifest  image/manifest.json
@@ -112,8 +143,9 @@ export function buildQemuArgs(cfg, manifest, paths) {
         '-global', `VGA.xres=${cfg.width}`,
         '-global', `VGA.yres=${cfg.height}`,
 
-        // Absolute pointer, as in Android-x86's qemu-android script.
-        ...(cfg.usb ? ['-usb', '-device', 'usb-tablet'] : []),
+        // Pointing device: a touchscreen, or with touch=0 the USB tablet
+        // (absolute pointer) of Android-x86's qemu-android script.
+        ...inputArgs(cfg),
 
         // Time dilation (?timescale=, patch 0011) slows QEMU's virtual
         // clock. The RTC follows the host's clock unless told otherwise,

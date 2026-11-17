@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import { MIB, chooseWasmMemoryMb, fallbackLadder, requiredWasmMemoryMb } from './config.js';
-import { buildKernelCmdline, buildQemuArgs } from './qemu-args.js';
+import { buildKernelCmdline, buildQemuArgs, inputDevice } from './qemu-args.js';
 import { WASM_PAGE, findMemoryImport, setMemoryImportPages } from './wasm-patch.js';
 import { Display } from './display.js';
 import { snapshotVersion } from './diskcache.js';
@@ -350,6 +350,9 @@ export class Emulator {
         }
         const snapshotIndexText = plan ? snapshotIndex(plan.snap, `${base}${SNAPSHOT_DIR}`, snapshotVersion(plan.snap) || true) : null;
         this.args = args;
+        // What the machine (a resumed one brings its own) has for a pointing
+        // device decides what the page sends: touches, tablet moves or nothing.
+        this.inputMode = inputDevice(args);
         this.cmdline = plan ? (args[args.indexOf('-append') + 1] || '') : buildKernelCmdline(this.cfg, manifest);
 
         let ramdisk = blobs.ramdisk;
@@ -480,6 +483,18 @@ export class Emulator {
         }
         this.display = new Display(this.canvas, memory, () => instance._porty_fb_poll());
         this.sendInput = (type, a, b, c) => instance._porty_input_event(type, a, b, c);
+        const abi = typeof instance._porty_abi_version === 'function' ? instance._porty_abi_version() : 0;
+        if (this.inputMode === 'touch' && abi < 2) {
+            this.notes.push(`This QEMU build (input ABI ${abi}) cannot pass touches on, but Android has a touchscreen ` +
+                'and nothing else to point with: add ?touch=0 for the USB tablet.');
+        } else {
+            this.notes.push({
+                touch: 'Android has a touchscreen (virtio multitouch): fingers are fingers, the mouse is one finger, ' +
+                    'its wheel drags and its right button is Back; touch=0 gives it a USB tablet (a mouse) instead.',
+                tablet: 'Android has a USB tablet (touch=0): it is a mouse there, with an arrow, and a tap is a click.',
+                none: 'Android has no pointing device (usb=0).',
+            }[this.inputMode]);
+        }
         if (plan) {
             this.resuming = true;
             this.snapshot = plan.snap;

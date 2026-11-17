@@ -224,7 +224,7 @@ export default async function createFakeQemu(Module) {
         __texts: texts,
         __snapshot: snapshot,
         __memoryBytes: memory.buffer.byteLength,
-        _porty_abi_version: () => 1,
+        _porty_abi_version: () => 2,
         _porty_fb_poll() {
             const i = INFO >> 2;
             u32[i] = MAGIC;
@@ -244,9 +244,12 @@ export default async function createFakeQemu(Module) {
         },
         _porty_input_event(type, a, b, c) {
             events.push([type, a, b, c]);
-            if (type === 1) { // draw a black dot where the pointer is
-                const x = Math.round((a / 0x7fff) * (live.width - 1));
-                const y = Math.round((b / 0x7fff) * (live.height - 1));
+            // a black dot where the pointer is (tablet) or a finger came down
+            // or moved (touchscreen: type 5 and 6, a = slot)
+            const [px, py] = type === 1 ? [a, b] : [b, c];
+            if (type === 1 || type === 5 || type === 6) {
+                const x = Math.round((px / 0x7fff) * (live.width - 1));
+                const y = Math.round((py / 0x7fff) * (live.height - 1));
                 fill(x - 3, y - 3, x + 4, y + 4, 0, 0, 0);
             } else if (type === 10 && a === 2) {
                 live.running = 0;
