@@ -12,6 +12,10 @@
 # as debug.hwui.renderer, or scheduling), " @@ " between variants.  Page parameters that shape the machine veto the
 # resume and boot instead (web/js/snapshot.js, MACHINE_PARAMS).
 #
+# With baseline_ref (e.g. main), the job also assembles that ref's site
+# with that ref's snapshot and visits both alternately: guest-side changes
+# need a snapshot of their own, and this compares them on one runner.
+#
 #   gh workflow run launch-compare.yml -R <owner>/<repo> --ref swarm/<you> \
 #     -f queries='wasmmem=1280&jitcap=15000;wasmmem=1280&jitcap=15000&jitgc=0' -f rounds=2
 #
@@ -45,6 +49,10 @@ on:
         default: 420
       env:
         description: More environment for the boot test, NAME=value separated by spaces
+        type: string
+        default: ''
+      baseline_ref:
+        description: A second ref (e.g. main) whose own site, with its own snapshot, is visited the same way in the same job
         type: string
         default: ''
 
@@ -134,6 +142,39 @@ jobs:
           scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$SHA" --snapshot out/artifact/snapshot
           du -sb dist
 
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: base-checkout
+        if: inputs.baseline_ref != '' && steps.site.outcome == 'success'
+        continue-on-error: true
+        with:
+          ref: ${{ inputs.baseline_ref }}
+          path: base
+          persist-credentials: false
+
+      # The baseline's snapshot, under the key its own files give (the same
+      # key snapshot.yml saved it under on that ref).
+      - name: Restore the baseline's resume snapshot
+        id: base-snapshot
+        if: steps.base-checkout.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/base-snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('base/scripts/prepare-image.sh', 'base/scripts/slim-system.py', 'base/build/slim-remove.list', 'base/build/versions.env') }}-${{ hashFiles('base/patches/qemu-wasm/**') }}-${{ hashFiles('base/web/js/qemu-args.js', 'base/web/js/config.js', 'base/web/js/boot-diet.js', 'base/web/js/initramfs.js', 'base/scripts/snapshot/**') }}
+
+      - name: Assemble the baseline's site
+        id: base-site
+        if: steps.base-snapshot.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: |
+          # Same QEMU-Wasm build and image, or the comparison means nothing.
+          cmp -s build/versions.env base/build/versions.env
+          diff -r -q patches/qemu-wasm base/patches/qemu-wasm
+          (cd base/web && npm ci --ignore-scripts --no-audit --no-fund)
+          base/scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist-base \
+            --id "$(git -C base rev-parse HEAD)" --snapshot out/base-snapshot
+          du -sb dist-base
+
       - name: Visits
         id: visits
         if: steps.site.outcome == 'success'
@@ -145,6 +186,7 @@ jobs:
           ROUNDS: ${{ inputs.rounds || 1 }}
           PROBE_WAIT_S: ${{ inputs.probe_wait || 420 }}
           EXTRA_ENV: ${{ inputs.env }}
+          BASELINE: ${{ steps.base-site.outcome == 'success' && 'yes' || '' }}
         run: |
           CHROME="$(command -v google-chrome || command -v chromium)"
           export CHROME SITE_URL="http://127.0.0.1:8080/"
@@ -161,14 +203,22 @@ jobs:
             fi
           done
           export PROBE_STEPS=launch PROBE_WAIT="$PROBE_WAIT_S" MINUTES=45
-          # One profile for every visit: after the first, the saved Android
-          # comes from the device (the disk cache), as for a returning visitor.
-          export USER_DATA_DIR="$work/profile"
+          # One profile per site for every visit: after the first, the saved
+          # Android comes from the device (the disk cache), as for a
+          # returning visitor.
           python3 tests/ui/serve.py dist 8080 "--log=$work/server.log" --isolate &
-          server=$!
-          for _ in $(seq 50); do
-            curl -fsS -o /dev/null "${SITE_URL}index.html" 2>/dev/null && break
-            sleep 0.2
+          servers=("$!")
+          sites=(test)
+          if [[ -n "$BASELINE" ]]; then
+            python3 tests/ui/serve.py dist-base 8081 "--log=$work/server-base.log" --isolate &
+            servers+=("$!")
+            sites+=(base)
+          fi
+          for port in 8080 8081; do
+            for _ in $(seq 50); do
+              curl -fsS -o /dev/null "http://127.0.0.1:$port/index.html" 2>/dev/null && break
+              sleep 0.2
+            done
           done
           IFS=';' read -r -a queries <<< "$QUERIES"
           shells=()
@@ -177,19 +227,24 @@ jobs:
           fi
           n=${#queries[@]}
           : > "$work/visits.txt"
+          m=${#sites[@]}
           for round in $(seq "$ROUNDS"); do
-            for k in $(seq 0 $((n - 1))); do
-              i=$k
-              (( round % 2 == 0 )) && i=$((n - 1 - k))
+            for k in $(seq 0 $((n * m - 1))); do
+              j=$k
+              (( round % 2 == 0 )) && j=$((n * m - 1 - k))
+              i=$((j / m)) site="${sites[$((j % m))]}"
               export QUERY="${queries[$i]}" SHELL_INIT="${shells[$i]:-}"
-              label="v$((i + 1)) r$round ${QUERY}${SHELL_INIT:+ sh: $SHELL_INIT}"
+              export USER_DATA_DIR="$work/profile-$site"
+              if [[ "$site" == base ]]; then SITE_URL="http://127.0.0.1:8081/"; else SITE_URL="http://127.0.0.1:8080/"; fi
+              export SITE_URL
+              label="v$((i + 1))${BASELINE:+ $site} r$round ${QUERY}${SHELL_INIT:+ sh: $SHELL_INIT}"
               echo "::group::$label"
-              node tests/boot/boot-test.mjs 2>&1 | tee "$work/visit-$i-$round.log" || true
+              node tests/boot/boot-test.mjs 2>&1 | tee "$work/visit-$site-$i-$round.log" || true
               echo "::endgroup::"
-              printf '%s=%s\n' "${label//=/:}" "$work/visit-$i-$round.log" >> "$work/visits.txt"
+              printf '%s=%s\n' "${label//=/:}" "$work/visit-$site-$i-$round.log" >> "$work/visits.txt"
             done
           done
-          kill "$server" 2>/dev/null || true
+          kill "${servers[@]}" 2>/dev/null || true
 
       - name: Summary
         if: ${{ always() }}

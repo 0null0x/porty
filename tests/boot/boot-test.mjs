@@ -717,7 +717,11 @@ async function inputProbe() {
         }
         const t = Date.now();
         marks.cpu.set(tag, { tag, at: t, procs: new Map(), threads: new Map(), done: false });
-        await send(`pcpu ${tag}${threads ? ' threads' : ''}\r`);
+        // Real-time for the snapshot: surfaceflinger's threads are
+        // SCHED_FIFO, and while it composes over and over a shell at nice
+        // -20 waits minutes for its turn (run 43980055445).  toybox's chrt
+        // takes the pid before the priority.
+        await send(`chrt -f -p $$ 99 > /dev/null 2>&1; pcpu ${tag}${threads ? ' threads' : ''}; chrt -o -p $$ 0 > /dev/null 2>&1\r`);
         while (!(marks.cpu.get(tag) || {}).done && Date.now() - t < ms) {
             await sleep(2000);
         }
