@@ -9,7 +9,7 @@
 # A variant is a query (page parameters that keep the resume, such as jit=,
 # jitcap= or jitgc=) and optionally a command line typed into Android's root
 # shell when it answers (for properties an app reads when it starts, such
-# as debug.hwui.renderer).  Page parameters that shape the machine veto the
+# as debug.hwui.renderer, or scheduling), " @@ " between variants.  Page parameters that shape the machine veto the
 # resume and boot instead (web/js/snapshot.js, MACHINE_PARAMS).
 #
 #   gh workflow run launch-compare.yml -R <owner>/<repo> --ref swarm/<you> \
@@ -21,12 +21,6 @@
 name: Launch compare
 
 on:
-  # A push of this file runs it once with the defaults (and registers it,
-  # so that it can be started by hand).
-  push:
-    branches: ['swarm/**']
-    paths:
-      - .github/workflows/launch-compare.yml
   workflow_dispatch:
     inputs:
       ref:
@@ -38,7 +32,7 @@ on:
         type: string
         default: 'wasmmem=1280&jitcap=15000'
       shells:
-        description: Shell command lines per variant, separated by ";" in the same order (may be empty; use && inside one)
+        description: Shell command lines per variant, separated by " @@ " in the same order (may be empty)
         type: string
         default: ''
       rounds:
@@ -177,7 +171,10 @@ jobs:
             sleep 0.2
           done
           IFS=';' read -r -a queries <<< "$QUERIES"
-          IFS=';' read -r -a shells <<< "$SHELLS"
+          shells=()
+          if [[ -n "$SHELLS" ]]; then
+            mapfile -t shells < <(printf '%s\n' "$SHELLS" | sed 's/ @@ /\n/g')
+          fi
           n=${#queries[@]}
           : > "$work/visits.txt"
           for round in $(seq "$ROUNDS"); do
