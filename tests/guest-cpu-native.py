@@ -235,6 +235,26 @@ def ppm_diff(data, base):
     return round(100.0 * (n - same) / max(1, n), 1)
 
 
+def jit_info(vm):
+    """QEMU's own translation counters (HMP "info jit"): {"tb_count",
+    "tb_flush", "tb_invalidate", "code_size_mb"...}, to tell how often the
+    code buffer was thrown away during a start."""
+    try:
+        text = vm.qmp.hmp("info jit", 60) or ""
+    except Exception as e:  # an old QEMU or no QMP: no counters
+        return {"error": str(e)[:120]}
+    out = {}
+    for key, pattern in (("tb_count", r"TB count\s+(\d+)"), ("tb_flush", r"TB flush count\s+(\d+)"),
+                         ("tb_invalidate", r"TB invalidate count\s+(\d+)"), ("tlb_flush", r"TLB full flushes\s+(\d+)"),
+                         ("code_size", r"gen code size\s+(\d+)/(\d+)")):
+        m = re.search(pattern, text)
+        if m:
+            out[key] = int(m.group(1))
+            if key == "code_size":
+                out["code_capacity"] = int(m.group(2))
+    return out
+
+
 def screen_diff(vm, name, base):
     """Share (%) of 1/7 of the pixels that differ from `base` (bytes of a PPM), and the new PPM."""
     path = vm.fb_prefix + ".ppm"
@@ -352,6 +372,7 @@ def launch(g, app, opts, index):
     anr0 = g.sh("logcat -b events -d | grep -c am_anr", 60)[1].strip()
     anr0 = int(anr0) if anr0.isdigit() else 0
     g.sh("dumpsys gfxinfo com.android.systemui reset > /dev/null 2>&1", 120)
+    jit0 = jit_info(vm)
     a = g.cpu("a", threads=True)
     d_snap = None
     t0 = time.monotonic()
@@ -405,6 +426,14 @@ def launch(g, app, opts, index):
             quiet_at = now_t
             break
     b = g.cpu("b", threads=True)
+    jit1 = jit_info(vm)
+    out["jit"] = {"before": jit0, "after": jit1}
+    if "tb_flush" in jit0 and "tb_flush" in jit1:
+        log(f"    QEMU's code buffer: {jit1['tb_flush'] - jit0['tb_flush']} flushes, "
+            f"{jit1.get('tb_invalidate', 0) - jit0.get('tb_invalidate', 0)} invalidations during the start; "
+            f"{jit1.get('tb_count')} blocks, {jit1.get('code_size', 0) // 1048576}/{jit1.get('code_capacity', 0) // 1048576} MB at the end")
+    else:
+        log(f"    QEMU's code buffer: no counters ({jit0}, {jit1})")
     out["sf_timestats"] = g.sh("dumpsys SurfaceFlinger --timestats -dump -maxlayers 16 2>&1 | grep -E"
                                " 'layerName|totalFrames|droppedFrames|missedFrames|clientCompositionFrames|statsStart|statsEnd'"
                                " | cut -c1-150", 120)[1]
