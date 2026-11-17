@@ -165,6 +165,35 @@ export const SF_FIX = {
     patchedSha256: '9a508052d6526e340fdf7355e1596d4596846f7124c07af4b02f43666379a6c1',
 };
 
+// "Not responding" reports without the stack dumps (ANR_TRACES, ?anrtraces=,
+// none by default).
+//
+// When a process does not answer in time (in the guest's own time, 10 s for
+// a foreground broadcast, 5 s for an input event), ActivityManager logs it
+// (am_anr, "ANR in"), shows its dialog, and first has the Java processes of
+// interest write every thread's stack (SIGQUIT, each process's "Signal
+// Catcher" thread: the culprit, system_server, the persistent processes and
+// the five busiest others) and debuggerd unwind a dozen native processes,
+// into a file in /data/anr.  In the browser the guest is slow enough that
+// SystemUI can miss the TIME_TICK broadcast during a cold app start (it did
+// in 3 of 4 visits of an earlier build).  On a settled native guest
+// (.github/workflows/guest-cpu.yml run 44088701829, SystemUI stopped until
+// such a report) the report cost 1361 busy ticks in 135 s with the dumps
+// (a 205 KB file, 103 ticks in Signal Catcher threads) and 919 without
+// (49): a third less, before any of it is slowed down the browser's way.
+// ActivityManager reads the directory from
+// dalvik.vm.stack-trace-dir (build.prop: /data/anr) at every report; when it
+// cannot create a file there it logs "Unable to create ANR dump file", skips
+// all those dumps and asks only the culprit for its own stacks.  The report,
+// the dialog and the event log entry stay, so a real hang still shows.  The
+// property is set once the boot has completed (build.prop is read after the
+// diet's properties, so a property line would not hold), to a /proc path in
+// which nothing can be created.  ?anrtraces=1 keeps Android's dumps.
+export const ANR_TRACES = {
+    property: 'dalvik.vm.stack-trace-dir',
+    off: '/proc/porty-no-anr-traces',
+};
+
 // Provisioning: what stands between a first boot and the home screen.
 //
 // A new Android has Settings.Global.DEVICE_PROVISIONED = 0 and
@@ -221,13 +250,14 @@ const SHA256 = /^[0-9a-f]{64}$/;
  * provision: false | PROVISION }.  The kernel fix not with gfx=vesa
  * (nomodeset: bochs-drm never drives the screen, nothing maps a TTM buffer)
  * and not with ttmfix=0; surfaceflinger's not with sffix=0; the
- * provisioning not with setup=1.
+ * provisioning not with setup=1; no ANR dumps unless anrtraces=1.
  */
 export function dietFixes(cfg) {
     return {
         ttm: cfg.ttmfix !== false && cfg.gfx !== 'vesa' ? TTM_FIX : false,
         sf: cfg.sffix !== false ? SF_FIX : false,
         provision: cfg.setup ? false : PROVISION,
+        anr: cfg.anrtraces ? false : ANR_TRACES,
     };
 }
 
@@ -273,7 +303,8 @@ export function describeDiet(cfg) {
     const props = dietProps(cfg);
     const fixes = dietFixes(cfg);
     return (props.length ? ` props: ${props.map((p) => p.join('=')).join(' ')}` : ' props: none')
-        + (fixes.ttm ? ' ttmfix' : '') + (fixes.sf ? ' sffix' : '') + (fixes.provision ? ' provisioned' : '');
+        + (fixes.ttm ? ' ttmfix' : '') + (fixes.sf ? ' sffix' : '') + (fixes.provision ? ' provisioned' : '')
+        + (fixes.anr ? ' noanrdumps' : '');
 }
 
 /** Shell lines that set the properties (empty: none to set). */
@@ -408,11 +439,43 @@ function provisionLines(provision) {
 }
 
 /**
+ * Lines that append an init.rc action setting the ANR trace directory once
+ * the boot has completed (see ANR_TRACES).
+ */
+function anrLines(fix) {
+    if (!fix) {
+        return [];
+    }
+    if (!/^[a-z0-9_.-]{1,64}$/.test(fix.property) || !/^\/proc\/[a-z0-9_-]{1,40}$/.test(fix.off)) {
+        throw new Error(`dietScript: bad ANR setting ${JSON.stringify(fix)}`);
+    }
+    return [
+        'porty_anr()',
+        '{',
+        '\tif [ ! -f init.rc ]; then',
+        '\t\techo "porty: no init.rc, ANR dumps as shipped"',
+        '\t\treturn',
+        '\tfi',
+        "\tif ! grep -q '^# porty: no ANR dumps' init.rc; then",
+        "\t\tcat >> init.rc <<'PORTY_EOF'",
+        '',
+        '# porty: no ANR dumps (web/js/boot-diet.js)',
+        'on property:sys.boot_completed=1',
+        `    setprop ${fix.property} ${fix.off}`,
+        'PORTY_EOF',
+        '\tfi',
+        `\techo "porty: no ANR dumps after the boot (${fix.property}=${fix.off})"`,
+        '}',
+        'porty_anr',
+    ];
+}
+
+/**
  * The script for the initrd (busybox ash, sourced by /init from /android).
  * Lines for the same keys are removed first: init keeps the first value of
  * a "ro." property and the last of any other.
  * @param props  [[key, value]...]
- * @param fixes  { ttm, sf: false | a file fix like TTM_FIX, provision: false | PROVISION }
+ * @param fixes  { ttm, sf: false | a file fix like TTM_FIX, provision: false | PROVISION, anr: false | ANR_TRACES }
  */
 export function dietScript(props, fixes = {}) {
     for (const [key, value] of props) {
@@ -427,6 +490,7 @@ export function dietScript(props, fixes = {}) {
         ...moduleFixLines(fixes.ttm),
         ...moduleFixLines(fixes.sf),
         ...provisionLines(fixes.provision),
+        ...anrLines(fixes.anr),
         '',
     ].join('\n');
 }
@@ -441,5 +505,6 @@ export function dietArchive(props, fixes = {}) {
 
 /** initrd.img with the diet script appended; unchanged when there is nothing to do. */
 export function applyBootDiet(initrd, props, fixes = {}) {
-    return props.length || fixes.ttm || fixes.sf || fixes.provision ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
+    return props.length || fixes.ttm || fixes.sf || fixes.provision || fixes.anr
+        ? appendInitramfs(initrd, dietArchive(props, fixes)) : initrd;
 }

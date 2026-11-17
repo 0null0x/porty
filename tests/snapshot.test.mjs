@@ -159,6 +159,7 @@ const snapshot = () => ({
     // ttm.ko fixed or not is decided when the saved machine boots.
     assert.match(resumeVeto({ search: '?ttmfix=0' }), /sets ttmfix=/);
     assert.match(resumeVeto({ search: '?sffix=0' }), /sets sffix=/);
+    assert.match(resumeVeto({ search: '?anrtraces=1' }), /sets anrtraces=/);
 
     // A desktop-sized snapshot is not for phones.
     const big = snapshot();

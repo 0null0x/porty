@@ -70,6 +70,7 @@ export const PARAM_HELP = [
     ['lowmem', '0 leaves Android\'s low memory killer as shipped: it then ends every app that is left for another within seconds (default 1: background apps stay until memory is critically short, see boot-diet.js).'],
     ['ttmfix', '0 leaves the kernel module ttm.ko as shipped: the guest then panics when Android collects stack traces (for diagnosis).'],
     ['sffix', '0 leaves surfaceflinger as shipped: it then composes the same picture on every vsync while a deferred transaction waits, for up to minutes after an app starts (see boot-diet.js).'],
+    ['anrtraces', '1 keeps Android\'s stack dumps for "not responding" reports (in /data/anr) (default 0: the report and its dialog, and the culprit\'s own stacks only; see boot-diet.js).'],
     ['resume', '1 resumes the saved Android even with other settings in the address; 0 always boots.'],
 ];
 
@@ -180,6 +181,8 @@ export function parseConfig(search, env = {}) {
         ttmfix: boolParam(params, 'ttmfix', true),
         // false: surfaceflinger as shipped (boot-diet.js, SF_FIX).
         sffix: boolParam(params, 'sffix', true),
+        // true: Android's own ANR dumps (boot-diet.js, ANR_TRACES).
+        anrtraces: boolParam(params, 'anrtraces', false),
     };
     return cfg;
 }

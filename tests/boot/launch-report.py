@@ -53,6 +53,22 @@ def main(args):
         print(f"| {label} | {r.get('hostCpu', cpu)} | {r.get('screenChangedS')} | {r.get('screenTimeline', '')} "
               f"| {r.get('firstFrameS')} | {r.get('launchTimeWallS')} | {r.get('focusedAtEnd')} "
               f"| {c.get('busy', '')} | {c.get('displayUpdates', '')} | {top} | {threads} | {jit.get('compiled', '')} |")
+    after = [(label, r) for label, r, _ in rows if r and (r.get("cpuAfterContent") or r.get("anr"))]
+    if after:
+        print()
+        print("After the app's content showed (90% of the screen changed), and \"not responding\" reports:")
+        print()
+        print("| visit | content s | busy ticks after | of | guest s | probe's shell | top processes after (ticks) "
+              "| top threads after | not responding after the tap |")
+        print("|---|---|---|---|---|---|---|---|---|")
+        for label, r in after:
+            c = r.get("cpuAfterContent") or {}
+            a = r.get("anr") or {}
+            top = ", ".join(f"{name} {ticks}" for name, ticks in (c.get("top") or [])[:5])
+            threads = ", ".join(f"{name} {ticks}" for name, ticks in (c.get("threads") or [])[:5])
+            listed = "; ".join(f"{proc}: {reason[:60]}" for proc, reason in (a.get("afterTapList") or [])[:3])
+            print(f"| {label} | {r.get('contentS', '')} | {c.get('busy', '')} | {c.get('total', '')} | {c.get('guestSeconds', '')} "
+                  f"| {c.get('probeTicks', '')} | {top} | {threads} | {a.get('afterTap', '')} {listed} |")
     return 0
 
 
