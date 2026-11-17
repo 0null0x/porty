@@ -267,9 +267,16 @@ def launch(g, app, opts, index):
         diff, _ = screen_diff(vm, "now", base)
         if changed is None and diff >= 40:
             changed = now_t
-        if index == 1 and shots and now_t >= shots[0]:
+        if index <= opts.watch and shots and now_t >= shots[0]:
             shot_at = shots.pop(0)
-            vm.screenshot(f"{app['name']}-{index}-t{shot_at}", show=opts.show_screens)
+            if index == 1:
+                vm.screenshot(f"{app['name']}-{index}-t{shot_at}", show=opts.show_screens)
+            # Who is in which state while surfaceflinger keeps composing.
+            watched = g.sh("dumpsys activity activities | grep -e 'state=' -e 'mResumedActivity' -e 'mLastPausedActivity'"
+                           " | grep -v -e '^ *$' | cut -c1-150 | head -12; dumpsys SurfaceFlinger | grep -e '^+ ' -e 'queued-frames'"
+                           " -e 'mRefreshPending' | cut -c1-140 | head -40", 120)[1]
+            out.setdefault("watch", []).append([shot_at, watched])
+            log(f"    t+{shot_at} s: " + " | ".join(line.strip() for line in watched.split("\n") if line.strip())[:2500])
         if m:
             v = [int(x) for x in m.group(1).split()]
             cur = (sum(v[:8]), v[3] + v[4])
@@ -290,6 +297,8 @@ def launch(g, app, opts, index):
                              " echo \"LAT|$(dumpsys SurfaceFlinger --latency \"$n\" | tail -n +2 | grep -c '^[1-9]')|$n\"; done"
                              " | grep -v '^LAT|0|' | cut -c1-120", 300)[1]
     log("    sf frames per layer (latency): " + " | ".join(line.strip() for line in out["sf_latency"].split("\n") if line.strip())[:3000])
+    out["sf_log"] = g.sh("logcat -d -s SurfaceFlinger:* -t 400 | grep -v -e 'Registering a buffer' | tail -12 | cut -c1-160", 120)[1]
+    log("    surfaceflinger log: " + " | ".join(line.strip() for line in out["sf_log"].split("\n") if line.strip())[:2000])
     out["drawn_s"] = drawn
     out["screen_changed_s"] = changed
     out["quiet_s"] = quiet_at
@@ -425,6 +434,7 @@ def main():
     ap.add_argument("--launch-timeout", type=float, default=180)
     ap.add_argument("--show-screens", type=int, default=0)
     ap.add_argument("--timescale", type=int, default=8, help="the page's time dilation, set through gdb (1: none)")
+    ap.add_argument("--watch", type=int, default=1, help="starts per app (from the first) during which activity and layer states are sampled")
     ap.add_argument("--profile", type=int, default=0, help="1: one more start of the first app, sampled by simpleperf")
     ap.add_argument("--profile-seconds", type=int, default=60)
     ap.add_argument("--profile-hz", type=int, default=1000)
