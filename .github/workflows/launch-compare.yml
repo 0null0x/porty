@@ -152,14 +152,22 @@ jobs:
           persist-credentials: false
 
       # The baseline's snapshot, under the key its own files give (the same
-      # key snapshot.yml saved it under on that ref).
+      # key snapshot.yml saved it under) and at the path snapshot.yml saved
+      # it from: a cache entry is only found with the same path.  The test
+      # site has its own copy in dist by now.
+      - name: Make room for the baseline's snapshot
+        id: base-room
+        if: steps.base-checkout.outcome == 'success'
+        continue-on-error: true
+        run: rm -rf out/artifact/snapshot
+
       - name: Restore the baseline's resume snapshot
         id: base-snapshot
-        if: steps.base-checkout.outcome == 'success'
+        if: steps.base-room.outcome == 'success'
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: out/base-snapshot
+          path: out/artifact/snapshot
           key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('base/scripts/prepare-image.sh', 'base/scripts/slim-system.py', 'base/build/slim-remove.list', 'base/build/versions.env') }}-${{ hashFiles('base/patches/qemu-wasm/**') }}-${{ hashFiles('base/web/js/qemu-args.js', 'base/web/js/config.js', 'base/web/js/boot-diet.js', 'base/web/js/initramfs.js', 'base/scripts/snapshot/**') }}
 
       - name: Assemble the baseline's site
@@ -172,7 +180,7 @@ jobs:
           diff -r -q patches/qemu-wasm base/patches/qemu-wasm
           (cd base/web && npm ci --ignore-scripts --no-audit --no-fund)
           base/scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist-base \
-            --id "$(git -C base rev-parse HEAD)" --snapshot out/base-snapshot
+            --id "$(git -C base rev-parse HEAD)" --snapshot out/artifact/snapshot
           du -sb dist-base
 
       - name: Visits
