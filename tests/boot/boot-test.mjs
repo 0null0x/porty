@@ -1050,7 +1050,7 @@ async function stressLoop() {
             const st = await page.evaluate(() => {
                 const e = globalThis.__porty;
                 const m = e && e.module;
-                // QEMU patch 0015: the vCPU thread's C stack, size and most used.
+                // QEMU patch 0016: the vCPU thread's C stack, size and most used.
                 let stack = null;
                 if (m && typeof m._porty_stack_stats === 'function' && e.memory) {
                     stack = Array.from(new Uint32Array(e.memory.buffer, m._porty_stack_stats() >>> 0, 2));
