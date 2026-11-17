@@ -423,6 +423,14 @@ export class Emulator {
                         this.notes.push('This QEMU build cannot skip the garbage-collector wait; ?jitgc= ignored.');
                     }
                 }
+                if (this.cfg.jitgcwait > 0) {
+                    if (typeof Module._porty_set_jit_gc_wait_ms === 'function') {
+                        const n = Module._porty_set_jit_gc_wait_ms(this.cfg.jitgcwait);
+                        this.notes.push(`The cap waits at most ${n} ms for the garbage collector (jitgcwait).`);
+                    } else {
+                        this.notes.push('This QEMU build has no limit on the garbage-collector wait; ?jitgcwait= ignored.');
+                    }
+                }
                 // QEMU patches 0022-0024: the JIT cache's policies and module
                 // ring (on by default on iPhones and iPads, config.js; a build
                 // without them stays as it is, so only a value that asks for

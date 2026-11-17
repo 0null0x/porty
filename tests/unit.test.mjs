@@ -50,6 +50,9 @@ const paths = { bios: '/pc-bios', kernel: '/img/kernel', initrd: '/img/initrd.im
     assert.deepEqual([desktop.cache, desktop.jitcap], [64, 0]);
     assert.equal(parseConfig('?jitcap=99999', {}).jitcap, 15000);
     assert.deepEqual([desktop.jitgc, parseConfig('?jitgc=0', {}).jitgc], [true, false]);
+    // QEMU patch 0023: the cap's wait for the collector, no limit by default
+    assert.deepEqual(['', '?jitgcwait=5000', '?jitgcwait=-3', '?jitgcwait=9999999'].map((q) => parseConfig(q, {}).jitgcwait),
+        [0, 5000, 0, 600000]);
     // Elsewhere both are off: QEMU-Wasm as before.
     assert.deepEqual([desktop.jitpolicy, desktop.jitring, android.jitpolicy, android.jitring], [0, 0, 0, 0]);
     assert.deepEqual([parseConfig('?jitring=0', { userAgent: IPHONE }).jitring, parseConfig('?jitpolicy=-1', {}).jitpolicy], [0, -1]);

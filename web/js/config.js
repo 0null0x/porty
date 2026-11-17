@@ -62,6 +62,7 @@ export const PARAM_HELP = [
     ['jit', 'runs of a code block before it is compiled to WebAssembly (default 1500; 2147483647 = interpreter only).'],
     ['jitcap', 'compiled code blocks kept at once (256-15000; default 15000, phones 4000, iPhones and iPads 8000).'],
     ['jitgc', '0: dropped compiled blocks stop counting at once instead of after garbage collection (experiment).'],
+    ['jitgcwait', 'ms the cap waits at most for the garbage collector to report dropped compiled blocks gone (default 0: as long as it takes).'],
     ['jitpolicy', 'JIT cache policies, bits (default 0, iPhones and iPads 6): 1 compile at once after a flush what was hot before it, 2 at the cap give the blocks that ran since the last drop a second chance, 4 translate again a hot block whose module was overwritten in the module ring. 0 = as before.'],
     ['jitring', 'KiB of the ring that keeps the compiled forms of code blocks out of the translation cache (default 0 = in the cache, as before; iPhones and iPads 24576).'],
     ['timescale', 'guest time runs this many times slower than real time (1-16, default 8; 1 = real time), so Android\'s timeouts allow for a slow emulator. The guest\'s clock then falls behind.'],
@@ -186,6 +187,8 @@ export function parseConfig(search, env = {}) {
         jitcapExplicit: params.has('jitcap'),
         // false: patch 0010's "do not wait for the garbage collector".
         jitgc: boolParam(params, 'jitgc', true),
+        // QEMU patch 0023: how long the cap waits for the collector (0: no limit).
+        jitgcwait: intParam(params, 'jitgcwait', 0, 0, 600000),
         // QEMU patches 0022-0024 (see PARAM_HELP); -1: the build's defaults (off).
         jitpolicy: intParam(params, 'jitpolicy', base.jitpolicy, -1, 7),
         jitring: intParam(params, 'jitring', base.jitring, -1, 262144),

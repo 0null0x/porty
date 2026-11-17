@@ -1506,7 +1506,8 @@ async function pageState() {
             // after a flush, [5] blocks kept at a drop; the module ring's counts.
             if (e && e.module && typeof e.module._porty_jit_ring_stats === 'function') {
                 ring = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_ring_stats() >>> 0, 6));
-                jitx = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_stats() >>> 0, 6));
+                jitx = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_stats() >>> 0,
+                    typeof e.module._porty_set_jit_gc_wait_ms === 'function' ? 7 : 6));
             }
             // Patch 0018: how full the wasm32 backend's per-TB tables get (tests/boot/tcg-tables.mjs).
             if (e && e.module && typeof e.module._porty_tcg_stats === 'function') {
@@ -1592,7 +1593,7 @@ async function sample(label, every = 10000) {
         // [5] translated again after that and compiled at once; porty_jit_stats() [4]
         // compiled at once after a flush, [5] kept at a drop.
         result.ring = { kb: s.ring[0], stashed: s.ring[1], stashedKb: s.ring[2], laps: s.ring[3], gone: s.ring[4],
-            regone: s.ring[5], rehot: s.jitx[4], kept: s.jitx[5] };
+            regone: s.ring[5], rehot: s.jitx[4], kept: s.jitx[5], gcWriteOffs: s.jitx[6] ?? null };
     }
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
@@ -1602,7 +1603,8 @@ async function sample(label, every = 10000) {
         (phases ? ` | PHASES ${describePhases(phases)}` : '') +
         (s.ring ? ` | RING ${s.ring[0]} KiB: ${s.ring[1]} modules (${s.ring[2]} KiB) in ${s.ring[3]} laps, ${s.ring[4]} gone ` +
             `(${s.ring[5]} translated again and compiled at once); ` +
-            `compiled at once after a flush ${s.jitx[4]}, kept at drops ${s.jitx[5]}` : ''));
+            `compiled at once after a flush ${s.jitx[4]}, kept at drops ${s.jitx[5]}` +
+            (s.jitx[6] !== undefined ? `, stopped waiting for the collector ${s.jitx[6]} times` : '') : ''));
     const tcg = tcgTables(s.tcg);
     if (tcg && JSON.stringify(tcg) !== JSON.stringify(result.tcg)) {
         log(`TCG TABLES: ${describeTcgTables(tcg)} ${JSON.stringify(tcg)}`);

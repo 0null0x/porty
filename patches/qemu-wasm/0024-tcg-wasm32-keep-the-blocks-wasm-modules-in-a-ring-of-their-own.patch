@@ -56,7 +56,7 @@ index 5385faf..58434a8 100644
      search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
      if (unlikely(search_size < 0)) {
 diff --git a/tcg/wasm32.c b/tcg/wasm32.c
-index ab00d04..91409a4 100644
+index eb5f581..f47d888 100644
 --- a/tcg/wasm32.c
 +++ b/tcg/wasm32.c
 @@ -27,6 +27,7 @@
@@ -91,7 +91,7 @@ index ab00d04..91409a4 100644
  
          // Create a full copy of the bytes instead of a subarray view to fix Firefox compatibility
          // See: https://bugzilla.mozilla.org/show_bug.cgi?id=1965217
-@@ -274,25 +284,207 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_wait_gc(int on)
+@@ -299,25 +309,207 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_gc_wait_ms(int ms)
   * after a flush what was hot before it, and drop the compiled blocks at
   * the flush (porty_jit_tb_flush()).  PORTY_JIT_KEEP_USED: at the cap, the
   * blocks that ran since the last drop get a second chance before the
@@ -305,7 +305,7 @@ index ab00d04..91409a4 100644
  __thread int instance_running_begin = 0;
  __thread int instance_running_end = 0;
  
-@@ -421,6 +613,8 @@ static void remove_instance_running_local()
+@@ -476,6 +668,8 @@ static void remove_instance_running_local()
   */
  #define PORTY_HOT_ORDER 18
  static uint32_t porty_hot[2][1 << (PORTY_HOT_ORDER - 5)];   /* now, before */
@@ -314,7 +314,7 @@ index ab00d04..91409a4 100644
  
  static uint32_t porty_hot_key(const TranslationBlock *tb)
  {
-@@ -442,7 +636,17 @@ void porty_jit_translated(TranslationBlock *tb)
+@@ -497,7 +691,17 @@ void porty_jit_translated(TranslationBlock *tb)
  {
      uint32_t k = porty_hot_key(tb);
  
@@ -333,7 +333,7 @@ index ab00d04..91409a4 100644
          ((porty_hot[0][k >> 5] | porty_hot[1][k >> 5]) >> (k & 31) & 1)) {
          *(int32_t *)((uintptr_t)tb->tc.ptr + counter_vec_off) = INSTANTIATE_NUM;
          qatomic_inc(&porty_hot_again);
-@@ -460,6 +664,8 @@ void porty_jit_tb_flush(void)
+@@ -515,6 +719,8 @@ void porty_jit_tb_flush(void)
      int n = instance_running_local;
  
      qatomic_inc(&porty_flush_gen);   /* see remove_instance_running_local() */
@@ -342,7 +342,7 @@ index ab00d04..91409a4 100644
      if (!(qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT)) {
          return;
      }
-@@ -481,6 +687,32 @@ void porty_jit_tb_flush(void)
+@@ -536,6 +742,32 @@ void porty_jit_tb_flush(void)
      }
  }
  
@@ -375,7 +375,7 @@ index ab00d04..91409a4 100644
  static void add_instance_running_local(int fidx, void *tb_ptr)
  {
      {
-@@ -1677,9 +1909,16 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+@@ -1733,9 +1965,16 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
              porty_prof_set(PORTY_PH_TCI_CAP);
              porty_prof_add(PORTY_C_EXEC_TCI_CAP, 1);
              res = tcg_qemu_tb_exec_tci(env);
