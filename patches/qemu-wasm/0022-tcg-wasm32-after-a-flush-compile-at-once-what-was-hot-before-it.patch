@@ -1,0 +1,248 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 08:30:00 +0000
+Subject: [PATCH] tcg/wasm32: after a flush, compile at once what was hot
+ before it
+
+When the translation cache fills up, tb_flush() throws every translation
+away.  With phones' tb-size of 128 MiB that happened every 6 to 10 s while
+Android started an app (13 to 35 flushes per Gallery launch; Porty's patch
+0019 and tcg-bounds' experiment counted them), and each time the hot code
+was translated again, interpreted for INSTANTIATE_NUM (1500) more
+executions and compiled again, while the compiled blocks of the old
+translations stayed in the ring and counted against the cap until the cap
+dropped them.
+
+Now a bit per hash of a compiled block's physical address and CPU state
+remembers what was hot, in two generations that change at each flush; a
+new translation that was compiled in this generation or the last one is
+compiled at its first execution (porty_jit_stats()[4] counts them).  A
+collision only compiles a block early.  At the flush every compiled block
+is dropped, as the cap would have dropped it later; with jitgc=1 they keep
+counting against the cap until the collector has freed them.
+
+porty_set_jit_policy() switches this off and on at run time (bit 0), for
+same-build comparisons and to roll back without a rebuild.
+---
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index 25c8b43..d81acf5 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -755,6 +755,10 @@ static void tb_remove(TranslationBlock *tb)
+ }
+ #endif /* CONFIG_USER_ONLY */
+ 
++#if !defined(CONFIG_TCG_INTERPRETER) && defined(EMSCRIPTEN)
++#include "../../tcg/wasm32.h"
++#endif
++
+ /* flush all the translation blocks */
+ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+ {
+@@ -770,6 +774,10 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+     CPU_FOREACH(cpu) {
+         tcg_flush_jmp_cache(cpu);
+     }
++#if !defined(CONFIG_TCG_INTERPRETER) && defined(EMSCRIPTEN)
++    /* Porty: the compiled blocks go with their translations. */
++    porty_jit_tb_flush();
++#endif
+ 
+     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
+     tb_remove_all();
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 87324bc..5385faf 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -66,6 +66,9 @@
+ #include "internal-target.h"
+ #include "perf.h"
+ #include "tcg/insn-start-words.h"
++#if !defined(CONFIG_TCG_INTERPRETER) && defined(EMSCRIPTEN)
++#include "../../tcg/wasm32.h"
++#endif
+ 
+ TBContext tb_ctx;
+ 
+@@ -576,6 +579,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+         tcg_tb_remove(tb);
+         return existing_tb;
+     }
++#if !defined(CONFIG_TCG_INTERPRETER) && defined(EMSCRIPTEN)
++    /* Porty: compiled at once if it was hot before a flush. */
++    porty_jit_translated(tb);
++#endif
+     return tb;
+ }
+ 
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index da3afe8..bbec44d 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -25,6 +25,8 @@
+ #include "exec/cpu_ldst.h"
+ #include "tcg/tcg-op.h"
+ #include "tcg/tcg-ldst.h"
++#include "exec/exec-all.h"
++#include "qemu/cacheinfo.h"
+ #include <string.h>
+ #include <emscripten.h>
+ #include <emscripten/threading.h>
+@@ -229,16 +231,19 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_max_instances(int n)
+ /*
+  * Porty: [0] compiled TBs alive, counting dropped ones the JS garbage
+  * collector has not reclaimed yet, [1] the cap, [2] the JIT threshold,
+- * [3] TBs compiled since start.
++ * [3] TBs compiled since start, [4] translations compiled at once because
++ * they were hot before a flush (porty_jit_translated()).
+  */
++static uint32_t porty_hot_again;
+ uint32_t *porty_jit_stats(void);
+ EMSCRIPTEN_KEEPALIVE uint32_t *porty_jit_stats(void)
+ {
+-    static uint32_t out[4];
++    static uint32_t out[5];
+     out[0] = qatomic_read(&instance_alive_global);
+     out[1] = qatomic_read(&porty_jit_max_alive);
+     out[2] = porty_jit_threshold;
+     out[3] = qatomic_read(&porty_jit_compiled);
++    out[4] = qatomic_read(&porty_hot_again);
+     return out;
+ }
+ 
+@@ -260,6 +265,28 @@ EMSCRIPTEN_KEEPALIVE int porty_set_jit_wait_gc(int on)
+     return on ? 1 : 0;
+ }
+ 
++/*
++ * Porty: the JIT cache policies as a run-time switch (?jitpolicy=, for A/B
++ * tests and rollback without a rebuild).  PORTY_JIT_REHOT: compile at once
++ * after a flush what was hot before it, and drop the compiled blocks at
++ * the flush (porty_jit_tb_flush()).  Set by the page before main() starts
++ * any vCPU; a negative value restores the default; returns the value in
++ * effect.
++ */
++#define PORTY_JIT_REHOT 1
++#define PORTY_JIT_POLICIES PORTY_JIT_REHOT
++static int porty_jit_policy = PORTY_JIT_POLICIES;
++
++int porty_set_jit_policy(int bits);
++EMSCRIPTEN_KEEPALIVE int porty_set_jit_policy(int bits)
++{
++    if (bits < 0) {
++        bits = PORTY_JIT_POLICIES;
++    }
++    qatomic_set(&porty_jit_policy, bits & PORTY_JIT_POLICIES);
++    return qatomic_read(&porty_jit_policy);
++}
++
+ __thread int instance_running_begin = 0;
+ __thread int instance_running_end = 0;
+ 
+@@ -330,8 +357,88 @@ static void remove_instance_running_local()
+     }
+ }
+ 
++/*
++ * Porty: what was hot when the code buffer was flushed.
++ *
++ * When the translation cache fills up, tb_flush() throws every translation
++ * away, and with it every compiled block.  During an app launch on a phone
++ * (tb-size 128) that happened every 8 to 10 s, and each time the hot code
++ * was translated again and run in the interpreter for INSTANTIATE_NUM
++ * more executions before it was compiled again.  This remembers which
++ * blocks were compiled (a bit per hash of the block's physical address and
++ * CPU state, in two generations that change at each flush), and a block
++ * translated again that was compiled in this generation or the last one
++ * is compiled at its first execution.  A hash collision only compiles a
++ * block early.
++ */
++#define PORTY_HOT_ORDER 18
++static uint32_t porty_hot[2][1 << (PORTY_HOT_ORDER - 5)];   /* now, before */
++
++static uint32_t porty_hot_key(const TranslationBlock *tb)
++{
++    uint64_t k = (uint64_t)tb_page_addr0(tb) ^ tb->cs_base ^ ((uint64_t)tb->flags << 32) ^
++                 ((uint64_t)(tb->cflags & ~CF_INVALID) << 12);
++
++    return (uint32_t)((k * 0x9e3779b97f4a7c15ull) >> (64 - PORTY_HOT_ORDER));
++}
++
++/* The TranslationBlock of a block's code (tcg_tb_alloc() puts it first). */
++static TranslationBlock *porty_tb_of(const void *tb_ptr)
++{
++    return (TranslationBlock *)((uintptr_t)tb_ptr -
++                                ROUND_UP(sizeof(TranslationBlock), qemu_icache_linesize));
++}
++
++/* tb_gen_code(): a new translation; compile it at once if it was hot. */
++void porty_jit_translated(TranslationBlock *tb)
++{
++    uint32_t k = porty_hot_key(tb);
++
++    if ((qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT) && counter_vec_off >= 0 &&
++        ((porty_hot[0][k >> 5] | porty_hot[1][k >> 5]) >> (k & 31) & 1)) {
++        *(int32_t *)((uintptr_t)tb->tc.ptr + counter_vec_off) = INSTANTIATE_NUM;
++        qatomic_inc(&porty_hot_again);
++    }
++}
++
++/*
++ * do_tb_flush(): every translation is gone, so every compiled block is
++ * dead weight that counted against the cap until the cap dropped it; drop
++ * them all now, and start a new generation of what is hot.
++ */
++void porty_jit_tb_flush(void)
++{
++    bool wait_gc = qatomic_read(&porty_jit_wait_gc);
++    int n = instance_running_local;
++
++    if (!(qatomic_read(&porty_jit_policy) & PORTY_JIT_REHOT)) {
++        return;
++    }
++    memcpy(porty_hot[1], porty_hot[0], sizeof(porty_hot[0]));
++    memset(porty_hot[0], 0, sizeof(porty_hot[0]));
++    for (int i = 0; i < n; i++) {
++        instance_running[instance_running_begin].tb = NULL;
++        to_remove_instance[to_remove_instance_idx++] = instance_running[instance_running_begin].fidx;
++        instance_running_local--;
++        instance_running_begin = (instance_running_begin + 1) % INSTANCE_RUNNING_LEN;
++    }
++    if (to_remove_instance_idx > 0) {
++        remove_module_js();
++    }
++    if (!wait_gc && n > 0) {
++        qatomic_sub(&instance_alive_global, n);
++        instance_alive_local -= n;
++    }
++}
++
+ static void add_instance_running_local(int fidx, void *tb_ptr)
+ {
++    {
++        /* Porty: remember that this block was hot. */
++        uint32_t k = porty_hot_key(porty_tb_of(tb_ptr));
++
++        porty_hot[0][k >> 5] |= 1u << (k & 31);
++    }
+     instance_running[instance_running_end].tb = tb_ptr;
+     instance_running[instance_running_end].fidx = fidx;
+ 
+diff --git a/tcg/wasm32.h b/tcg/wasm32.h
+index 8d493a1..72bc264 100644
+--- a/tcg/wasm32.h
++++ b/tcg/wasm32.h
+@@ -37,6 +37,14 @@ int get_core_nums();
+ 
+ void init_wasm32();
+ 
++/*
++ * Porty: tb_gen_code() tells about each new translation, do_tb_flush()
++ * about a flush (what was hot is compiled again at once; see wasm32.c).
++ */
++struct TranslationBlock;
++void porty_jit_translated(struct TranslationBlock *tb);
++void porty_jit_tb_flush(void);
++
+ /*
+  * Executions of a TB before it is compiled to its own Wasm module (until
+  * then TCI interprets it).  Porty: a variable rather than a constant, so the
