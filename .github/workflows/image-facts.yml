@@ -1,0 +1,150 @@
+# Facts from the system image the site publishes, without booting it:
+# files are read out of the ext4 inside the qcow2 (qemu-img, debugfs) and
+# shown or disassembled.  For the guest CPU work (docs/PLAN.md): how
+# surfaceflinger handles deferred transactions (Layer::pushPendingState,
+# Layer::applyPendingStates in libsurfaceflinger.so), what the launcher is
+# granted, what SwiftShader reads.
+#
+# The run never fails, because every failed run emails the repository owner.
+name: Image facts
+
+on:
+  push:
+    branches: [swarm/guest-cpu]
+    paths:
+      - .github/workflows/image-facts.yml
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: C++ functions of libsurfaceflinger.so to disassemble (regular expression on demangled names)
+        default: 'Layer::pushPendingState|Layer::applyPendingStates|Layer::addSyncPoint|SurfaceFlinger::handleMessageTransaction'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  facts:
+    name: Files from the published image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        run: |
+          source build/versions.env
+          echo "iso_sha1=$ANDROID_ISO_SHA1" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the image the site publishes
+        id: image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Files and disassembly
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        env:
+          SYMBOLS: ${{ inputs.symbols || 'Layer::pushPendingState|Layer::applyPendingStates|Layer::addSyncPoint|SurfaceFlinger::handleMessageTransaction' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-utils e2fsprogs binutils
+          dir="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["disk"]["dir"])' out/image/manifest.json)"
+          find "out/image/$dir" -name '*.bin' | wc -l
+          # The chunks of the qcow2, joined, are the qcow2 the site serves.
+          find "out/image/$dir" -name '*.bin' -print0 | sort -z | xargs -0 cat > "$RUNNER_TEMP/system.qcow2"
+          qemu-img info "$RUNNER_TEMP/system.qcow2" | head -8
+          qemu-img convert -O raw "$RUNNER_TEMP/system.qcow2" "$RUNNER_TEMP/system.raw"
+          rm -f "$RUNNER_TEMP/system.qcow2"
+          img="$RUNNER_TEMP/system.raw"
+          mkdir -p out/facts
+          get() { debugfs -R "dump $1 out/facts/$(basename "$1")" "$img" 2>/dev/null && sha256sum "out/facts/$(basename "$1")"; }
+          for f in /lib64/libsurfaceflinger.so /bin/surfaceflinger /etc/init/surfaceflinger.rc /build.prop \
+                   /vendor/lib64/egl/libGLESv2_swiftshader.so /vendor/lib64/egl/libEGL_swiftshader.so \
+                   /lib64/libgui.so /etc/init.sh; do
+            get "$f" || echo "no $f"
+          done
+          # From here on everything is a report: a command that finds
+          # nothing (grep) or a reader that stops early (head) does not stop
+          # the rest.
+          set +e +o pipefail
+          so=out/facts/libsurfaceflinger.so
+          # The fix web/js/boot-diet.js applies (SF_FIX): in
+          # Layer::pushPendingState() (inlined addSyncPoint), "jbe" to the
+          # path for a barrier frame already latched becomes "nop; jmp" to the
+          # same place (0f 86 -> 90 e9), so that no deferred transaction ever
+          # waits for a barrier frame.  The hash of the patched copy is
+          # SF_FIX.patchedSha256.
+          echo "::group::the patched copy"
+          off=$((16#7a4aa))
+          od -A d -t x1 -j "$off" -N 6 "$so"
+          cp "$so" "$RUNNER_TEMP/patched.so"
+          printf '\220\351' | dd of="$RUNNER_TEMP/patched.so" bs=1 seek="$off" conv=notrunc 2>/dev/null
+          od -A d -t x1 -j "$off" -N 6 "$RUNNER_TEMP/patched.so"
+          echo "original $(sha256sum < "$so" | cut -c1-64) patched $(sha256sum < "$RUNNER_TEMP/patched.so" | cut -c1-64) offset $off"
+          objdump -d --start-address=$((16#964a0)) --stop-address=$((16#964c1)) "$RUNNER_TEMP/patched.so" | tail -n +7
+          cmp -l "$so" "$RUNNER_TEMP/patched.so"
+          echo "::endgroup::"
+          echo "::group::surfaceflinger.rc and properties"
+          cat out/facts/surfaceflinger.rc || true
+          grep -i -e privapp -e control_ -e hwui -e 'ro.sf' -e 'debug.sf' -e opengles out/facts/build.prop || true
+          echo "::endgroup::"
+          echo "::group::privapp whitelist entries for the launcher"
+          debugfs -R "ls -l /etc/permissions" "$img" 2>/dev/null | head -60
+          for f in $(debugfs -R "ls /etc/permissions" "$img" 2>/dev/null | tr ' ' '\n' | grep -i privapp); do
+            debugfs -R "cat /etc/permissions/$f" "$img" 2>/dev/null | grep -i -A3 -B1 -e launcher -e REMOTE_APP_TRANSITION || true
+          done
+          echo "::endgroup::"
+          echo "::group::SwiftShader: configuration it reads"
+          strings -n 6 out/facts/libGLESv2_swiftshader.so | grep -i -e 'SwiftShader.ini' -e 'Optimization' -e 'ExactColorRounding' \
+            -e 'ThreadCount' -e 'EnableSSE' -e 'TextureSampleQuality' -e 'PerspectiveCorrection' -e 'SWIFTSHADER' | sort -u | head -40 || true
+          echo "::endgroup::"
+          echo "::group::libsurfaceflinger.so symbols"
+          nm -D -C --defined-only out/facts/libsurfaceflinger.so | grep -E "$SYMBOLS" || true
+          echo "::endgroup::"
+          # Each function: its address and size from the dynamic symbols,
+          # then the disassembly of exactly that range.
+          nm -D --defined-only -S out/facts/libsurfaceflinger.so | awk 'NF == 4' > "$RUNNER_TEMP/syms.txt"
+          while read -r addr size _ name; do
+            demangled="$(echo "$name" | c++filt)"
+            if [[ "$demangled" =~ $SYMBOLS ]]; then
+              start=$((16#$addr)); stop=$((start + 16#$size))
+              echo "::group::$demangled at 0x$addr, $((16#$size)) bytes"
+              objdump -d -C --start-address="$start" --stop-address="$stop" out/facts/libsurfaceflinger.so | tail -n +7
+              echo "::endgroup::"
+            fi
+          done < "$RUNNER_TEMP/syms.txt"
+          # Strings the code above may log, with their addresses.
+          echo "::group::log strings"
+          strings -t x out/facts/libsurfaceflinger.so | grep -e 'sync point' -e 'barrier' -e 'Unable to promote' | head -20 || true
+          echo "::endgroup::"
+          readelf -lW out/facts/libsurfaceflinger.so | grep -e LOAD -e 'Entry' | head -6
+          # The library is stripped: find the code by the strings it logs.
+          # File offset -> address through the first LOAD segment; then the
+          # instructions that load each string's address, with the code
+          # around them.
+          delta=$(( $(readelf -lW "$so" | awk '$1 == "LOAD" { print $3; exit }') - $(readelf -lW "$so" | awk '$1 == "LOAD" { print $2; exit }') ))
+          objdump -d "$so" > "$RUNNER_TEMP/text.s"
+          wc -l "$RUNNER_TEMP/text.s"
+          for text in 'Unable to promote barrier Layer' 'No local sync point found' 'Unexpected sync point frame number'; do
+            off=$(strings -t x "$so" | grep -F "$text" | head -1 | awk '{ print $1 }')
+            [[ -n "$off" ]] || continue
+            addr=$(printf '%x' $(( 16#$off + delta )))
+            echo "::group::code that loads \"$text\" (file offset 0x$off, address 0x$addr)"
+            grep -n "# $addr" "$RUNNER_TEMP/text.s" | head -4
+            line=$(grep -n "# $addr" "$RUNNER_TEMP/text.s" | head -1 | cut -d: -f1)
+            if [[ -n "$line" ]]; then
+              sed -n "$(( line > 160 ? line - 160 : 1 )),$(( line + 90 ))p" "$RUNNER_TEMP/text.s"
+            fi
+            echo "::endgroup::"
+          done

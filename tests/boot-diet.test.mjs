@@ -10,8 +10,8 @@ import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parseConfig } from '../web/js/config.js';
 import {
-    DIET_LEVELS, DIET_SCRIPT, LOWMEM_PROPS, PROVISION, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps, dietScript,
-    parseProps,
+    DIET_LEVELS, DIET_SCRIPT, LOWMEM_PROPS, PROVISION, SF_FIX, TTM_FIX, applyBootDiet, describeDiet, dietArchive, dietFixes, dietProps,
+    dietScript, parseProps,
 } from '../web/js/boot-diet.js';
 import { appendInitramfs, appendOffset, newcArchive, parseNewc } from '../web/js/initramfs.js';
 
@@ -76,15 +76,16 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         ['debug.sf.nobootanimation', '1'], ['pm.dexopt.first-boot', 'extract'], ['pm.dexopt.boot', 'extract'],
         ['ro.lmk.medium', '1001'], ['ro.lmk.critical', '200']]);
     assert.equal(describeDiet(dflt), ' props: debug.sf.nobootanimation=1 pm.dexopt.first-boot=extract pm.dexopt.boot=extract'
-        + ' ro.lmk.medium=1001 ro.lmk.critical=200 ttmfix provisioned');
+        + ' ro.lmk.medium=1001 ro.lmk.critical=200 ttmfix sffix provisioned');
     // the screen must come on: never the quiescent boot
     assert.ok(DIET_LEVELS.flat().every(([k]) => !/quiescent/.test(k)));
 
     const off = parseConfig('?diet=0&lowmem=0', {});
     assert.deepEqual(dietProps(off), []);
-    assert.equal(describeDiet(off), ' props: none ttmfix provisioned');
-    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&setup=1', {})), ' props: none');
-    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0', {})), ' props: none provisioned');
+    assert.equal(describeDiet(off), ' props: none ttmfix sffix provisioned');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0&setup=1', {})), ' props: none');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0&sffix=0', {})), ' props: none provisioned');
+    assert.equal(describeDiet(parseConfig('?diet=0&lowmem=0&ttmfix=0', {})), ' props: none sffix provisioned');
     assert.deepEqual(dietProps(parseConfig('?diet=0&lowmem=0&props=a.b=c', {})), [['a.b', 'c']]);
 
     // lowmem: lmkd's levels, whatever the diet; off with lowmem=0; props override them
@@ -277,6 +278,89 @@ const have = (tool) => spawnSync(tool, ['--help'], { stdio: 'ignore' }).error ==
         out = run();
         assert.equal(String(out.stdout), 'porty: ttm.ko could not be fixed, left alone\n');
         assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-ttm.ko')));
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+// --- surfaceflinger's deferred transactions (libsurfaceflinger.so) -------------------------
+{
+    // On by default, whatever else is asked for; off with sffix=0.
+    assert.equal(parseConfig('', {}).sffix, true);
+    assert.equal(dietFixes(parseConfig('', {})).sf, SF_FIX);
+    assert.equal(dietFixes(parseConfig('?diet=0&lowmem=0&ttmfix=0&gfx=vesa&setup=1', {})).sf, SF_FIX);
+    assert.equal(dietFixes(parseConfig('?sffix=0', {})).sf, false);
+    assert.equal(describeDiet(parseConfig('?sffix=0', {})).includes('sffix'), false);
+
+    // What is known about the library: the jbe of Layer::pushPendingState
+    // at 0x964aa (the first LOAD segment maps file offset 0 to 0x1c000)
+    // becomes "nop; jmp" with the same displacement.
+    assert.equal(SF_FIX.module, 'system/lib64/libsurfaceflinger.so');
+    assert.equal(SF_FIX.offset, 0x964aa - 0x1c000);
+    assert.deepEqual(SF_FIX.bytes, [0x90, 0xe9]);
+    assert.match(SF_FIX.sha256, /^[0-9a-f]{64}$/);
+    assert.match(SF_FIX.patchedSha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(SF_FIX.sha256, SF_FIX.patchedSha256);
+    assert.notEqual(SF_FIX.sha256, TTM_FIX.sha256);
+
+    // The script: after the module fix, before the provisioning; alone, too.
+    const props = dietProps(parseConfig('', {}));
+    const withTtm = dietScript(props, { ttm: TTM_FIX });
+    const both = dietScript(props, { ttm: TTM_FIX, sf: SF_FIX });
+    assert.ok(both.startsWith(withTtm.slice(0, -1)), 'the library fix follows the module fix');
+    assert.match(both, /\n\tprintf '\\220\\351' \| dd of=porty-libsurfaceflinger\.so bs=1 seek=500906 conv=notrunc 2>\/dev\/null\n/);
+    assert.match(both, /&& mount --bind porty-libsurfaceflinger\.so \$porty_m; then\n/);
+    const all = dietScript(props, { ttm: TTM_FIX, sf: SF_FIX, provision: PROVISION });
+    assert.ok(all.indexOf('porty-libsurfaceflinger.so') < all.indexOf('porty_provision'));
+    const initrd = new Uint8Array([0x1f, 0x8b, 8, 0, 0]);
+    assert.equal(applyBootDiet(initrd, [], { ttm: false, sf: false }), initrd);
+    assert.equal(ascii(parseNewc(applyBootDiet(initrd, [], { sf: SF_FIX }), 8).entries[1].data), dietScript([], { sf: SF_FIX }));
+    for (const bad of [{ module: 'lib/../../x' }, { sha256: 'x' }, { offset: -2 }, { bytes: [0x90, 300] }]) {
+        assert.throws(() => dietScript([], { sf: { ...SF_FIX, ...bad } }), /bad module fix/, JSON.stringify(bad));
+    }
+
+    // Run it like /init does, after the module fix, against stand-ins for
+    // both files ("mount" records what it was asked to do).
+    const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+    const lib = new Uint8Array(SF_FIX.offset + 4096).map((_, i) => (i * 13 + 5) % 256);
+    lib.set([0x48, 0x39, 0xc8, 0x0f, 0x86, 0x01, 0x01, 0x00, 0x00], SF_FIX.offset - 3);
+    const libPatched = lib.slice();
+    libPatched.set(SF_FIX.bytes, SF_FIX.offset);
+    const sf = { ...SF_FIX, sha256: sha256(lib), patchedSha256: sha256(libPatched) };
+    const shell = have('busybox') ? ['busybox', 'sh'] : ['sh'];
+    const dir = mkdtempSync(path.join(tmpdir(), 'porty-sf-'));
+    const run = () => spawnSync(shell[0], [...shell.slice(1), '-c',
+        'mount() { echo "mount $*" >> mounts; }; . ./script'], { cwd: dir, input: '', env: { ...process.env } });
+    try {
+        writeFileSync(path.join(dir, 'default.prop'), 'ro.debuggable=1\n');
+        writeFileSync(path.join(dir, 'script'), dietScript([], { sf }));
+        let out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: no libsurfaceflinger.so, nothing to fix\n');
+
+        const file = path.join(dir, sf.module);
+        mkdirSync(path.dirname(file), { recursive: true });
+        writeFileSync(file, lib);
+        writeFileSync(path.join(dir, 'script'), dietScript([], { sf }));
+        out = run();
+        assert.equal(out.status, 0, String(out.stderr));
+        assert.equal(String(out.stdout), 'porty: libsurfaceflinger.so fixed (2 bytes at 500906)\n');
+        assert.equal(readFileSync(path.join(dir, 'mounts'), 'utf8'), `mount --bind porty-libsurfaceflinger.so ${sf.module}\n`);
+        const copy = readFileSync(path.join(dir, 'porty-libsurfaceflinger.so'));
+        const changed = [...copy].map((b, i) => (b === lib[i] ? -1 : i)).filter((i) => i >= 0);
+        assert.deepEqual(changed, [500906, 500907]);
+        assert.deepEqual([...copy.subarray(SF_FIX.offset - 3, SF_FIX.offset + 6)], [0x48, 0x39, 0xc8, 0x90, 0xe9, 0x01, 0x01, 0x00, 0x00]);
+        assert.deepEqual([...readFileSync(file)], [...lib], 'the shipped library itself is not written to');
+
+        // another build of the library: left alone
+        rmSync(path.join(dir, 'mounts'));
+        rmSync(path.join(dir, 'porty-libsurfaceflinger.so'));
+        const other = lib.slice();
+        other[7] ^= 1;
+        writeFileSync(file, other);
+        out = run();
+        assert.equal(String(out.stdout), 'porty: libsurfaceflinger.so is not the one known, left alone\n');
+        assert.ok(!existsSync(path.join(dir, 'mounts')) && !existsSync(path.join(dir, 'porty-libsurfaceflinger.so')));
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

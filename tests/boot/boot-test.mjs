@@ -58,6 +58,7 @@ import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
 import path from 'node:path';
+import { PCPU_FUNCTION, cpuDelta, describeCpu, parseCpuLine } from './cpu-probe.mjs';
 
 const require = createRequire(path.join(process.env.PUPPETEER_DIR || process.cwd(), 'noop.js'));
 const puppeteer = require('puppeteer-core');
@@ -458,6 +459,16 @@ async function dumpFiles() {
  * the search bar with the mouse, and reports what the page saw, what has
  * the focus, and screenshots after each.
  */
+// Where the guest's CPU goes during the launch (tests/boot/cpu-probe.mjs):
+// a snapshot before the tap, one every PROBE_CPU_EVERY rounds of guest
+// samples (default 2, about every minute) and one at the end; PROBE_CPU=0
+// takes none.
+const probeCpu = process.env.PROBE_CPU !== '0';
+const probeCpuEvery = num('PROBE_CPU_EVERY', 2, 1, 100);
+// surfaceflinger's frames per layer (TimeStats) from the tap to the end;
+// PROBE_SFSTATS=0: not asked for.
+const probeSfStats = process.env.PROBE_SFSTATS !== '0';
+
 async function inputProbe() {
     const send = (cmd) => page.evaluate((c) => globalThis.__send(c), cmd);
     // Print the serial output as it comes, so that it lands between the
@@ -465,7 +476,7 @@ async function inputProbe() {
     let lastFocus = '';
     // Marker lines of the guest, newest of each kind (the output of the
     // commands, never their echo: an echo has "$(" after the colon).
-    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map(), top: [] };
+    const marks = { st: null, ps: null, lmk: null, cal: 0, clock: null, events: new Map(), top: [], cpu: new Map() };
     let pendingLine = '';
     let logDone = 0;
     const sleep = async (ms) => {
@@ -474,6 +485,13 @@ async function inputProbe() {
         const lines = (pendingLine + stripAnsi(text)).split('\n');
         pendingLine = lines.pop();
         for (const line of lines) {
+            // The CPU lines are many; they are reported, not echoed.
+            if (parseCpuLine(line.replace(/\r$/, ''), marks.cpu)) {
+                if (/^CP[SE]\|/.test(line)) {
+                    log(`INPUT PROBE: cpu snapshot ${line.replace(/\r$/, '').slice(0, 120)}`);
+                }
+                continue;
+            }
             if (line.trim()) {
                 console.log(`serial| ${line.replace(/\r$/, '')}`);
             }
@@ -528,6 +546,9 @@ async function inputProbe() {
             }
             if (/LOGDONE:2:END/.test(line)) {
                 logDone = Date.now();
+            }
+            if (/SFTSDONE:2:END/.test(line)) {
+                marks.sfts = 'done';
             }
             if (/CALDONE:\d+:END/.test(line) && !marks.cal) {
                 marks.cal = Date.now();
@@ -630,6 +651,7 @@ async function inputProbe() {
         const stats = document.getElementById('stats');
         return {
             diff,
+            frames: e && e.display && e.display.guestFrames !== undefined ? e.display.guestFrames : -1,
             fps: Number((/^(\d+) fps/.exec(stats ? stats.textContent : '') || [])[1] || -1),
             disk: e && e.diskStats ? e.diskStats() : null,
             heap: e && e.heapStats ? e.heapStats() : null,
@@ -709,6 +731,48 @@ async function inputProbe() {
     }
     log(`INPUT PROBE: the event log ${logDone ? 'answered' : 'did not answer in 180 s'} before the tap`);
     logDone = 0;
+    // A pcpu snapshot: wait for its end marker (or give up after `ms`).
+    const cpuSnap = async (tag, threads, ms) => {
+        if (!probeCpu) {
+            return null;
+        }
+        const t = Date.now();
+        marks.cpu.set(tag, { tag, at: t, procs: new Map(), threads: new Map(), done: false });
+        // Real-time for the snapshot: surfaceflinger's threads are
+        // SCHED_FIFO, and while it composes over and over a shell at nice
+        // -20 waits minutes for its turn (run 43980055445).  toybox's chrt
+        // takes the pid before the priority.
+        await send(`chrt -f -p $$ 99 > /dev/null 2>&1; pcpu ${tag}${threads ? ' threads' : ''}; chrt -o -p $$ 0 > /dev/null 2>&1\r`);
+        while (!(marks.cpu.get(tag) || {}).done && Date.now() - t < ms) {
+            await sleep(2000);
+        }
+        const s = marks.cpu.get(tag);
+        log(`INPUT PROBE: cpu snapshot ${tag}: ${s && s.done ? `${s.procs.size} processes, ${s.threads.size} threads, ` +
+            `sf frames ${s.frames}, in ${Math.round((Date.now() - t) / 1000)} s` : `incomplete after ${Math.round(ms / 1000)} s`}`);
+        return s && s.done ? s : null;
+    };
+    if (probeCpu) {
+        await send(`${PCPU_FUNCTION}\r`);
+        await sleep(3000);
+    }
+    // surfaceflinger's own count of the frames it composes, per layer
+    // (TimeStats, Android 9): on and cleared now, read at the end.  Both
+    // are binder calls (and a permission check with system_server), so
+    // they stay out of the launch.
+    const sfStats = async (cmd, ms) => {
+        if (!probeSfStats) {
+            return;
+        }
+        marks.sfts = '';
+        const t = Date.now();
+        await send(`${cmd}; echo SFTSDONE:$((1+1)):END\r`);
+        while (marks.sfts !== 'done' && Date.now() - t < ms) {
+            await sleep(2000);
+        }
+    };
+    await sfStats('dumpsys SurfaceFlinger --timestats -enable -clear > /dev/null 2>&1', 60000);
+    const cpuBefore = await cpuSnap('before', true, 180000);
+    const cpuTags = cpuBefore ? ['before'] : [];
     let prevSt = marks.st;
     let prevPs = marks.ps;
     const before = await pageSample(true);
@@ -734,9 +798,20 @@ async function inputProbe() {
     const timeline = [];
     let lastDiff = 0;
     while (Date.now() - tapAt < probeWaitMs) {
-        if (guestEveryMs && Date.now() >= nextGuest) {
+        // Nothing new is typed while a CPU snapshot is still printing: the
+        // terminal's echo of typed text lands in the middle of its lines.
+        const lastCpu = cpuTags.length ? marks.cpu.get(cpuTags[cpuTags.length - 1]) : null;
+        const cpuBusy = lastCpu && !lastCpu.done && Date.now() - lastCpu.at < 300000;
+        if (guestEveryMs && Date.now() >= nextGuest && !cpuBusy) {
             nextGuest = Date.now() + guestEveryMs;
-            await send(`${guestSample}${guestRound++ % 2 === 1 ? `; ${guestTop}` : ''}\r`);
+            const round = guestRound++;
+            // Every PROBE_CPU_EVERY-th round a CPU snapshot instead of top.
+            const cpuTag = cpuBefore && round % probeCpuEvery === probeCpuEvery - 1 ? `t${since()}` : '';
+            if (cpuTag) {
+                cpuTags.push(cpuTag);
+                marks.cpu.set(cpuTag, { tag: cpuTag, at: Date.now(), procs: new Map(), threads: new Map(), done: false });
+            }
+            await send(`${guestSample}${cpuTag ? `; pcpu ${cpuTag}` : (round % 2 === 1 ? `; ${guestTop}` : '')}\r`);
         }
         await sleep(5000);
         let now;
@@ -820,6 +895,37 @@ async function inputProbe() {
     log(`INPUT PROBE: how much of the screen differed from the home screen, when it changed: ${result.screenTimeline || 'never'}`);
     for (const line of marks.top) {
         log(`INPUT PROBE: top| ${line}`);
+    }
+    // Where the guest's CPU went: from the tap to now, and between the
+    // snapshots taken during the launch.
+    const cpuEnd = cpuBefore ? await cpuSnap('end', true, 240000) : null;
+    await sfStats('dumpsys SurfaceFlinger --timestats -dump -maxlayers 16 2>&1 | grep -E ' +
+        '"layerName|totalFrames|droppedFrames|missedFrames|clientCompositionFrames|statsStart|statsEnd|displayOnTime" ' +
+        '| sed "s/^/SFTS|/"', 120000);
+    if (cpuEnd) {
+        cpuTags.push('end');
+        const whole = cpuDelta(cpuBefore, cpuEnd);
+        log(`INPUT PROBE: CPU from the tap to the end: ${describeCpu(whole, 16)}`);
+        const pct = (v) => `${Math.round((1000 * v) / Math.max(1, whole.busy)) / 10}%`;
+        for (const p of whole.procs.slice(0, 30)) {
+            log(`INPUT PROBE: cpu| process ${p.comm}${p.isNew ? ' (new)' : ''} pid ${p.pid}: ${p.ticks} ticks, ${pct(p.ticks)}`);
+        }
+        for (const t of whole.threads.slice(0, 40)) {
+            log(`INPUT PROBE: cpu| thread ${t.proc}/${t.comm} tid ${t.tid} (nice ${t.nice}, policy ${t.policy}): ${t.ticks} ticks, ${pct(t.ticks)}`);
+        }
+        const done = cpuTags.map((tag) => marks.cpu.get(tag)).filter((s) => s && s.done && s.stat);
+        for (let i = 1; i < done.length; i++) {
+            log(`INPUT PROBE: cpu ${done[i - 1].tag} -> ${done[i].tag}: ${describeCpu(cpuDelta(done[i - 1], done[i]), 6)}`);
+        }
+        const shown = await pageSample(false).catch(() => null);
+        const displayUpdates = shown && shown.frames >= 0 && before.frames >= 0 ? shown.frames - before.frames : -1;
+        log(`INPUT PROBE: QEMU's display was updated ${displayUpdates} times from the tap to the end`);
+        result.cpu = {
+            busy: whole.busy, total: whole.total, user: whole.user, system: whole.system, guestSeconds: whole.guestSeconds,
+            sfFrames: whole.frames, displayUpdates, uncounted: whole.uncounted,
+            top: whole.procs.slice(0, 10).map((p) => [p.comm, p.ticks]),
+            threads: whole.threads.slice(0, 12).map((t) => [`${t.proc}/${t.comm}`, t.ticks]),
+        };
     }
     // The event log's own account, in guest time since the tap.
     const clock1 = await guestClock();

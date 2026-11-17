@@ -1,0 +1,294 @@
+# Compares Gallery launches in headless Chrome between page settings, all in
+# one job on one runner: assembles the site of a ref from the caches (as
+# branch-boot-test.yml does, with the resume snapshot when one is cached for
+# it), and then visits it once per variant and round in the same browser
+# profile, each visit resuming the saved Android and tapping Gallery
+# (tests/boot/boot-test.mjs with PROBE_STEPS=launch).  Runners differ by more
+# than 2x in guest speed, so variants are only compared within a job.
+#
+# A variant is a query (page parameters that keep the resume, such as jit=,
+# jitcap= or jitgc=) and optionally a command line typed into Android's root
+# shell when it answers (for properties an app reads when it starts, such
+# as debug.hwui.renderer, or scheduling), " @@ " between variants.  Page parameters that shape the machine veto the
+# resume and boot instead (web/js/snapshot.js, MACHINE_PARAMS).
+#
+# With baseline_ref (e.g. main), the job also assembles that ref's site
+# with that ref's snapshot and visits both alternately: guest-side changes
+# need a snapshot of their own, and this compares them on one runner.
+#
+#   gh workflow run launch-compare.yml -R <owner>/<repo> --ref swarm/<you> \
+#     -f queries='wasmmem=1280&jitcap=15000;wasmmem=1280&jitcap=15000&jitgc=0' -f rounds=2
+#
+# The run never fails, because every failed run emails the repository
+# owner.  The verdict is the commit status "porty/launch-compare ..." and
+# the job summary (tests/boot/launch-report.py); the log has everything else.
+name: Launch compare
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to test (default, the branch the run is started on)
+        type: string
+        default: ''
+      queries:
+        description: Page parameters per variant, separated by ";"
+        type: string
+        default: 'wasmmem=1280&jitcap=15000'
+      shells:
+        description: Shell command lines per variant, separated by " @@ " in the same order (may be empty)
+        type: string
+        default: ''
+      rounds:
+        description: Rounds over all variants (the order is reversed every other round)
+        type: number
+        default: 1
+      probe_wait:
+        description: Seconds the probe follows the launch after the tap
+        type: number
+        default: 420
+      env:
+        description: More environment for the boot test, NAME=value separated by spaces
+        type: string
+        default: ''
+      baseline_ref:
+        description: A second ref (e.g. main) whose own site, with its own snapshot, is visited the same way in the same job
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: launch-compare-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.queries }}-${{ inputs.shells }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  compare:
+    name: Gallery launches by variant
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Read pinned versions
+        id: versions
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          source build/versions.env
+          {
+            echo "qemu_commit=$QEMU_WASM_COMMIT"
+            echo "wasm_memory_mb=$WASM_MEMORY_MB"
+            echo "iso_sha1=$ANDROID_ISO_SHA1"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          git log -1 --oneline
+
+      # The keys of build-and-deploy.yml, branch-check.yml and snapshot.yml.
+      - name: Restore the QEMU-Wasm build
+        id: qemu-cache
+        if: steps.versions.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/qemu
+          key: qemu-${{ steps.versions.outputs.qemu_commit }}-${{ steps.versions.outputs.wasm_memory_mb }}-${{ hashFiles('patches/qemu-wasm/**', 'build/build-qemu.sh', 'build/pc-bios.list', 'scripts/wasm-info.py') }}
+
+      - name: Restore the prepared Android image
+        id: image-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/image
+          key: android-image-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}
+
+      - name: Restore the resume snapshot
+        id: snapshot-cache
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/artifact/snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('scripts/prepare-image.sh', 'scripts/slim-system.py', 'build/slim-remove.list', 'build/versions.env') }}-${{ hashFiles('patches/qemu-wasm/**') }}-${{ hashFiles('web/js/qemu-args.js', 'web/js/config.js', 'web/js/boot-diet.js', 'web/js/initramfs.js', 'scripts/snapshot/**') }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        with:
+          node-version: 22
+
+      - name: Assemble the site
+        id: site
+        if: steps.qemu-cache.outputs.cache-hit == 'true' && steps.image-cache.outputs.cache-hit == 'true' && steps.snapshot-cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        env:
+          SHA: ${{ steps.versions.outputs.sha }}
+        run: |
+          (cd web && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd tests/ui && npm ci --ignore-scripts --no-audit --no-fund)
+          scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist --id "$SHA" --snapshot out/artifact/snapshot
+          du -sb dist
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: base-checkout
+        if: inputs.baseline_ref != '' && steps.site.outcome == 'success'
+        continue-on-error: true
+        with:
+          ref: ${{ inputs.baseline_ref }}
+          path: base
+          persist-credentials: false
+
+      # The baseline's snapshot, under the key its own files give (the same
+      # key snapshot.yml saved it under) and at the path snapshot.yml saved
+      # it from: a cache entry is only found with the same path.  The test
+      # site has its own copy in dist by now.
+      - name: Make room for the baseline's snapshot
+        id: base-room
+        if: steps.base-checkout.outcome == 'success'
+        continue-on-error: true
+        run: rm -rf out/artifact/snapshot
+
+      - name: Restore the baseline's resume snapshot
+        id: base-snapshot
+        if: steps.base-room.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out/artifact/snapshot
+          key: android-snapshot-${{ steps.versions.outputs.iso_sha1 }}-${{ hashFiles('base/scripts/prepare-image.sh', 'base/scripts/slim-system.py', 'base/build/slim-remove.list', 'base/build/versions.env') }}-${{ hashFiles('base/patches/qemu-wasm/**') }}-${{ hashFiles('base/web/js/qemu-args.js', 'base/web/js/config.js', 'base/web/js/boot-diet.js', 'base/web/js/initramfs.js', 'base/scripts/snapshot/**') }}
+
+      - name: Assemble the baseline's site
+        id: base-site
+        if: steps.base-snapshot.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: |
+          # Same QEMU-Wasm build and image, or the comparison means nothing.
+          cmp -s build/versions.env base/build/versions.env
+          diff -r -q patches/qemu-wasm base/patches/qemu-wasm
+          (cd base/web && npm ci --ignore-scripts --no-audit --no-fund)
+          base/scripts/assemble-site.sh --qemu out/qemu --image out/image --out dist-base \
+            --id "$(git -C base rev-parse HEAD)" --snapshot out/artifact/snapshot
+          du -sb dist-base
+
+      - name: Visits
+        id: visits
+        if: steps.site.outcome == 'success'
+        continue-on-error: true
+        env:
+          PUPPETEER_DIR: ${{ github.workspace }}/tests/ui
+          QUERIES: ${{ inputs.queries || 'wasmmem=1280&jitcap=15000' }}
+          SHELLS: ${{ inputs.shells }}
+          ROUNDS: ${{ inputs.rounds || 1 }}
+          PROBE_WAIT_S: ${{ inputs.probe_wait || 420 }}
+          EXTRA_ENV: ${{ inputs.env }}
+          BASELINE: ${{ steps.base-site.outcome == 'success' && 'yes' || '' }}
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium)"
+          export CHROME SITE_URL="http://127.0.0.1:8080/"
+          cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || true)"
+          echo "runner CPU: ${cpu:-unknown}, $(nproc) threads"
+          work="$RUNNER_TEMP/compare"
+          mkdir -p "$work"
+          for pair in $EXTRA_ENV; do
+            if [[ "$pair" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_.,:/@%+=-]*$ ]]; then
+              export "${pair?}"
+              echo "boot test environment: $pair"
+            else
+              echo "::warning::ignored '$pair' (not NAME=value)"
+            fi
+          done
+          export PROBE_STEPS=launch PROBE_WAIT="$PROBE_WAIT_S" MINUTES=45
+          # One profile per site for every visit: after the first, the saved
+          # Android comes from the device (the disk cache), as for a
+          # returning visitor.
+          python3 tests/ui/serve.py dist 8080 "--log=$work/server.log" --isolate &
+          servers=("$!")
+          sites=(test)
+          if [[ -n "$BASELINE" ]]; then
+            python3 tests/ui/serve.py dist-base 8081 "--log=$work/server-base.log" --isolate &
+            servers+=("$!")
+            sites+=(base)
+          fi
+          for port in 8080 8081; do
+            for _ in $(seq 50); do
+              curl -fsS -o /dev/null "http://127.0.0.1:$port/index.html" 2>/dev/null && break
+              sleep 0.2
+            done
+          done
+          IFS=';' read -r -a queries <<< "$QUERIES"
+          shells=()
+          if [[ -n "$SHELLS" ]]; then
+            mapfile -t shells < <(printf '%s\n' "$SHELLS" | sed 's/ @@ /\n/g')
+          fi
+          n=${#queries[@]}
+          : > "$work/visits.txt"
+          m=${#sites[@]}
+          for round in $(seq "$ROUNDS"); do
+            for k in $(seq 0 $((n * m - 1))); do
+              j=$k
+              (( round % 2 == 0 )) && j=$((n * m - 1 - k))
+              i=$((j / m)) site="${sites[$((j % m))]}"
+              export QUERY="${queries[$i]}" SHELL_INIT="${shells[$i]:-}"
+              export USER_DATA_DIR="$work/profile-$site"
+              if [[ "$site" == base ]]; then SITE_URL="http://127.0.0.1:8081/"; else SITE_URL="http://127.0.0.1:8080/"; fi
+              export SITE_URL
+              label="v$((i + 1))${BASELINE:+ $site} r$round ${QUERY}${SHELL_INIT:+ sh: $SHELL_INIT}"
+              echo "::group::$label"
+              node tests/boot/boot-test.mjs 2>&1 | tee "$work/visit-$site-$i-$round.log" || true
+              echo "::endgroup::"
+              printf '%s=%s\n' "${label//=/:}" "$work/visit-$site-$i-$round.log" >> "$work/visits.txt"
+            done
+          done
+          kill "${servers[@]}" 2>/dev/null || true
+
+      - name: Summary
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.versions.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          QEMU: ${{ steps.qemu-cache.outputs.cache-hit }}
+          IMAGE: ${{ steps.image-cache.outputs.cache-hit }}
+          SNAPSHOT: ${{ steps.snapshot-cache.outputs.cache-hit }}
+          QUERIES: ${{ inputs.queries }}
+        run: |
+          set +e
+          work="$RUNNER_TEMP/compare"
+          if [[ -s "$work/visits.txt" ]]; then
+            mapfile -t args < "$work/visits.txt"
+            details="$(python3 -I tests/boot/launch-report.py "${args[@]}" 2>&1)"
+          else
+            details="failed: no visits (QEMU-Wasm cached: ${QEMU:-no}, image: ${IMAGE:-no}, snapshot: ${SNAPSHOT:-no})"
+          fi
+          first="$(sed -n 1p <<<"$details")"
+          state=success
+          grep -q '^ok' <<<"$first" || state=error
+          echo "$details"
+          {
+            echo "## Launch compare"
+            echo
+            echo "Runner CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+            echo
+            sed -n '1,$p' <<<"$details"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "${SHA:-}" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" -f state="$state" \
+              -f context="$(printf 'porty/launch-compare %s' "$QUERIES" | cut -c1-100)" \
+              -f description="${first:0:139}" -f target_url="$RUN_URL" >/dev/null || true
+          fi
+          exit 0
