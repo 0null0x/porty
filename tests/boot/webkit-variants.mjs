@@ -29,6 +29,8 @@
 //                     local=1             the page's own files from this
 //                                         checkout's web/ (LOCAL_WEB), the
 //                                         rest from the site (site-proxy.mjs)
+//                     use=<minutes>       after the probe, start apps from the
+//                                         shell for this long (USE_MINUTES)
 //                   e.g. "name=base; name=nostack JSC_exceptionStackTraceLimit=0"
 //   BASE_QUERY      page parameters of every variant (default
 //                   wasmmem=1280&jitcap=4000)
@@ -70,7 +72,7 @@ export function parseVariant(text, base = '') {
     const words = text.trim().split(/\s+/).filter(Boolean);
     const v = {
         name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, proxy: false, local: false,
-        qemu: '', browser: 'webkit', mlwait: '', words: [],
+        qemu: '', browser: 'webkit', mlwait: '', use: 0, words: [],
     };
     for (const w of words) {
         if (!WORD.test(w)) {
@@ -104,6 +106,8 @@ export function parseVariant(text, base = '') {
             v.mlwait = /^\d{1,4}$/.test(value) ? value : '';
         } else if (key === 'loops') {
             v.loops = Math.max(1, Math.min(12, Number(value) || 3));
+        } else if (key === 'use') {
+            v.use = Math.max(0, Math.min(120, Number(value) || 0));
         }
     }
     v.query = v.query.toString();
@@ -221,6 +225,7 @@ function runOne(v, index) {
             PROBE_SECONDS: String(probeSeconds),
             PROBE: v.probe ? '1' : '0',
             LOOP_ROUNDS: String(v.loops),
+            USE_MINUTES: String(v.use),
             STATUS_CONTEXT: `porty/webkit-mem r${replica} ${v.name}`,
             VARIANT: v.name,
             ...(gcLog ? { DEBUG: 'pw:browser' } : {}),
@@ -315,6 +320,8 @@ function row(v, r) {
         biggest: res.qemu && res.qemu.functions ? (res.qemu.functions.hot || []).slice(0, 8) : [],
         // Patches 0022-0024: the module ring and the cache policies, at the end of the run.
         ring: res.ring || null,
+        // use=<minutes>: apps started from the shell after the probe, and memory meanwhile.
+        use: res.use || null,
         exit: r.code,
     };
 }

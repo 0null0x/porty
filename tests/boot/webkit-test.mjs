@@ -114,6 +114,9 @@ const glue = (process.env.GLUE || '').split(/[\s,+]+/).filter((g) => /^[a-z0-9-]
 const scanBlocksAtEnd = process.env.SCAN !== '0';
 const probeAfterLoops = process.env.PROBE !== '0';
 const loopRounds = Math.max(1, Math.min(12, Number(process.env.LOOP_ROUNDS) || 3));
+// After the probe: start apps from the shell for this many minutes ("use"),
+// and watch the memory meanwhile (does it level off?).
+const useMinutes = Math.max(0, Math.min(120, Number(process.env.USE_MINUTES) || 0));
 const variantName = (process.env.VARIANT || '').replace(/[^A-Za-z0-9_=&.,:%+ -]/g, '').slice(0, 60);
 // Patch 0017: the main loop's longest wait in ms, set once QEMU runs (0: spin as before).
 const mlWait = /^\d{1,4}$/.test(process.env.MLWAIT || '') ? Number(process.env.MLWAIT) : null;
@@ -1507,7 +1510,7 @@ async function pageState() {
             if (e && e.module && typeof e.module._porty_jit_ring_stats === 'function') {
                 ring = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_ring_stats() >>> 0, 6));
                 jitx = Array.from(new Uint32Array(e.memory.buffer, e.module._porty_jit_stats() >>> 0,
-                    typeof e.module._porty_set_jit_gc_wait_ms === 'function' ? 7 : 6));
+                    typeof e.module._porty_set_jit_gc_wait_ms === 'function' ? 9 : 6));
             }
             // Patch 0018: how full the wasm32 backend's per-TB tables get (tests/boot/tcg-tables.mjs).
             if (e && e.module && typeof e.module._porty_tcg_stats === 'function') {
@@ -1593,7 +1596,8 @@ async function sample(label, every = 10000) {
         // [5] translated again after that and compiled at once; porty_jit_stats() [4]
         // compiled at once after a flush, [5] kept at a drop.
         result.ring = { kb: s.ring[0], stashed: s.ring[1], stashedKb: s.ring[2], laps: s.ring[3], gone: s.ring[4],
-            regone: s.ring[5], rehot: s.jitx[4], kept: s.jitx[5], gcWriteOffs: s.jitx[6] ?? null };
+            regone: s.ring[5], rehot: s.jitx[4], kept: s.jitx[5], gcWriteOffs: s.jitx[6] ?? null,
+            gcUnreported: s.jitx[7] ?? null, gcPending: s.jitx[8] ?? null };
     }
     log(`SAMPLE ${label}: state=${s.state} pill="${s.pill}" lit=${s.lit}% bright=${s.bright}% jit=${h.jitAlive}/${h.jitCompiled} ` +
         `heap=${h.used}/${h.brk}MB disk=${row.diskMb}MB stats="${s.stats}"${s.tci ? ` tci=${s.tci.join('/')}` : ''}` +
@@ -1604,7 +1608,8 @@ async function sample(label, every = 10000) {
         (s.ring ? ` | RING ${s.ring[0]} KiB: ${s.ring[1]} modules (${s.ring[2]} KiB) in ${s.ring[3]} laps, ${s.ring[4]} gone ` +
             `(${s.ring[5]} translated again and compiled at once); ` +
             `compiled at once after a flush ${s.jitx[4]}, kept at drops ${s.jitx[5]}` +
-            (s.jitx[6] !== undefined ? `, stopped waiting for the collector ${s.jitx[6]} times` : '') : ''));
+            (s.jitx[6] !== undefined ? `, stopped waiting for the collector ${s.jitx[6]} times ` +
+                `(${s.jitx[7]} written off and unreported, ${s.jitx[8]} dropped and still counting)` : '') : ''));
     const tcg = tcgTables(s.tcg);
     if (tcg && JSON.stringify(tcg) !== JSON.stringify(result.tcg)) {
         log(`TCG TABLES: ${describeTcgTables(tcg)} ${JSON.stringify(tcg)}`);
@@ -1773,6 +1778,79 @@ async function boot() {
     }
     await sample('before-tap', 0);
     return true;
+}
+
+/**
+ * USE_MINUTES: start one app after another from the guest's shell (each for
+ * 20 s, then the home screen), sampling memory and the JIT every 30 s, so
+ * that what the browser holds can be seen to level off or not.
+ */
+async function usePhase() {
+    const starts = [
+        'am start -n com.android.settings/.Settings',
+        'am start -n com.android.gallery3d/.app.GalleryActivity',
+        'am start -a android.intent.action.MAIN -c android.intent.category.APP_CALCULATOR',
+        'am start -a android.intent.action.MAIN -c android.intent.category.APP_CONTACTS',
+        'am start -a android.intent.action.MAIN -c android.intent.category.APP_CALENDAR',
+        'am start -a android.intent.action.MAIN -c android.intent.category.APP_MUSIC',
+        'am start -a android.intent.action.MAIN -c android.intent.category.APP_BROWSER',
+    ];
+    const u = { minutes: useMinutes, starts: 0, answered: 0, rss: [] };
+    result.use = u;
+    const tEnd = Math.min(Date.now() + useMinutes * 60000, t0 + minutes * 60000);
+    log(`USE: starting apps from the shell for ${useMinutes} min`);
+    const waitSerial = async (needle, ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms && !result.crashed) {
+            await sleep(500);
+            await drainSerial();
+            if (serialAll.includes(needle)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const rest = async (ms) => {
+        const t = Date.now();
+        while (Date.now() - t < ms && Date.now() < tEnd && !result.crashed) {
+            await sleep(2000);
+            await drainSerial();
+            const n = result.jit.length;
+            await sample('use', 30000);
+            const row = result.jit.length > n ? result.jit[result.jit.length - 1] : null;
+            if (row && Number.isFinite(row.rss)) {
+                // [s, RSS MiB, alive, written off and unreported, dropped and still counting]
+                u.rss.push([row.t, row.rss, row.alive ?? null, row.jitx ? row.jitx[7] ?? null : null,
+                    row.jitx ? row.jitx[8] ?? null : null]);
+            }
+        }
+    };
+    for (let i = 0; Date.now() < tEnd && !result.crashed; i++) {
+        serialAll = '';
+        await send(`${starts[i % starts.length]} >/dev/null 2>&1; echo USE${i}:END\r`);
+        u.starts++;
+        if (await waitSerial(`USE${i}:END`, 90000)) {
+            u.answered++;
+        }
+        await rest(20000);
+        await send('input keyevent 3\r');
+        await rest(5000);
+    }
+    const r = u.rss.map((x) => x[1]);
+    if (r.length) {
+        const half = r.slice(Math.floor(r.length / 2));
+        u.rssFirst = r[0];
+        u.rssMax = Math.max(...r);
+        u.rssLast = r[r.length - 1];
+        u.rssMaxFirstHalf = Math.max(...r.slice(0, Math.max(1, Math.floor(r.length / 2))));
+        u.rssMaxSecondHalf = Math.max(...half);
+        const un = u.rss.map((x) => x[3]).filter(Number.isFinite);
+        u.unreportedMax = un.length ? Math.max(...un) : null;
+    }
+    log(`USE: ${u.starts} app starts (${u.answered} answered); RSS ${u.rssFirst} -> max ${u.rssMax} ` +
+        `(first half ${u.rssMaxFirstHalf}, second half ${u.rssMaxSecondHalf}) -> ${u.rssLast} MiB; ` +
+        `written off and unreported at most ${u.unreportedMax}`);
+    log(`USE RSS: ${JSON.stringify(u.rss)}`);
 }
 
 async function inputProbe() {
@@ -2321,6 +2399,9 @@ try {
         if (await boot()) {
             if (probeAfterLoops) {
                 await inputProbe();
+                if (useMinutes > 0) {
+                    await usePhase();
+                }
             } else {
                 for (let i = 0; i < 3 && !result.crashed; i++) {
                     await sleep(10000);
