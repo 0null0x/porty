@@ -1182,6 +1182,14 @@ async function inputProbe() {
         touchResult.settings = { changedS: settingsS, taps: touchResult.settingsTaps };
         log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s ` +
             `(${touchResult.settingsTaps} taps)`);
+        if (settingsS < 0) {
+            // Then the shell, if it answers, so that the swipe is measured anyway.
+            await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
+            const byShell = await changeFrom(drawer, 30, probeWaitMs);
+            touchResult.settings.byShellS = byShell;
+            log(`INPUT PROBE: Settings started from the shell: the screen changed after ${byShell} s`);
+            settingsS = byShell;
+        }
         if (settingsS >= 0) {
             const settled = await still(120000);
             const top = await rowSig();

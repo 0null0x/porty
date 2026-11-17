@@ -458,6 +458,41 @@ def main():
             g.sh("input keyevent 3", 60)
 
 
+        # --- the app drawer: a quick swipe up opens it, a tap starts Settings ---
+        # (In the browser the tap on Settings in the drawer opened nothing,
+        # three times, runs 44080618863, 44080633997, 44084324374.)
+        g.sh("am force-stop com.android.settings; input keyevent 3", 60)
+        prov.wait(vm, 3)
+        g.quiet(timeout=90)
+        home2 = shot_pair(vm, g, "home2")
+        touch.swipe(0.5, 650 / 800, 0.5, 200 / 800, steps=6, pause=0.06)   # as the browser probe does
+        drawer = shot_pair(vm, g, "drawer")
+        dr = result["drawer"] = {"opened_pct": gcpu.ppm_diff(drawer, home2), "focus": g.focus()}
+        for i in range(3):
+            touch.tap(60 / 480, 375 / 800, hold=0.12)
+            prov.wait(vm, 12)
+            g.quiet(timeout=60)
+            dr[f"tap{i + 1}_focus"] = g.focus()
+            if "settings" in dr[f"tap{i + 1}_focus"].lower():
+                break
+        dr["raw_touch"] = run("drawer_raw_touch", "dumpsys input | sed -n '/Input Reader State/,/Input Dispatcher State/p' | "
+                                                  "grep -A3 -E 'Last (Raw|Cooked) Touch' | cut -c1-200", 240)
+        dr["resumed"] = run("drawer_resumed", "dumpsys activity activities | grep -e mResumedActivity -e 'state=' | head -6 | cut -c1-160")
+        after = shot_pair(vm, g, "drawer-tapped")
+        dr["tap_changed_pct"] = gcpu.ppm_diff(after, drawer)
+        if "settings" not in dr.get("tap3_focus", dr.get("tap2_focus", dr.get("tap1_focus", ""))).lower():
+            # Android's own injection at the same spot, for comparison.
+            g.sh("input tap 60 375", 60)
+            prov.wait(vm, 12)
+            g.quiet(timeout=60)
+            dr["input_tap_focus"] = g.focus()
+            shot_pair(vm, g, "drawer-input-tap")
+        log("drawer: " + json.dumps({k: v for k, v in dr.items() if k not in ("raw_touch", "resumed")}))
+        check("drawer_tap_opens_settings", any("settings" in str(dr.get(f"tap{i}_focus", "")).lower() for i in (1, 2, 3)),
+              json.dumps({k: v for k, v in dr.items() if k not in ("raw_touch", "resumed")}))
+        g.sh("input keyevent 3", 60)
+        prov.wait(vm, 3)
+
         # --- a long list: resting before the lift, with and without reports ---
         # Developer options: Settings keeps the activity disabled until they
         # are switched on (Settings$DevelopmentSettingsDashboardActivity,
