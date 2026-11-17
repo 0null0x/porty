@@ -1,0 +1,35 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 07:00:00 +0000
+Subject: [PATCH] EXPERIMENT: export TB flush and invalidation counts
+
+Not for merging: porty_tb_stats() returns tb_flush() calls, TBs
+invalidated, TBs in the code buffer and its use and capacity in KiB.
+---
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index 6867d8d..88b5bc1 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -1257,3 +1257,23 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
+ }
+ 
+ #endif /* CONFIG_USER_ONLY */
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++/*
++ * EXPERIMENT, not for merging: [0] tb_flush() calls, [1] TBs invalidated,
++ * [2] TBs in the code buffer, [3] its KiB in use, [4] its capacity in KiB.
++ */
++uint32_t *porty_tb_stats(void);
++EMSCRIPTEN_KEEPALIVE uint32_t *porty_tb_stats(void)
++{
++    static uint32_t out[5];
++
++    out[0] = qatomic_read(&tb_ctx.tb_flush_count);
++    out[1] = qatomic_read(&tb_ctx.tb_phys_invalidate_count);
++    out[2] = tcg_nb_tbs();
++    out[3] = tcg_code_size() / 1024;
++    out[4] = tcg_code_capacity() / 1024;
++    return out;
++}
++#endif
