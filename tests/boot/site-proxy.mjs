@@ -23,7 +23,8 @@ const ISOLATION = {
     'cross-origin-embedder-policy': 'require-corp',
     'cross-origin-resource-policy': 'cross-origin',
 };
-// Upstream response headers worth passing on.
+// Upstream response headers worth passing on (not content-length or
+// content-encoding: fetch() decodes the body).
 const PASS = ['content-type', 'cache-control', 'etag', 'last-modified', 'content-range', 'accept-ranges'];
 
 /**
@@ -85,9 +86,9 @@ export async function startSiteProxy({ upstream, rewrite = null, localDir = '', 
                 res.end(req.method === 'HEAD' ? undefined : body);
                 return;
             }
-            if (r.headers.get('content-length')) {
-                out['content-length'] = r.headers.get('content-length');
-            }
+            // No content-length: fetch() has already undone any
+            // content-encoding (GitHub Pages gzips .js and .wasm), so the
+            // upstream's length is not this body's.
             res.writeHead(r.status, out);
             if (req.method === 'HEAD' || !r.body) {
                 res.end();
