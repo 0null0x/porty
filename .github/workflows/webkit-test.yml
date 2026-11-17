@@ -8,7 +8,11 @@
 # dispatching ref's patches (build-and-deploy on main, branch-check on a
 # branch, both under the same cache key), served by a local proxy of the
 # site in place of the deployed one; the page, snapshot and disk are still
-# the deployed ones.  A ref whose build is not in the cache tests nothing.
+# the deployed ones.  The page checks the snapshot against the site's
+# build.json, not against the QEMU it runs, so the cached build resumes the
+# deployed snapshot: a fair test only of patches that leave the machine's
+# state as it is (0015 and 0017 do; resume times matched the deployed
+# build's).  A ref whose build is not in the cache tests nothing.
 #
 # The run never fails, because every failed run emails the repository owner.
 # The outcome of each job is a commit status ("porty/webkit <query>" for
