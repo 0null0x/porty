@@ -399,7 +399,14 @@ def launch(g, app, opts, index):
     component = app["component"]
     package = component.split("/")[0]
     out = {"app": app["name"], "how": app["how"], "index": index, "component": component}
-    g.sh(f"am force-stop {package}", 60)
+    # prepare: a shell line before the start (e.g. Back and Home, so that the
+    # next start is a new activity); force_stop false: the app's process, if
+    # it is there, stays (a warm start).
+    if app.get("prepare"):
+        out["prepared"] = g.sh(app["prepare"], 240)[1].strip()[:300]
+    if app.get("force_stop", True):
+        g.sh(f"am force-stop {package}", 60)
+    out["process_before"] = g.sh(f"pidof {package} || echo none", 30)[1].strip()
     out["anr_dismissed"] = dismiss_anr(vm)
     out["focus_before"] = g.focus()
     out["quiet_before_s"] = g.quiet(timeout=90)
@@ -510,7 +517,7 @@ def launch(g, app, opts, index):
     out["cpu"] = d
     out["screen"] = vm.screenshot(f"{app['name']}-{index}", show=opts.show_screens)
     log(f"launch {app['name']} #{index} ({app['how']}): drawn {drawn} s, screen changed {changed} s, quiet {quiet_at} s,"
-        f" Android {out['launch_ms']}/{out['launch_total_ms']} ms; {describe(d)}")
+        f" Android {out['launch_ms']}/{out['launch_total_ms']} ms, process before: {out['process_before']}; {describe(d)}")
     if d:
         for t in d["threads"][:14]:
             log(f"    thread {t['proc']}/{t['comm']} (nice {t['nice']}, policy {t['policy']}): {t['ticks']}")

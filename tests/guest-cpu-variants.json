@@ -10,24 +10,40 @@
   "ui": false,
   "apps": [
     {
-      "name": "gallery-start",
+      "name": "gallery-first",
       "how": "start",
       "component": "com.android.gallery3d/.app.GalleryActivity",
-      "times": 2
+      "force_stop": false,
+      "prepare": "input keyevent 3; sleep 1; echo home",
+      "times": 1
     },
     {
-      "name": "gallery",
-      "how": "tap",
-      "x": 0.3125,
-      "y": 0.70625,
-      "component": "com.android.gallery3d/.app.GalleryActivity",
-      "times": 2
-    },
-    {
-      "name": "gallery-start-after",
+      "name": "gallery-cold",
       "how": "start",
       "component": "com.android.gallery3d/.app.GalleryActivity",
-      "times": 2
+      "times": 1
+    },
+    {
+      "name": "gallery-warm",
+      "how": "start",
+      "component": "com.android.gallery3d/.app.GalleryActivity",
+      "force_stop": false,
+      "prepare": "input keyevent 4; sleep 1; input keyevent 3; sleep 1; echo back home",
+      "times": 1
+    },
+    {
+      "name": "settings-cold",
+      "how": "start",
+      "component": "com.android.settings/.Settings",
+      "times": 1
+    },
+    {
+      "name": "settings-warm",
+      "how": "start",
+      "component": "com.android.settings/.Settings",
+      "force_stop": false,
+      "prepare": "input keyevent 4; sleep 1; input keyevent 3; sleep 1; echo back home",
+      "times": 1
     }
   ],
   "variants": {
@@ -201,6 +217,21 @@
       "after_settle": [
         "pm list features | grep touchscreen; am get-config | grep -o -e '-finger-' -e '-notouch-' -e '-stylus-' | head -1"
       ]
+    },
+    "pw1-t1": {
+      "query": "touch=1",
+      "after_settle": [
+        "am start -W -n com.android.gallery3d/.app.GalleryActivity | grep -e Status -e TotalTime; sleep 3; input keyevent 4; sleep 1; echo gallery pid $(pidof com.android.gallery3d)",
+        "am start -W -n com.android.settings/.Settings | grep -e Status -e TotalTime; sleep 3; input keyevent 4; sleep 1; echo settings pid $(pidof com.android.settings)",
+        "input keyevent 3; sleep 1; input swipe 240 650 240 200 300; sleep 2; input keyevent 3; sleep 2; dumpsys window | grep mCurrentFocus | head -1",
+        "sleep 10; echo gallery $(pidof com.android.gallery3d) settings $(pidof com.android.settings)"
+      ]
+    },
+    "pw0-t1": {
+      "query": "touch=1"
+    },
+    "pw0-t0": {
+      "query": "touch=0"
     }
   }
 }
