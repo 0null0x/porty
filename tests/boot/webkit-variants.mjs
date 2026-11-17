@@ -16,6 +16,11 @@
 //                     probe=0             no tap on Gallery: the shell loop
 //                                         and LOOP_ROUNDS more rounds only
 //                     loops=<n>           shell loop rounds (default 3)
+//                     proxy=1             through the test's local proxy of
+//                                         the site even without glue
+//                     local=1             the page's own files from this
+//                                         checkout's web/ (LOCAL_WEB), the
+//                                         rest from the site (site-proxy.mjs)
 //                   e.g. "name=base; name=nostack JSC_exceptionStackTraceLimit=0"
 //   BASE_QUERY      page parameters of every variant (default
 //                   wasmmem=1280&jitcap=4000)
@@ -41,6 +46,8 @@ const baseQuery = (process.env.BASE_QUERY || 'wasmmem=1280&jitcap=4000').trim().
 const replica = (process.env.REPLICA || '1').replace(/[^0-9]/g, '') || '1';
 const minutes = Math.max(4, Math.min(60, Number(process.env.MINUTES) || 14));
 const probeSeconds = Math.max(30, Math.min(1800, Number(process.env.PROBE_SECONDS) || 360));
+// The page files for local=1: this checkout's web/ unless LOCAL_WEB names another.
+const localWeb = process.env.LOCAL_WEB || path.join(here, '..', '..', 'web');
 
 // Only the characters page parameters, option names and labels need.
 const WORD = /^[A-Za-z0-9_=&.,:%+-]{1,120}$/;
@@ -48,7 +55,7 @@ const WORD = /^[A-Za-z0-9_=&.,:%+-]{1,120}$/;
 /** "name=x q=a=1&b=2 JSC_y=0 glue=count+ffi" -> {name, query, env, glue, probe, loops, words} */
 export function parseVariant(text, base = '') {
     const words = text.trim().split(/\s+/).filter(Boolean);
-    const v = { name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, words: [] };
+    const v = { name: '', query: new URLSearchParams(base), env: [], glue: [], probe: true, loops: 3, proxy: false, local: false, words: [] };
     for (const w of words) {
         if (!WORD.test(w)) {
             continue;
@@ -69,6 +76,10 @@ export function parseVariant(text, base = '') {
             v.glue.push(...value.split('+').filter((g) => /^[a-z0-9-]+$/.test(g)));
         } else if (key === 'probe') {
             v.probe = value !== '0';
+        } else if (key === 'proxy') {
+            v.proxy = value === '1';
+        } else if (key === 'local') {
+            v.local = value === '1';
         } else if (key === 'loops') {
             v.loops = Math.max(1, Math.min(12, Number(value) || 3));
         }
@@ -142,7 +153,20 @@ export function gcSummary(text) {
             }
         }
     }
-    return [...heaps.values()].sort((a, b) => (b.full + b.eden) - (a.full + a.eden));
+    const seconds = (t) => {
+        const m = /(\d\d):(\d\d):(\d\d\.\d+)/.exec(t || '');
+        return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
+    };
+    for (const h of heaps.values()) {
+        // What the heap allocated after it first held the WebAssembly memory
+        // (its first full collection), per second up to its last collection.
+        const i = h.events.findIndex((ev) => ev.kind === 'Full');
+        const later = i < 0 ? [] : h.events.slice(i + 1);
+        const span = later.length ? seconds(later[later.length - 1].when) - seconds(h.events[i].when) : 0;
+        h.allocatedMb = Math.round(later.reduce((sum, ev) => sum + ev.allocatedKb, 0) / 1024);
+        h.mbPerSecond = span > 5 ? Math.round((h.allocatedMb / span) * 10) / 10 : null;
+    }
+    return [...heaps.values()].sort((a, b) => (b.allocatedMb || 0) - (a.allocatedMb || 0));
 }
 
 const mib = (kb) => Math.round(kb / 1024);
@@ -161,9 +185,10 @@ function runOne(v, index) {
             QUERY: v.query,
             BROWSER_ENV: v.env.join(' '),
             GLUE: v.glue.join(','),
-            // Rewritten glue reaches the browser only through the test's
-            // routes, which do not see a service worker's fetches.
-            COI: v.glue.length ? 'route' : (process.env.COI || 'auto'),
+            // Glue rewrites and page files go through the test's local
+            // proxy of the site (site-proxy.mjs); proxy=1 forces it.
+            PROXY: v.proxy ? '1' : (v.glue.length || v.local ? '1' : '0'),
+            LOCAL_WEB: v.local ? localWeb : '',
             BENCH: '0',
             SCAN: '0',
             MINUTES: String(minutes),
@@ -286,6 +311,7 @@ async function main() {
                 console.log(`[${v.name}] GC LOG: ${r.gcLines} lines, ${heaps.length} heaps`);
                 for (const h of heaps.slice(0, 16)) {
                     console.log(`[${v.name}] GC heap ${h.id}: ${h.full} full + ${h.eden} eden from ${h.first} to ${h.last}; ` +
+                        `${h.allocatedMb} MiB allocated after its first full collection (${h.mbPerSecond ?? '?'} MiB/s); ` +
                         `allocated before a collection up to ${mib(h.maxAllocatedKb)} MiB, capacity at the start up to ` +
                         `${mib(h.maxCapacityKb)} MiB, headroom up to ${mib(h.maxHeadroomKb)} MiB, size after up to ` +
                         `${mib(h.maxAfterKb)} MiB (last ${mib(h.lastAfterKb)}), longest pause ${h.maxPauseMs} ms`);
@@ -314,11 +340,12 @@ async function main() {
         '',
         `Base query \`${baseQuery}\`; ${rows[0] ? rows[0].version : ''}. RSS of the web content process in MiB.`,
         '',
-        '| variant | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | JIT alive/compiled | counters per s | notes |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+        '| variant | peak RSS | steady RSS | peak heaps | resume s | loop s | Gallery s | JIT alive/compiled | JS heaps: MiB/s, most allocated before a GC | counters per s | notes |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows.map((r) => `| ${r.name} (\`${r.words || '-'}\`) | ${fmt(r.peakRss)} | ${fmt(r.steadyRss)} | ${fmt(r.peakHeaps)} | ` +
             `${fmt(r.resumed)} | ${r.loops.map(fmt).join('/') || '-'} | ${fmt(r.gallery)} | ${r.jit || '-'} | ` +
-            `${Object.entries(r.counters).map(([k, x]) => `${k} ${x}`).join(', ') || '-'} | ` +
+            `${(r.gc || []).filter((h) => h.allocatedMb > 50).slice(0, 4).map((h) => `${h.mbPerSecond ?? '?'}/s, ${Math.round(h.maxAllocatedKb / 1024)}`).join('; ') || '-'} | ` +
+            `${Object.entries(r.counters).map(([t, row]) => `${t}: ${Object.entries(row).map(([k, x]) => `${k} ${x}`).join(' ')}`).join('; ') || '-'} | ` +
             `${[r.crashed ? 'CRASHED' : '', r.failed, ...r.errors.map((e) => e.slice(0, 80))].filter(Boolean).join('; ').replace(/\|/g, '/') || ''} |`),
         '',
     ].join('\n');

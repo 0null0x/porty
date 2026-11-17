@@ -59,7 +59,10 @@
 import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import { COUNTER_BASE, COUNTER_NAMES, glueRewrite as rewriteGlue } from './webkit-glue.mjs';
+import { startSiteProxy } from './site-proxy.mjs';
+import {
+    COUNTER_BASE, COUNTER_CONTEXTS, COUNTER_NAMES, COUNTER_ROWS, glueRewrite as rewriteGlue,
+} from './webkit-glue.mjs';
 
 const require = createRequire(path.join(process.env.PLAYWRIGHT_DIR || process.cwd(), 'noop.js'));
 const playwright = require('playwright-core');
@@ -94,7 +97,14 @@ const variantName = (process.env.VARIANT || '').replace(/[^A-Za-z0-9_=&.,:%+ -]/
 const queryText = (process.env.QUERY || '').trim().replace(/^\?/, '');
 const params = new URLSearchParams(queryText);
 params.set('serial', '1');
-const url = `${siteUrl}?${params}`;
+// Experiments that change QEMU's glue or the page run through a local proxy
+// of the site (site-proxy.mjs): it makes the page cross-origin isolated by
+// its headers and rewrites qemu/out.js for every context, service workers
+// and QEMU's threads included, which the test's routes cannot.
+const localWeb = (process.env.LOCAL_WEB || '').trim();
+const useProxy = process.env.PROXY === '1' ||
+    (process.env.PROXY !== '0' && (glue.length > 0 || tableGrow > 0 || !!localWeb));
+let url = `${siteUrl}?${params}`;
 const statusContext = (process.env.STATUS_CONTEXT ? `${process.env.STATUS_CONTEXT}`
     : `${browserName === 'webkit' ? 'porty/webkit' : 'porty/webkit-chrome'} ${queryText || 'defaults'}` +
     `${tableGrow ? ` tablegrow=${tableGrow}` : ''}${envText ? ` ${envText}` : ''}${glue.length ? ` glue=${glue.join('+')}` : ''}`).slice(0, 100);
@@ -305,6 +315,44 @@ const describeMemory = (m) => (m ? `${m.name}[${m.pid}] rss=${m.rss} anon=${m.an
     ` threads=${m.threads}; content processes ${m.content} MiB, all ${m.count} processes ${m.total} MiB` : 'no browser process found');
 
 // -------------------------------------------------------------- browser ---
+/** qemu/out.js as the experiments want it (TABLE_GROW, GLUE). */
+function rewriteOutJs(text) {
+    let out = text;
+    if (tableGrow > 0) {
+        const patch = `wasmTable.grow(${tableGrow});for(var portyI=wasmTable.length-${tableGrow};` +
+            'portyI<wasmTable.length-1;portyI++)freeTableIndexes.push(portyI)';
+        result.tableGrowHits = (result.tableGrowHits || 0) + out.split('wasmTable.grow(1)').length - 1;
+        out = out.split('wasmTable.grow(1)').join(patch);
+    }
+    if (glue.length) {
+        const applied = {};
+        out = rewriteGlue(out, glue, applied);
+        result.glueLoads = (result.glueLoads || 0) + 1;
+        if (!result.glueApplied) {
+            result.glueApplied = applied;
+            log(`GLUE ${glue.join('+')}: ${JSON.stringify(applied)}`);
+        }
+    }
+    return out;
+}
+
+let proxy = null;
+if (useProxy) {
+    try {
+        proxy = await startSiteProxy({
+            upstream: siteUrl,
+            rewrite: (pathname, text) => rewriteOutJs(text),
+            localDir: localWeb,
+            log,
+        });
+        url = `${proxy.url}?${params}`;
+        result.proxy = { local: localWeb || '', upstream: siteUrl };
+        log(`site proxy at ${proxy.url} for ${siteUrl}${localWeb ? `, page files from ${localWeb}` : ''}`);
+    } catch (e) {
+        note(`site proxy did not start: ${String(e.message || e).split('\n')[0]}`);
+    }
+}
+
 const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 ' +
     '(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
 let browser;
@@ -1638,44 +1686,57 @@ const ISOLATION_HEADERS = {
     'cross-origin-resource-policy': 'cross-origin',
 };
 // See webkit-glue.mjs.
-/** Runs in the page: the glue counters, or null without them. */
-function readCounters(base) {
+/** Runs in the page: [contexts, ...rows of counters], or null without them. */
+function readCounters([base, rows, width, contexts]) {
     const e = globalThis.__porty;
     if (!e || !e.memory) {
         return null;
     }
-    return Array.from(new Int32Array(e.memory.buffer, base, 16));
+    const n = Math.min(new Int32Array(e.memory.buffer, base, 1)[0], contexts);
+    return [n, Array.from(new Int32Array(e.memory.buffer, rows, n * width))];
 }
 
 let lastCounters = null;
 const counterStart = { t: 0, c: null };
+const counterRow = (flat, c) => flat.slice(c * COUNTER_NAMES.length, (c + 1) * COUNTER_NAMES.length);
+/** {ctx: {name: value}} for the counters that are not zero. */
+function counterTable(flat, n, fn = (v) => v) {
+    const out = {};
+    for (let c = 0; c < n; c++) {
+        const row = Object.fromEntries(counterRow(flat, c).map((v, i) => [COUNTER_NAMES[i], fn(v, c, i)]).filter(([, v]) => v));
+        if (Object.keys(row).length) {
+            out[`t${c}`] = row;
+        }
+    }
+    return out;
+}
 
-/** Counters since the last call, per second. */
+/** Counters per thread since the last call, per second ("t0" is the page's thread). */
 async function counterRates() {
     if (!glue.includes('count')) {
         return null;
     }
-    let c;
+    let got;
     try {
-        c = await page.evaluate(readCounters, COUNTER_BASE);
+        got = await page.evaluate(readCounters, [COUNTER_BASE, COUNTER_ROWS, COUNTER_NAMES.length, COUNTER_CONTEXTS]);
     } catch (e) {
         return null;
     }
-    if (!c) {
+    if (!got) {
         return null;
     }
+    const [n, flat] = got;
     const now = Date.now();
-    const out = { total: Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, c[i]]).filter(([n, v]) => v && !/^c1\d$/.test(n))) };
+    const out = { contexts: n, total: counterTable(flat, n) };
     if (lastCounters) {
         const dt = (now - lastCounters.t) / 1000;
-        out.rate = Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, Math.round((c[i] - lastCounters.c[i]) / dt)])
-            .filter(([n, v]) => v && n !== 'contexts' && !/^c1\d$/.test(n)));
+        out.rate = counterTable(flat, n, (v, c, i) => Math.round((v - (lastCounters.flat[c * COUNTER_NAMES.length + i] || 0)) / dt));
     }
-    if (!counterStart.c) {
+    if (!counterStart.flat) {
         counterStart.t = now;
-        counterStart.c = c;
+        counterStart.flat = flat;
     }
-    lastCounters = { t: now, c };
+    lastCounters = { t: now, flat, n };
     return out;
 }
 
@@ -1734,7 +1795,7 @@ function summarize() {
 }
 
 try {
-    if (tableGrow > 0 || glue.length) {
+    if (!proxy && (tableGrow > 0 || glue.length)) {
         // Experiments on QEMU's JavaScript, rewritten on its way to the
         // browser; nothing on the site changes.  TABLE_GROW: Emscripten's
         // addFunction() grows QEMU's table by one entry for every compiled
@@ -1884,12 +1945,12 @@ try {
 }
 
 clearInterval(peakTimer);
-if (counterStart.c && lastCounters && lastCounters.t > counterStart.t) {
+if (counterStart.flat && lastCounters && lastCounters.t > counterStart.t) {
     const dt = (lastCounters.t - counterStart.t) / 1000;
-    result.counterRates = Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, Math.round((lastCounters.c[i] - counterStart.c[i]) / dt)])
-        .filter(([n, v]) => v && n !== 'contexts' && !/^c1\d$/.test(n)));
-    result.counterTotals = Object.fromEntries(COUNTER_NAMES.map((n, i) => [n, lastCounters.c[i]]).filter(([, v]) => v));
-    log(`COUNTERS per second over ${Math.round(dt)} s: ${JSON.stringify(result.counterRates)}; totals ${JSON.stringify(result.counterTotals)}`);
+    result.counterRates = counterTable(lastCounters.flat, lastCounters.n,
+        (v, c, i) => Math.round((v - (counterStart.flat[c * COUNTER_NAMES.length + i] || 0)) / dt));
+    result.counterTotals = counterTable(lastCounters.flat, lastCounters.n);
+    log(`COUNTERS per second per thread over ${Math.round(dt)} s: ${JSON.stringify(result.counterRates)}; totals ${JSON.stringify(result.counterTotals)}`);
 }
 log(`PEAK: content process ${result.peakRss} MiB at ${result.peakAt} s, all processes ${result.peakTotal} MiB`);
 const verdict = summarize();
@@ -1933,4 +1994,8 @@ if (process.env.GITHUB_STEP_SUMMARY) {
 }
 closing = true;
 await Promise.race([browser.close().catch(() => {}), sleep(15000)]);
+if (proxy) {
+    log(`site proxy: ${JSON.stringify(proxy.stats)}`);
+    await Promise.race([proxy.close(), sleep(3000)]);
+}
 process.exit(0);

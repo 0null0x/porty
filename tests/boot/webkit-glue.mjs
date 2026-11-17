@@ -1,33 +1,42 @@
 // Rewrites of QEMU-Wasm's JavaScript glue (qemu/out.js, Emscripten 3.1.50)
 // for the WebKit memory experiments (tests/boot/webkit-test.mjs, GLUE):
 //
-//   count  counters of what the glue does, in the WebAssembly memory that
-//          every thread shares (below Emscripten's GLOBAL_BASE of 1024,
-//          where nothing else lives): throws for longjmp, invoke wrappers,
-//          caught longjmps, libffi calls, compiled blocks, removals, sleeps
+//   count  counters of what the glue does, per thread, in the WebAssembly
+//          memory that every thread shares (below Emscripten's GLOBAL_BASE
+//          of 1024, where nothing else lives): throws for longjmp, invoke
+//          wrappers, libffi calls, compiled blocks, sleeps
 //          (Asyncify.handleSleep runs twice per sleep), XHRs, postMessage
-//          from workers, and the contexts that loaded the rewritten glue
+//          from workers, clock reads (clock_time_get) and polls
 //   ffi    libffi's ffi_call_js without the arrays it allocates
 //   slice  instantiate_wasm copies a block's bytes once instead of twice
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Layout below GLOBAL_BASE: [512] the next context number; from 528 on,
+// one row of COUNTER_NAMES.length int32 per context (the page's thread
+// first, then QEMU's threads in the order they load the glue), at most
+// COUNTER_CONTEXTS rows.  Each row has one writer, so plain increments do.
 export const COUNTER_BASE = 512;
-export const COUNTER_NAMES = ['throws', 'invokes', 'catches', 'ffi', 'compiles', 'removes', 'sleeps', 'xhrs',
-    'ffiSlow', 'posts', 'c10', 'c11', 'c12', 'c13', 'c14', 'contexts'];
+export const COUNTER_ROWS = 528;
+export const COUNTER_NAMES = ['throws', 'invokes', 'ffi', 'compiles', 'sleeps', 'xhrs', 'posts', 'clocks', 'polls'];
+export const COUNTER_CONTEXTS = 12;
 
 export const COUNT_PRELUDE = `
 var portyCounters = null;
 function portyCount(i) {
-  try {
-    if (!portyCounters) portyCounters = new Int32Array(wasmMemory.buffer, ${COUNTER_BASE}, 16);
-    Atomics.add(portyCounters, i, 1);
-  } catch (e) {}
+  if (portyCounters === null) {
+    try {
+      var n = Atomics.add(new Int32Array(wasmMemory.buffer, ${COUNTER_BASE}, 1), 0, 1);
+      portyCounters = new Int32Array(wasmMemory.buffer, ${COUNTER_ROWS} + Math.min(n, ${COUNTER_CONTEXTS - 1}) * ${COUNTER_NAMES.length * 4}, ${COUNTER_NAMES.length});
+    } catch (e) {
+      return;
+    }
+  }
+  portyCounters[i]++;
 }
-portyCount(15);
 if (typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self !== 'undefined' && self.postMessage) {
   var portyPostMessage = self.postMessage;
-  self.postMessage = function(m, t) { portyCount(9); return t === undefined ? portyPostMessage.call(self, m) : portyPostMessage.call(self, m, t); };
+  self.postMessage = function(m, t) { portyCount(6); return t === undefined ? portyPostMessage.call(self, m) : portyPostMessage.call(self, m, t); };
 }
 `;
 
@@ -125,7 +134,7 @@ export function glueRewrite(js, names, applied = {}) {
         const renamed = count(/function ffi_call_js\(/, () => 'function portyFfiSlow(');
         let fast = FFI_FAST;
         if (names.includes('count')) {
-            fast = fast.replace('/*PORTY_FFI_COUNT*/', 'portyCount(3);').replace('/*PORTY_FFI_SLOW_COUNT*/', 'portyCount(8);');
+            fast = fast.replace('/*PORTY_FFI_COUNT*/', 'portyCount(2);');
         }
         const before = out.length;
         out = renamed ? insertBeforeImports(out, fast) : out;
@@ -144,14 +153,15 @@ export function glueRewrite(js, names, applied = {}) {
         applied.countThrow = count(/((?:__emscripten_throw_longjmp\s*=\s*(?:\(\)\s*=>|function\s*\(\))|function\s+__emscripten_throw_longjmp\s*\(\))\s*\{)/,
             (m, a) => `${a} portyCount(0);`);
         applied.countInvoke = count(/(function invoke_[a-zA-Z0-9]+\([^)]*\)\s*\{\s*var sp = stackSave\(\);)/g, (m, a) => `${a} portyCount(1);`);
-        applied.countCatch = count(/(_setThrew\(1,\s*0\);)/g, (m, a) => `portyCount(2); ${a}`);
         if (!names.includes('ffi')) {
-            applied.countFfi = count(/(function ffi_call_js\([^)]*\)\s*\{)/, (m, a) => `${a} portyCount(3);`);
+            applied.countFfi = count(/(function ffi_call_js\([^)]*\)\s*\{)/, (m, a) => `${a} portyCount(2);`);
         }
-        applied.countCompile = count(/(function instantiate_wasm\(\)\s*\{)/, (m, a) => `${a} portyCount(4);`);
-        applied.countRemove = count(/(function remove_module_js\(\)\s*\{)/, (m, a) => `${a} portyCount(5);`);
-        applied.countSleep = count(/(\n\s*handleSleep\(startAsync\)\s*\{)/, (m, a) => `${a} portyCount(6);`);
-        applied.countXhr = count(/new XMLHttpRequest\b(?:\(\))?/g, () => '(portyCount(7), new XMLHttpRequest())');
+        applied.countCompile = count(/(function instantiate_wasm\(\)\s*\{)/, (m, a) => `${a} portyCount(3);`);
+        applied.countSleep = count(/(\n\s*handleSleep\(startAsync\)\s*\{)/, (m, a) => `${a} portyCount(4);`);
+        applied.countXhr = count(/new XMLHttpRequest\b(?:\(\))?/g, () => '(portyCount(5), new XMLHttpRequest())');
+        applied.countClock = count(/(function _clock_time_get\([^)]*\)\s*\{)/, (m, a) => `${a} portyCount(7);`);
+        applied.countPoll = count(/(var ___syscall_poll\s*=\s*\([^)]*\)\s*=>\s*)(PTY_wrapPoll\(\(\) => xterm_pty_old_poll\([^)]*\)\));/,
+            (m, a, b) => `${a}(portyCount(8), ${b});`);
     }
     return out;
 }

@@ -6,7 +6,9 @@
 // usage: node tests/webkit-glue.test.mjs
 // SPDX-License-Identifier: GPL-2.0-or-later
 import assert from 'node:assert/strict';
-import { FFI_FAST, glueRewrite } from './boot/webkit-glue.mjs';
+import {
+    COUNT_PRELUDE, COUNTER_BASE, COUNTER_CONTEXTS, COUNTER_NAMES, COUNTER_ROWS, FFI_FAST, glueRewrite,
+} from './boot/webkit-glue.mjs';
 
 let failures = 0;
 const check = (name, fn) => {
@@ -172,6 +174,11 @@ var Asyncify = {
  },
 };
 var _emscripten_sleep = ms => Asyncify.handleSleep(wakeUp => safeSetTimeout(wakeUp, ms));
+function _clock_time_get(clk_id, ignored_precision, ptime) {
+ ignored_precision = bigintToI53Checked(ignored_precision);
+ return 0;
+}
+var ___syscall_poll = (fds, nfds, timeout) => PTY_wrapPoll(() => xterm_pty_old_poll(fds, nfds, timeout));
 var wasmImports = {
  /** @export */ ka: ffi_call_js,
  /** @export */ xa: __emscripten_throw_longjmp,
@@ -202,14 +209,15 @@ check('every counter finds its place, and the result parses', () => {
     const applied = {};
     const out = glueRewrite(GLUE, ['count', 'ffi', 'slice'], applied);
     assert.deepEqual(applied, {
-        ffi: 1, slice: 1, countPrelude: 1, countThrow: 1, countInvoke: 2, countCatch: 2,
-        countCompile: 1, countRemove: 1, countSleep: 1, countXhr: 1,
+        ffi: 1, slice: 1, countPrelude: 1, countThrow: 1, countInvoke: 2,
+        countCompile: 1, countSleep: 1, countXhr: 1, countClock: 1, countPoll: 1,
     });
     // eslint-disable-next-line no-new-func
     new Function(out);
     assert.ok(out.indexOf('function ffi_call_js(') < out.indexOf('var wasmImports'));
     assert.ok(out.includes('function portyFfiSlow('));
-    assert.ok(out.includes('portyCount(3);') && out.includes('portyCount(8);'));
+    assert.ok(out.includes('function ffi_call_js(cif, fn, rvalue, avalue) {\n  portyCount(2);'));
+    assert.ok(out.includes('var ___syscall_poll = (fds, nfds, timeout) => (portyCount(8), PTY_wrapPoll('));
     assert.ok(out.includes('const wasmBytes = HEAP8.slice(wasm_begin, wasm_begin + wasm_size);'));
 });
 
@@ -217,9 +225,27 @@ check('count alone counts the original ffi_call_js', () => {
     const applied = {};
     const out = glueRewrite(GLUE, ['count'], applied);
     assert.equal(applied.countFfi, 1);
-    assert.ok(/function ffi_call_js\(cif, fn, rvalue, avalue\) \{ portyCount\(3\);/.test(out));
+    assert.ok(/function ffi_call_js\(cif, fn, rvalue, avalue\) \{ portyCount\(2\);/.test(out));
     // eslint-disable-next-line no-new-func
     new Function(out);
+});
+
+check('each context counts in a row of its own', () => {
+    const memory = { buffer: new SharedArrayBuffer(4096) };
+    const run = () => {
+        // eslint-disable-next-line no-new-func
+        const f = new Function('wasmMemory', `${COUNT_PRELUDE}; return portyCount;`);
+        return f(memory);
+    };
+    const a = run();
+    const b = run();
+    a(0); a(0); a(2); b(7);
+    const i32 = new Int32Array(memory.buffer);
+    assert.equal(i32[COUNTER_BASE / 4], 2);
+    const row = (c) => Array.from(i32.subarray(COUNTER_ROWS / 4 + c * COUNTER_NAMES.length, COUNTER_ROWS / 4 + (c + 1) * COUNTER_NAMES.length));
+    assert.deepEqual(row(0), [2, 0, 1, 0, 0, 0, 0, 0, 0]);
+    assert.deepEqual(row(1), [0, 0, 0, 0, 0, 0, 0, 1, 0]);
+    assert.ok(COUNTER_ROWS + COUNTER_CONTEXTS * COUNTER_NAMES.length * 4 <= 1024, 'the rows stay below GLOBAL_BASE');
 });
 
 check('nothing changes without names', () => {
