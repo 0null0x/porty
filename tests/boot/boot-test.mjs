@@ -1164,9 +1164,10 @@ async function inputProbe() {
         await shot('drawer', true);
         // Settings: the drawer's eleventh app, first of the third row.  A
         // press of 120 ms, as a finger's (puppeteer's tap lifts at once);
-        // up to three, since the first tap in the drawer opened nothing in
-        // two runs (44080618863, 44080633997), maybe caught by a list that
-        // was still settling after the swipe.
+        // up to three.  Settings and the drawer are both light screens and
+        // differ by about 26% (natively too), so 30% missed it: in
+        // 44088225511 the focus was Settings while the probe saw no change.
+        const settingsPct = 12;
         const [sx0, sy0] = at(60, 375 * (r.ch || 800) / 800);
         let settingsS = -1;
         const tapped = Date.now();
@@ -1174,18 +1175,19 @@ async function inputProbe() {
             await page.touchscreen.touchStart(sx0, sy0);
             await sleep(120);
             await page.touchscreen.touchEnd();
-            if (await changeFrom(drawer, 30, i < 2 ? 60000 : probeWaitMs) >= 0) {
+            if (await changeFrom(drawer, settingsPct, i < 2 ? 60000 : probeWaitMs) >= 0) {
                 settingsS = Math.round((Date.now() - tapped) / 1000);
             }
             touchResult.settingsTaps = i + 1;
         }
-        touchResult.settings = { changedS: settingsS, taps: touchResult.settingsTaps };
+        touchResult.settings = { changedS: settingsS, taps: touchResult.settingsTaps,
+            changedPct: changedPct(drawer, await canvasSample()) };
         log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s ` +
-            `(${touchResult.settingsTaps} taps)`);
+            `(${touchResult.settingsTaps} taps, ${touchResult.settings.changedPct}% of the screen)`);
         if (settingsS < 0) {
             // Then the shell, if it answers, so that the swipe is measured anyway.
             await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
-            const byShell = await changeFrom(drawer, 30, probeWaitMs);
+            const byShell = await changeFrom(drawer, settingsPct, probeWaitMs);
             touchResult.settings.byShellS = byShell;
             log(`INPUT PROBE: Settings started from the shell: the screen changed after ${byShell} s`);
             settingsS = byShell;
