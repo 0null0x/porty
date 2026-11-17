@@ -177,6 +177,9 @@
     },
     "gal-touch-usb": {
       "query": "qemu=-usb"
+    },
+    "gal-touch-tablet": {
+      "query": "qemu=-usb+-device+usb-tablet"
     }
   }
 }
