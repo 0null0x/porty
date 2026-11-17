@@ -1,6 +1,6 @@
 From: Claude <noreply@anthropic.com>
 Date: Tue, 17 Nov 2026 09:00:00 +0000
-Subject: [PATCH] tcg/wasm32: start a TB over when one of its tables is full (STRESS TEST: tiny tables)
+Subject: [PATCH] tcg/wasm32: start a TB over when one of its tables is full
 
 The wasm32 backend builds each TB's WebAssembly module in fixed-size
 thread-local tables: the helpers the TB imports (200) and their types
@@ -39,7 +39,7 @@ caused.
   2 files changed, 185 insertions(+), 15 deletions(-)
 
 diff --git a/tcg/tcg.c b/tcg/tcg.c
-index 7a24a24..30f251c 100644
+index 7a24a24..9824802 100644
 --- a/tcg/tcg.c
 +++ b/tcg/tcg.c
 @@ -428,17 +428,67 @@ tlb_mask_table_ofs(TCGContext *s, int which)
@@ -107,7 +107,7 @@ index 7a24a24..30f251c 100644
 -        printf("buffer too small\n"); fflush(stdout);
 -        exit(1);
 +    /* Porty: room first (this checked after the write, then exit(1)). */
-+    if (unlikely(sub_buf_ptr == sub_buf + 24000)) { /* STRESS TEST: SUB_BUF_MAX */
++    if (unlikely(sub_buf_ptr == sub_buf + SUB_BUF_MAX)) {
 +        wasm_table_full(s, WASM_TAB_BODY);
      }
 +    *sub_buf_ptr++ = v;
@@ -124,7 +124,7 @@ index 7a24a24..30f251c 100644
 + * by id + 1), as many labels placed (current_label[], tcg-target.c.inc) and
 + * LABEL_MAX branches to labels; QEMU-Wasm had 200, 100 and 200.
 + */
-+#define LABEL_MAX 12 /* STRESS TEST: 1024 */
++#define LABEL_MAX 1024
  
  struct label_placeholder {
      int label;
@@ -142,7 +142,7 @@ index 7a24a24..30f251c 100644
 + * typemask, a count, a result), so the types fit too (QEMU-Wasm had 200
 + * bytes, the types of some 25 helpers).
 + */
-+#define WASM_NUM_HELPER_FUNCS_MAX 10 /* STRESS TEST: 127 */
++#define WASM_NUM_HELPER_FUNCS_MAX 127
 +#define WASM_HELPER_TYPE_MAX 16
 +#define WASM_HELPER_ADDED_TYPES_SECTION_MAX \
 +    (WASM_NUM_HELPER_FUNCS_MAX * WASM_HELPER_TYPE_MAX)
@@ -213,7 +213,7 @@ index 7a24a24..30f251c 100644
 +    [WASM_TAB_LABEL_IDS] = LABEL_MAX,
 +    [WASM_TAB_LABELS] = ARRAY_SIZE(current_label),
 +    [WASM_TAB_BRANCHES] = LABEL_MAX,
-+    [WASM_TAB_BODY] = 24000, /* STRESS TEST: SUB_BUF_MAX */
++    [WASM_TAB_BODY] = SUB_BUF_MAX,
 +};
 +static const uint32_t wasm_tab_size_before[WASM_TAB_N] = {
 +    200, 200, 200, 100, 200, 100000,
