@@ -884,7 +884,7 @@ Three agents on Opus (branches `swarm/webkit-memory`, `swarm/qemu-crash`,
   and 0 of 4 resumes fixed; no measurable cost. One fixed full boot froze
   after 6 minutes with the page's own polls slowed to a minute: not
   explained, watch for it.
-- surfaceflinger (`swarm/guest-cpu`, not merged yet): while a layer
+- surfaceflinger (merge 0dfdeb4, `sffix=`): while a layer
   change waits for another layer's frame (`deferTransactionUntil`, used
   by SurfaceView), Android 9's surfaceflinger asks for a traversal on
   every vsync and each one is a full SwiftShader composition in a
@@ -902,7 +902,8 @@ Three agents on Opus (branches `swarm/webkit-memory`, `swarm/qemu-crash`,
 
 **Next steps:**
 
-1. Merge surfaceflinger's fix after its browser A/B, then a new snapshot.
+1. The browser A/B of surfaceflinger's fix on one runner (both guests on
+   the same QEMU build).
 2. On the iPhone: Gallery with the new build, and whether the tab
    survives at `jitcap=4000` and 15000.
 3. Bound the wasm32 backend's per-block arrays.
