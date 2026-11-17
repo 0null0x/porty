@@ -487,9 +487,34 @@ def main():
             g.quiet(timeout=60)
             dr["input_tap_focus"] = g.focus()
             shot_pair(vm, g, "drawer-input-tap")
+        opened = any("settings" in str(dr.get(f"tap{i}_focus", "")).lower() for i in (1, 2, 3))
+        if opened:
+            # The browser probe's next step, where its drags moved nothing
+            # (44096770993, 44100096190): a drag on this Settings, opened from
+            # the drawer rather than by am start, as the page sends it: eight
+            # moves 150 ms apart, a rest of 1.5 s with reports, the lift.
+            prov.wait(vm, 10)
+            g.quiet(timeout=120)
+            s0 = shot_pair(vm, g, "drawer-settings")
+            # (getevent ends after 40 events, the down and the moves, so that
+            # it writes them out; killed, it would lose them.)
+            run("drawer_getevent_start", f"getevent -lt -c 40 {node} > /data/local/tmp/porty-raw2.txt 2>&1 & echo started", 60)
+            prov.wait(vm, 2)
+            touch.drag(0.5, 640 / 800, 0.5, 280 / 800, steps=8, pause=0.15, rest=1.5, keep=True)
+            prov.wait(vm, 5)
+            g.quiet(timeout=60)
+            s1 = shot_pair(vm, g, "drawer-settings-dragged")
+            dr["drag_shift"] = vshift(s0, s1)
+            run("drawer_raw2", "cat /data/local/tmp/porty-raw2.txt | head -45", 60)
+            run("drawer_touch_after", "dumpsys input | grep -E -A2 'Last (Raw|Cooked) Touch|TouchStates|TouchedWindows' | "
+                                      "head -24 | cut -c1-180", 120)
+            run("drawer_dispatch_log", "logcat -d -b main -b system | grep -E 'InputDispatcher|InputReader|Dropp|"
+                                       "spent [0-9.]+ms' | tail -30 | cut -c1-200", 120)
         log("drawer: " + json.dumps({k: v for k, v in dr.items() if k not in ("raw_touch", "resumed")}))
-        check("drawer_tap_opens_settings", any("settings" in str(dr.get(f"tap{i}_focus", "")).lower() for i in (1, 2, 3)),
-              json.dumps({k: v for k, v in dr.items() if k not in ("raw_touch", "resumed")}))
+        check("drawer_tap_opens_settings", opened, json.dumps({k: v for k, v in dr.items() if k not in ("raw_touch", "resumed")}))
+        if opened:
+            moved = dr["drag_shift"][0]
+            check("drawer_settings_drag_scrolls", moved is not None and moved >= 100, json.dumps(dr["drag_shift"]))
         g.sh("input keyevent 3", 60)
         prov.wait(vm, 3)
 
