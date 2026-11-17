@@ -10,6 +10,12 @@
   "ui": false,
   "apps": [
     {
+      "name": "gallery-start",
+      "how": "start",
+      "component": "com.android.gallery3d/.app.GalleryActivity",
+      "times": 2
+    },
+    {
       "name": "gallery",
       "how": "tap",
       "x": 0.3125,
@@ -18,7 +24,7 @@
       "times": 2
     },
     {
-      "name": "gallery-start",
+      "name": "gallery-start-after",
       "how": "start",
       "component": "com.android.gallery3d/.app.GalleryActivity",
       "times": 2
@@ -162,6 +168,15 @@
     },
     "gal-old": {
       "query": "touch=0&anrtraces=1"
+    },
+    "gal-touch-key": {
+      "query": "",
+      "after_settle": [
+        "input keyevent 20; echo dpad down: out of touch mode"
+      ]
+    },
+    "gal-touch-usb": {
+      "query": "qemu=-usb"
     }
   }
 }
