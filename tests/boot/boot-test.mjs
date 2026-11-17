@@ -615,7 +615,30 @@ async function inputProbe() {
                 seen[k] = (seen[k] || 0) + 1;
             }, { capture: true });
         }
+        // What the page hands QEMU's ring (web/js/emulator.js looks the
+        // export up on every call): touch events, with QEMU's answer.
+        const m = globalThis.__porty && globalThis.__porty.module;
+        if (m && typeof m._porty_input_event === 'function' && !m.__portySent) {
+            const send = m._porty_input_event;
+            const sent = m.__portySent = globalThis.__portySent = [];
+            const t0 = performance.now();
+            m._porty_input_event = (type, a, b, c) => {
+                const ok = send(type, a, b, c);
+                if (type >= 5 && type <= 7) {
+                    sent.push([Math.round(performance.now() - t0), type, a, b, c, ok]);
+                }
+                return ok;
+            };
+        }
     });
+    // The touch events the page sent since `mark` (a count of them), in short.
+    const sentMark = () => page.evaluate(() => (globalThis.__portySent || []).length);
+    const sentSince = (mark) => page.evaluate((from) => {
+        const ev = (globalThis.__portySent || []).slice(from);
+        const name = { 5: 'down', 6: 'move', 7: 'up' };
+        return ev.map(([t, type, slot, x, y, ok]) => `${t}:${name[type]}${slot}` +
+            (type === 7 ? '' : `@${x},${y}`) + (ok ? '' : '!dropped')).join(' ');
+    }, mark);
     const r = await page.$eval('#screen', (e) => {
         const b = e.getBoundingClientRect();
         return { x: b.left, y: b.top, w: b.width, h: b.height, cw: e.width, ch: e.height };
@@ -1217,6 +1240,7 @@ async function inputProbe() {
         const [sx0, sy0] = at(60, 375 * (r.ch || 800) / 800);
         let settingsS = -1;
         const tapped = Date.now();
+        const tapMark = await sentMark();
         for (let i = 0; i < 3 && settingsS < 0; i++) {
             await page.touchscreen.touchStart(sx0, sy0);
             await sleep(120);
@@ -1230,6 +1254,7 @@ async function inputProbe() {
             changedPct: changedPct(drawer, await canvasSample()) };
         log(`INPUT PROBE: tap on Settings in the drawer: the screen changed after ${settingsS} s ` +
             `(${touchResult.settingsTaps} taps, ${touchResult.settings.changedPct}% of the screen)`);
+        log(`INPUT PROBE: sent for the taps on Settings: ${await sentSince(tapMark)}`);
         if (settingsS < 0) {
             // Then the shell, if it answers, so that the swipe is measured anyway.
             await send('am start -n com.android.settings/.Settings > /dev/null 2>&1\r');
@@ -1258,6 +1283,7 @@ async function inputProbe() {
             // before the lift (no fling): the list should follow the finger.
             const [x0, y0] = at(240, 640 * (r.ch || 800) / 800);
             const [, y1] = at(240, 280 * (r.ch || 800) / 800);
+            const swipeMark = await sentMark();
             await page.touchscreen.touchStart(x0, y0);
             for (let i = 1; i <= 8; i++) {
                 await sleep(150);
@@ -1275,6 +1301,7 @@ async function inputProbe() {
             log(`INPUT PROBE: swipe on Settings: the list moved ${moved.shift === null ? 'farther than 640 px or not at all'
                 : `${moved.shift} px`} for a finger moved 360 px (row match ${moved.err}, unmoved ${moved.err0}); ` +
                 `the screen changed after ${movedS} s and was still after ${quiet} s more`);
+            log(`INPUT PROBE: sent for the swipe: ${await sentSince(swipeMark)}`);
             await shot('after-swipe', true);
             // The mouse wheel over the list, three notches: the page drags
             // with a finger of its own (web/js/input.js), which lifts by
@@ -1285,6 +1312,7 @@ async function inputProbe() {
             const swipedSample = await canvasSample();
             const [wx, wy] = at(240, 400 * (r.ch || 800) / 800);
             await page.mouse.move(wx, wy);
+            const wheelMark = await sentMark();
             for (let i = 0; i < 3; i++) {
                 await page.mouse.wheel({ deltaY: back ? -100 : 100 });
                 await sleep(100);
@@ -1297,16 +1325,8 @@ async function inputProbe() {
             log(`INPUT PROBE: mouse wheel ${back ? 'up' : 'down'} 3 notches on Settings: the list moved ${wheeled.shift === null
                 ? 'farther than 640 px or not at all' : `${wheeled.shift} px`} (row match ${wheeled.err}); ` +
                 `the screen changed after ${wmovedS} s`);
+            log(`INPUT PROBE: sent for the wheel: ${await sentSince(wheelMark)}`);
             await shot('after-wheel', true);
-            // The guest's side: touches the input dispatcher dropped, or
-            // that Settings took long over (lines of the serial console).
-            marks.inlog = null;
-            await send('logcat -d -b main -b system | grep -E "InputDispatcher|Dropp|spent [0-9.]+ms|ANR in|' +
-                'Skipped [0-9]+ frames" | tail -25; echo INLOGDONE:$((1+1)):END\r');
-            for (let i = 0; i < 24 && !marks.inlog; i++) {
-                await sleep(5000);
-            }
-            log(`INPUT PROBE: the guest's input log ${marks.inlog ? 'is in the serial lines above' : 'did not come in 120 s'}`);
             if (probePinch) {
                 await pinch();
             }
@@ -1345,9 +1365,19 @@ async function inputProbe() {
     touchResult.pointerModeDevices = marks.sprites ? marks.sprites.pointerMappers : -1;
     log(`TOUCH RESULT: ${JSON.stringify(touchResult)}`);
 
-    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); head -40 /data/local/tmp/porty-ev.txt\r');
-    await sleep(20000);
-    log('INPUT PROBE: done');
+    // What reached the guest's input devices (the touchscreen's lines, and
+    // keys), then what Android's input dispatcher holds and logged.
+    marks.inlog = null;
+    await send('\rpkill getevent; echo PROBE-EVENTS $(wc -l < /data/local/tmp/porty-ev.txt); ' +
+        'grep -E "EV_(ABS|KEY|SYN)" /data/local/tmp/porty-ev.txt | grep -v -E "REP_|MSC_" | ' +
+        'sed -e "s|/dev/input/||" -e "s/  */ /g" | head -700; ' +
+        'dumpsys input | grep -E -A3 "Last Raw Touch|TouchStates" | head -12; ' +
+        'logcat -d -b main -b system | grep -E "InputDispatcher|InputReader|Dropp" | tail -30; ' +
+        'echo INLOGDONE:$((1+1)):END\r');
+    for (let i = 0; i < 36 && !marks.inlog; i++) {
+        await sleep(5000);
+    }
+    log(`INPUT PROBE: done${marks.inlog ? '' : ' (the guest\'s event lines did not all come in 180 s)'}`);
 }
 
 /**
